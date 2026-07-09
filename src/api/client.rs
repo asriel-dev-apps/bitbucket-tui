@@ -12,8 +12,8 @@ use serde::de::DeserializeOwned;
 
 use crate::api::error::{ApiError, classify_error};
 use crate::api::models::{
-    Comment, DiffStatEntry, MergeParams, Paginated, Pipeline, PipelineStep, PipelineTarget,
-    PullRequest, Repository, User, Workspace,
+    Branch, Comment, Commit, DiffStatEntry, MergeParams, Paginated, Pipeline, PipelineStep,
+    PipelineTarget, PullRequest, Repository, SrcEntry, User, Workspace,
 };
 
 /// API のベース URL（Bitbucket Cloud）。
@@ -290,6 +290,105 @@ impl BitbucketClient {
             .await
     }
 
+    /// ブランチ一覧を最終コミット日時降順で取得する。
+    pub async fn list_branches(
+        &self,
+        workspace: &str,
+        repo: &str,
+    ) -> Result<Vec<Branch>, ApiError> {
+        let path = format!("/repositories/{workspace}/{repo}/refs/branches");
+        self.get_paged(&path, &[("sort", "-target.date"), ("pagelen", "50")])
+            .await
+    }
+
+    /// コミット履歴を取得する。
+    ///
+    /// `revision`（ブランチ名/ハッシュ）を省略すると既定ブランチの履歴になる。
+    /// ブランチ名に含まれ得る `/` はパスセパレータとして温存する。
+    pub async fn list_commits(
+        &self,
+        workspace: &str,
+        repo: &str,
+        revision: Option<&str>,
+    ) -> Result<Vec<Commit>, ApiError> {
+        let path = match revision {
+            Some(rev) => format!(
+                "/repositories/{workspace}/{repo}/commits/{}",
+                encode_path(rev)
+            ),
+            None => format!("/repositories/{workspace}/{repo}/commits"),
+        };
+        self.get_paged(&path, &[("pagelen", "50")]).await
+    }
+
+    /// コミット詳細を取得する（単数 `commit` エンドポイント）。
+    pub async fn get_commit(
+        &self,
+        workspace: &str,
+        repo: &str,
+        hash: &str,
+    ) -> Result<Commit, ApiError> {
+        let url = format!(
+            "{BASE_URL}/repositories/{workspace}/{repo}/commit/{}",
+            encode_path(hash)
+        );
+        self.send_get(url, Vec::new()).await
+    }
+
+    /// コミット差分をユニファイド diff テキスト（`text/plain`）で取得する。
+    ///
+    /// `spec` が単一ハッシュのときは当該コミットの差分になる。
+    pub async fn get_commit_diff(
+        &self,
+        workspace: &str,
+        repo: &str,
+        spec: &str,
+    ) -> Result<String, ApiError> {
+        let url = format!(
+            "{BASE_URL}/repositories/{workspace}/{repo}/diff/{}",
+            encode_path(spec)
+        );
+        self.send_get_text(url).await
+    }
+
+    /// ソースのディレクトリ列挙を取得する（`path` 空でルート）。
+    ///
+    /// `commit` はブランチ名/ハッシュ。`commit`/`path` の `/` は温存し、その他の文字を
+    /// percent-encode する。呼び出し側は [`SrcEntry::is_dir`] でディレクトリ/ファイルを判定し、
+    /// ファイルは [`BitbucketClient::get_src_file`] で内容を取得する。
+    pub async fn list_src(
+        &self,
+        workspace: &str,
+        repo: &str,
+        commit: &str,
+        path: &str,
+    ) -> Result<Vec<SrcEntry>, ApiError> {
+        let src_path = format!(
+            "/repositories/{workspace}/{repo}/src/{}/{}",
+            encode_path(commit),
+            encode_path(path)
+        );
+        self.get_paged(&src_path, &[("pagelen", "100")]).await
+    }
+
+    /// ソースのファイル内容を生テキストで取得する。
+    ///
+    /// バイナリ/巨大ファイルの判定・打切りは呼び出し側（TUI）が行う。
+    pub async fn get_src_file(
+        &self,
+        workspace: &str,
+        repo: &str,
+        commit: &str,
+        path: &str,
+    ) -> Result<String, ApiError> {
+        let url = format!(
+            "{BASE_URL}/repositories/{workspace}/{repo}/src/{}/{}",
+            encode_path(commit),
+            encode_path(path)
+        );
+        self.send_get_text(url).await
+    }
+
     /// ページングエンドポイントを `next` に従って全ページ集約する。
     ///
     /// 初回リクエストにのみ `query` を適用する。2 ページ目以降は Bitbucket が返す
@@ -440,6 +539,27 @@ fn percent_encode(input: &str) -> String {
     for &byte in input.as_bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(hex_digit(byte >> 4));
+                out.push(hex_digit(byte & 0x0f));
+            }
+        }
+    }
+    out
+}
+
+/// URL パス用のエンコード。[`percent_encode`] と違い `/` はセパレータとして温存する。
+///
+/// ブランチ名 `feature/x`・ソースパス `src/tui/app.rs` をそのまま使いつつ、空白などの
+/// 特殊文字だけを `%XX` へ変換する（unreserved + `/` 以外を全てエンコード）。
+fn encode_path(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for &byte in input.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
                 out.push(byte as char);
             }
             _ => {
@@ -624,6 +744,18 @@ mod tests {
     #[test]
     fn percent_encode_escapes_slash_and_space() {
         assert_eq!(percent_encode("a/b c"), "a%2Fb%20c");
+    }
+
+    #[test]
+    fn encode_path_preserves_slashes() {
+        // `/` は温存し、空白などのみエンコードする。
+        assert_eq!(encode_path("src/tui/my file.rs"), "src/tui/my%20file.rs");
+        assert_eq!(encode_path("feature/new-thing"), "feature/new-thing");
+    }
+
+    #[test]
+    fn encode_path_empty_is_empty() {
+        assert_eq!(encode_path(""), "");
     }
 
     #[tokio::test]

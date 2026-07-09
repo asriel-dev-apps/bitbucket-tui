@@ -7,8 +7,8 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
 
 use crate::api::{
-    ApiError, BitbucketClient, Comment, DiffStatEntry, MergeParams, MergeStrategy, Pipeline,
-    PipelineStep, PipelineTarget, PullRequest, Repository, User, Workspace,
+    ApiError, BitbucketClient, Branch, Comment, Commit, DiffStatEntry, MergeParams, MergeStrategy,
+    Pipeline, PipelineStep, PipelineTarget, PullRequest, Repository, SrcEntry, User, Workspace,
 };
 use crate::auth;
 use crate::config::Config;
@@ -28,6 +28,11 @@ pub enum Screen {
     Pipelines,
     PipelineDetail,
     StepLog,
+    Branches,
+    Commits,
+    CommitDetail,
+    Source,
+    FileView,
 }
 
 /// PR 一覧の state フィルタ。
@@ -224,6 +229,24 @@ impl DiffState {
     }
 }
 
+/// Source（ソースツリー閲覧）画面の状態。
+///
+/// 現在の `reference`（ブランチ名/ハッシュ）と `path`（ルートからのディレクトリパス。
+/// 空文字がルート）を保持し、ディレクトリ列挙を選択リストで表示する。
+#[derive(Debug, Default)]
+pub struct SourceState {
+    pub reference: String,
+    pub path: String,
+    pub entries: SelectList<SrcEntry>,
+}
+
+impl SourceState {
+    /// ヘッダ表示用の `ref:/path` 文字列。
+    pub fn location(&self) -> String {
+        format!("{}:/{}", self.reference, self.path)
+    }
+}
+
 /// ステータス行の状態。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
@@ -304,6 +327,25 @@ pub enum Msg {
     },
     /// stop / re-run の成功。
     PipelineActionDone { action: PipelineAction },
+    /// ブランチ一覧の取得完了。
+    BranchesLoaded { repo: String, branches: Vec<Branch> },
+    /// コミット履歴の取得完了。
+    CommitsLoaded {
+        revision: Option<String>,
+        commits: Vec<Commit>,
+    },
+    /// コミット詳細の取得完了。
+    CommitDetailLoaded { hash: String, commit: Box<Commit> },
+    /// コミット差分テキストの取得完了。
+    CommitDiffLoaded { spec: String, text: String },
+    /// ソースのディレクトリ列挙の取得完了。
+    SourceLoaded {
+        reference: String,
+        path: String,
+        entries: Vec<SrcEntry>,
+    },
+    /// ソースファイル内容の取得完了。
+    FileLoaded { path: String, text: String },
 }
 
 /// `update()` が返す副作用の指示。実行は `event` モジュールが担う。
@@ -427,11 +469,56 @@ pub enum Command {
         uuid: String,
     },
     /// パイプラインを再実行する。
+    ///
+    /// `target` は [`Commit`] を内包し大きめのため、enum サイズ抑制のため `Box` 化する。
     TriggerPipeline {
         client: BitbucketClient,
         workspace: String,
         repo: String,
-        target: PipelineTarget,
+        target: Box<PipelineTarget>,
+    },
+    /// ブランチ一覧を取得する。
+    LoadBranches {
+        client: BitbucketClient,
+        workspace: String,
+        repo: String,
+    },
+    /// コミット履歴を取得する（`revision` 省略時は既定ブランチ）。
+    LoadCommits {
+        client: BitbucketClient,
+        workspace: String,
+        repo: String,
+        revision: Option<String>,
+    },
+    /// コミット詳細を取得する。
+    LoadCommitDetail {
+        client: BitbucketClient,
+        workspace: String,
+        repo: String,
+        hash: String,
+    },
+    /// コミット差分テキストを取得する。
+    LoadCommitDiff {
+        client: BitbucketClient,
+        workspace: String,
+        repo: String,
+        spec: String,
+    },
+    /// ソースのディレクトリ列挙を取得する。
+    LoadSource {
+        client: BitbucketClient,
+        workspace: String,
+        repo: String,
+        reference: String,
+        path: String,
+    },
+    /// ソースファイル内容を取得する。
+    LoadFile {
+        client: BitbucketClient,
+        workspace: String,
+        repo: String,
+        reference: String,
+        path: String,
     },
 }
 
@@ -518,6 +605,8 @@ pub struct App {
     pub repositories: SelectList<Repository>,
     pub selected_workspace: Option<String>,
     pub selected_repo: Option<String>,
+    /// 選択リポジトリの既定ブランチ名（`mainbranch.name`）。Source ルートに使う。
+    pub repo_main_branch: Option<String>,
     pub pull_requests: SelectList<PullRequest>,
     pub pr_state_filter: PrStateFilter,
     pub current_pr: Option<PullRequest>,
@@ -536,6 +625,21 @@ pub struct App {
     pub confirm_modal: Option<ConfirmModal>,
     /// 進行中パイプラインの自動ポーリング更新が有効か。
     pub auto_refresh: bool,
+    /// Diff 画面から `Esc` で戻る先（PR 詳細 or コミット詳細）。
+    pub diff_return: Screen,
+    pub branches: SelectList<Branch>,
+    pub commits: SelectList<Commit>,
+    /// Commits 画面が表示中の revision（ブランチ名/ハッシュ、既定は `None`）。
+    pub commits_revision: Option<String>,
+    pub current_commit: Option<Commit>,
+    /// CommitDetail のメッセージスクロール量。
+    pub commit_scroll: u16,
+    pub source: Option<SourceState>,
+    pub file_view: Option<LogView>,
+    /// FileView で開いているファイルのパス（受信結果の照合キー）。
+    pub open_file_path: Option<String>,
+    /// 開いているファイルの mimetype（バイナリ判定に使う）。
+    pub open_file_mimetype: Option<String>,
     pub status: Status,
     pub show_help: bool,
 }
@@ -565,6 +669,7 @@ impl App {
             repositories: SelectList::default(),
             selected_workspace: None,
             selected_repo: None,
+            repo_main_branch: None,
             pull_requests: SelectList::default(),
             pr_state_filter: PrStateFilter::Open,
             current_pr: None,
@@ -581,6 +686,16 @@ impl App {
             open_step_uuid: None,
             confirm_modal: None,
             auto_refresh: true,
+            diff_return: Screen::PullRequestDetail,
+            branches: SelectList::default(),
+            commits: SelectList::default(),
+            commits_revision: None,
+            current_commit: None,
+            commit_scroll: 0,
+            source: None,
+            file_view: None,
+            open_file_path: None,
+            open_file_mimetype: None,
             status: Status::Idle,
             show_help: false,
         }
@@ -766,6 +881,70 @@ impl App {
                     }
                 }
             }
+            Msg::BranchesLoaded { repo, branches } => {
+                if self.repo_slug().as_deref() == Some(repo.as_str()) {
+                    self.clear_loading();
+                    self.branches.set_items(branches);
+                }
+                Command::None
+            }
+            Msg::CommitsLoaded { revision, commits } => {
+                if self.commits_revision == revision {
+                    self.clear_loading();
+                    self.commits.set_items(commits);
+                }
+                Command::None
+            }
+            Msg::CommitDetailLoaded { hash, commit } => {
+                if self.current_commit_hash() == Some(hash.as_str()) {
+                    self.clear_loading();
+                    self.current_commit = Some(*commit);
+                }
+                Command::None
+            }
+            Msg::CommitDiffLoaded { spec, text } => {
+                if self.current_commit_hash() == Some(spec.as_str()) {
+                    self.clear_loading();
+                    self.diff = Some(DiffState {
+                        parsed: parse_diff(&text),
+                        scroll: 0,
+                        viewport: 0,
+                        title: short_hash_str(&spec),
+                    });
+                }
+                Command::None
+            }
+            Msg::SourceLoaded {
+                reference,
+                path,
+                mut entries,
+            } => {
+                let matches = self
+                    .source
+                    .as_ref()
+                    .is_some_and(|source| source.reference == reference && source.path == path);
+                if matches {
+                    self.clear_loading();
+                    sort_src_entries(&mut entries);
+                    if let Some(source) = self.source.as_mut() {
+                        source.entries.set_items(entries);
+                    }
+                }
+                Command::None
+            }
+            Msg::FileLoaded { path, text } => {
+                if self.open_file_path.as_deref() == Some(path.as_str()) {
+                    self.clear_loading();
+                    let mimetype = self.open_file_mimetype.clone();
+                    self.file_view = Some(LogView::from_file(
+                        path.clone(),
+                        path,
+                        mimetype.as_deref(),
+                        &text,
+                    ));
+                }
+                Command::None
+            }
         }
     }
 
@@ -845,6 +1024,11 @@ impl App {
             Screen::Pipelines => self.on_key_pipelines(key),
             Screen::PipelineDetail => self.on_key_pipeline_detail(key),
             Screen::StepLog => self.on_key_step_log(key),
+            Screen::Branches => self.on_key_branches(key),
+            Screen::Commits => self.on_key_commits(key),
+            Screen::CommitDetail => self.on_key_commit_detail(key),
+            Screen::Source => self.on_key_source(key),
+            Screen::FileView => self.on_key_file_view(key),
         }
     }
 
@@ -967,21 +1151,49 @@ impl App {
                 Command::None
             }
             KeyCode::Enter => {
-                if let Some(repo) = self.repositories.selected() {
-                    self.selected_repo = Some(repo.full_name.clone());
-                    return self.open_pull_requests();
-                }
-                Command::None
+                let Some(repo) = self.repositories.selected().cloned() else {
+                    return Command::None;
+                };
+                self.select_repo(&repo);
+                self.open_pull_requests()
             }
             KeyCode::Char('p') => {
-                if let Some(repo) = self.repositories.selected() {
-                    self.selected_repo = Some(repo.full_name.clone());
-                    return self.open_pipelines();
-                }
-                Command::None
+                let Some(repo) = self.repositories.selected().cloned() else {
+                    return Command::None;
+                };
+                self.select_repo(&repo);
+                self.open_pipelines()
+            }
+            KeyCode::Char('b') => {
+                let Some(repo) = self.repositories.selected().cloned() else {
+                    return Command::None;
+                };
+                self.select_repo(&repo);
+                self.open_branches()
+            }
+            KeyCode::Char('s') => {
+                let Some(repo) = self.repositories.selected().cloned() else {
+                    return Command::None;
+                };
+                self.select_repo(&repo);
+                let branch = self.default_source_ref();
+                self.open_source_root(branch)
             }
             _ => Command::None,
         }
+    }
+
+    /// 選択リポジトリを確定する（`ws/repo` と既定ブランチを保持）。
+    fn select_repo(&mut self, repo: &Repository) {
+        self.selected_repo = Some(repo.full_name.clone());
+        self.repo_main_branch = repo.main_branch_name().map(str::to_string);
+    }
+
+    /// Source ルートに使う既定ブランチ名（未取得なら `main` にフォールバック）。
+    fn default_source_ref(&self) -> String {
+        self.repo_main_branch
+            .clone()
+            .unwrap_or_else(|| "main".to_string())
     }
 
     /// PR 一覧画面へ遷移し、OPEN の一覧取得を開始する。
@@ -1037,6 +1249,11 @@ impl App {
             KeyCode::Char('a') => self.set_pr_filter(PrStateFilter::All),
             KeyCode::Char('r') => self.reload_pull_requests(),
             KeyCode::Char('P') => self.open_pipelines(),
+            KeyCode::Char('b') => self.open_branches(),
+            KeyCode::Char('s') => {
+                let branch = self.default_source_ref();
+                self.open_source_root(branch)
+            }
             KeyCode::Enter => self.open_pr_detail(),
             _ => Command::None,
         }
@@ -1133,6 +1350,7 @@ impl App {
         let Some(id) = self.current_pr_id() else {
             return Command::None;
         };
+        self.diff_return = Screen::PullRequestDetail;
         self.screen = Screen::Diff;
         if self.diff.is_some() {
             self.clear_loading();
@@ -1354,7 +1572,7 @@ impl App {
                 return Command::None;
             }
             KeyCode::Esc => {
-                self.screen = Screen::PullRequestDetail;
+                self.screen = self.diff_return;
                 return Command::None;
             }
             _ => {}
@@ -1710,7 +1928,7 @@ impl App {
                     client,
                     workspace,
                     repo,
-                    target,
+                    target: Box::new(target),
                 }
             }
         }
@@ -1797,6 +2015,367 @@ impl App {
         } else {
             format!("{build} / {name}")
         }
+    }
+
+    // ---- リポジトリブラウズ（M3） ----
+
+    /// Branches 一覧画面へ遷移し、取得を開始する。
+    fn open_branches(&mut self) -> Command {
+        self.screen = Screen::Branches;
+        self.branches.set_items(Vec::new());
+        self.reload_branches()
+    }
+
+    /// ブランチ一覧を取得する。
+    fn reload_branches(&mut self) -> Command {
+        let Some((client, workspace, repo)) = self.review_context() else {
+            self.status = Status::Error("認証クライアントが未初期化です".to_string());
+            return Command::None;
+        };
+        self.status = Status::Loading("ブランチ一覧を取得中…".to_string());
+        Command::LoadBranches {
+            client,
+            workspace,
+            repo,
+        }
+    }
+
+    fn on_key_branches(&mut self, key: KeyEvent) -> Command {
+        match key.code {
+            KeyCode::Char('q') => Command::Quit,
+            KeyCode::Char('?') => {
+                self.show_help = true;
+                Command::None
+            }
+            KeyCode::Esc => {
+                self.screen = Screen::Repositories;
+                self.status = Status::Idle;
+                Command::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.branches.select_next();
+                Command::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.branches.select_prev();
+                Command::None
+            }
+            KeyCode::Char('r') => self.reload_branches(),
+            KeyCode::Char('s') => match self.selected_branch_name() {
+                Some(name) => self.open_source_root(name),
+                None => Command::None,
+            },
+            KeyCode::Enter => match self.selected_branch_name() {
+                Some(name) => self.open_commits(name),
+                None => Command::None,
+            },
+            _ => Command::None,
+        }
+    }
+
+    /// 選択中ブランチの名前（無ければ `None`）。
+    fn selected_branch_name(&self) -> Option<String> {
+        self.branches
+            .selected()
+            .and_then(|branch| branch.name.clone())
+    }
+
+    /// 指定 revision の Commits 画面へ遷移し、履歴取得を開始する。
+    fn open_commits(&mut self, revision: String) -> Command {
+        self.screen = Screen::Commits;
+        self.commits_revision = Some(revision);
+        self.commits.set_items(Vec::new());
+        self.current_commit = None;
+        self.reload_commits()
+    }
+
+    /// 現在の revision でコミット履歴を再取得する。
+    fn reload_commits(&mut self) -> Command {
+        let Some((client, workspace, repo)) = self.review_context() else {
+            self.status = Status::Error("認証クライアントが未初期化です".to_string());
+            return Command::None;
+        };
+        let revision = self.commits_revision.clone();
+        self.status = Status::Loading(format!(
+            "コミット履歴を取得中…（{}）",
+            revision.as_deref().unwrap_or("既定ブランチ")
+        ));
+        Command::LoadCommits {
+            client,
+            workspace,
+            repo,
+            revision,
+        }
+    }
+
+    fn on_key_commits(&mut self, key: KeyEvent) -> Command {
+        match key.code {
+            KeyCode::Char('q') => Command::Quit,
+            KeyCode::Char('?') => {
+                self.show_help = true;
+                Command::None
+            }
+            KeyCode::Esc => {
+                self.screen = Screen::Branches;
+                self.status = Status::Idle;
+                Command::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.commits.select_next();
+                Command::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.commits.select_prev();
+                Command::None
+            }
+            KeyCode::Char('r') => self.reload_commits(),
+            KeyCode::Enter => self.open_commit_detail(),
+            _ => Command::None,
+        }
+    }
+
+    /// 選択中コミットの詳細画面へ遷移し、詳細取得を開始する。
+    fn open_commit_detail(&mut self) -> Command {
+        let Some(commit) = self.commits.selected().cloned() else {
+            return Command::None;
+        };
+        let Some(hash) = commit.hash.clone() else {
+            self.status = Status::Error("コミット hash がありません".to_string());
+            return Command::None;
+        };
+        self.current_commit = Some(commit);
+        self.commit_scroll = 0;
+        self.diff = None;
+        self.screen = Screen::CommitDetail;
+
+        let Some((client, workspace, repo)) = self.review_context() else {
+            self.status = Status::Error("認証クライアントが未初期化です".to_string());
+            return Command::None;
+        };
+        self.status = Status::Loading(format!("コミット {} を取得中…", short_hash_str(&hash)));
+        Command::LoadCommitDetail {
+            client,
+            workspace,
+            repo,
+            hash,
+        }
+    }
+
+    fn on_key_commit_detail(&mut self, key: KeyEvent) -> Command {
+        match key.code {
+            KeyCode::Char('q') => Command::Quit,
+            KeyCode::Char('?') => {
+                self.show_help = true;
+                Command::None
+            }
+            KeyCode::Esc => {
+                self.screen = Screen::Commits;
+                self.status = Status::Idle;
+                Command::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.commit_scroll = self.commit_scroll.saturating_add(1);
+                Command::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.commit_scroll = self.commit_scroll.saturating_sub(1);
+                Command::None
+            }
+            KeyCode::PageDown => {
+                self.commit_scroll = self.commit_scroll.saturating_add(5);
+                Command::None
+            }
+            KeyCode::PageUp => {
+                self.commit_scroll = self.commit_scroll.saturating_sub(5);
+                Command::None
+            }
+            KeyCode::Char('d') => self.open_commit_diff(),
+            _ => Command::None,
+        }
+    }
+
+    /// 現在のコミットの diff を M1 の Diff ビューアで開く。
+    fn open_commit_diff(&mut self) -> Command {
+        let Some(hash) = self.current_commit_hash().map(str::to_string) else {
+            self.status = Status::Error("コミット hash がありません".to_string());
+            return Command::None;
+        };
+        self.diff = None;
+        self.diff_return = Screen::CommitDetail;
+        self.screen = Screen::Diff;
+
+        let Some((client, workspace, repo)) = self.review_context() else {
+            self.status = Status::Error("認証クライアントが未初期化です".to_string());
+            return Command::None;
+        };
+        self.status = Status::Loading(format!(
+            "コミット {} の diff を取得中…",
+            short_hash_str(&hash)
+        ));
+        Command::LoadCommitDiff {
+            client,
+            workspace,
+            repo,
+            spec: hash,
+        }
+    }
+
+    /// 現在のコミットの hash。
+    fn current_commit_hash(&self) -> Option<&str> {
+        self.current_commit
+            .as_ref()
+            .and_then(|commit| commit.hash.as_deref())
+    }
+
+    /// 既定ブランチの Source ルートへ遷移する。
+    fn open_source_root(&mut self, reference: String) -> Command {
+        self.open_source(reference, String::new())
+    }
+
+    /// 指定 `reference` / `path` の Source 画面へ遷移し、列挙取得を開始する。
+    fn open_source(&mut self, reference: String, path: String) -> Command {
+        self.screen = Screen::Source;
+        self.source = Some(SourceState {
+            reference,
+            path,
+            entries: SelectList::default(),
+        });
+        self.reload_source()
+    }
+
+    /// 現在の Source（reference/path）の列挙を再取得する。
+    fn reload_source(&mut self) -> Command {
+        let Some(source) = self.source.as_ref() else {
+            return Command::None;
+        };
+        let reference = source.reference.clone();
+        let path = source.path.clone();
+        let location = source.location();
+        let Some((client, workspace, repo)) = self.review_context() else {
+            self.status = Status::Error("認証クライアントが未初期化です".to_string());
+            return Command::None;
+        };
+        self.status = Status::Loading(format!("ソースを取得中…（{location}）"));
+        Command::LoadSource {
+            client,
+            workspace,
+            repo,
+            reference,
+            path,
+        }
+    }
+
+    fn on_key_source(&mut self, key: KeyEvent) -> Command {
+        match key.code {
+            KeyCode::Char('q') => Command::Quit,
+            KeyCode::Char('?') => {
+                self.show_help = true;
+                Command::None
+            }
+            // Backspace / Esc = 親ディレクトリへ（ルートで repo へ戻る）。
+            KeyCode::Esc | KeyCode::Backspace => self.source_up(),
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(source) = self.source.as_mut() {
+                    source.entries.select_next();
+                }
+                Command::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(source) = self.source.as_mut() {
+                    source.entries.select_prev();
+                }
+                Command::None
+            }
+            KeyCode::Char('r') => self.reload_source(),
+            KeyCode::Enter => self.source_enter(),
+            _ => Command::None,
+        }
+    }
+
+    /// 選択中エントリを開く（ディレクトリなら潜る / ファイルなら FileView）。
+    fn source_enter(&mut self) -> Command {
+        let Some(source) = self.source.as_ref() else {
+            return Command::None;
+        };
+        let Some(entry) = source.entries.selected() else {
+            return Command::None;
+        };
+        let reference = source.reference.clone();
+        let path = entry.path_str().to_string();
+        if entry.is_dir() {
+            self.open_source(reference, path)
+        } else {
+            let mimetype = entry.mimetype.clone();
+            self.open_file(reference, path, mimetype)
+        }
+    }
+
+    /// 親ディレクトリへ戻る（ルートなら Repositories へ）。
+    fn source_up(&mut self) -> Command {
+        let parent = self.source.as_ref().and_then(|source| {
+            parent_dir(&source.path).map(|parent| (source.reference.clone(), parent))
+        });
+        match parent {
+            Some((reference, path)) => self.open_source(reference, path),
+            None => {
+                self.source = None;
+                self.screen = Screen::Repositories;
+                self.status = Status::Idle;
+                Command::None
+            }
+        }
+    }
+
+    /// ファイル内容の FileView 画面へ遷移し、取得を開始する。
+    fn open_file(&mut self, reference: String, path: String, mimetype: Option<String>) -> Command {
+        self.open_file_path = Some(path.clone());
+        self.open_file_mimetype = mimetype;
+        self.file_view = None;
+        self.screen = Screen::FileView;
+
+        let Some((client, workspace, repo)) = self.review_context() else {
+            self.status = Status::Error("認証クライアントが未初期化です".to_string());
+            return Command::None;
+        };
+        self.status = Status::Loading(format!("{path} を取得中…"));
+        Command::LoadFile {
+            client,
+            workspace,
+            repo,
+            reference,
+            path,
+        }
+    }
+
+    fn on_key_file_view(&mut self, key: KeyEvent) -> Command {
+        match key.code {
+            KeyCode::Char('q') => return Command::Quit,
+            KeyCode::Char('?') => {
+                self.show_help = true;
+                return Command::None;
+            }
+            KeyCode::Esc => {
+                self.screen = Screen::Source;
+                self.status = Status::Idle;
+                return Command::None;
+            }
+            _ => {}
+        }
+
+        let Some(view) = self.file_view.as_mut() else {
+            return Command::None;
+        };
+        let page = view.viewport.max(1);
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => view.scroll_down(1),
+            KeyCode::Up | KeyCode::Char('k') => view.scroll_up(1),
+            KeyCode::PageDown | KeyCode::Char('f') => view.scroll_down(page),
+            KeyCode::PageUp | KeyCode::Char('b') => view.scroll_up(page),
+            KeyCode::Char('g') | KeyCode::Home => view.scroll_to_top(),
+            KeyCode::Char('G') | KeyCode::End => view.scroll_to_bottom(),
+            _ => {}
+        }
+        Command::None
     }
 
     /// 詳細を再取得する（承認/マージ後の状態反映用。Loading 表示はしない）。
@@ -1886,6 +2465,35 @@ fn user_is_me(user: Option<&User>, me: &Me) -> bool {
         || (me.display_name.is_some() && user.display_name == me.display_name)
 }
 
+/// ディレクトリパスの親を返す。ルート（空文字）なら `None`（= repo へ戻る合図）。
+///
+/// 末尾スラッシュは無視する。`"a/b/c"` → `"a/b"`、`"a"` → `""`、`""` → `None`。
+fn parent_dir(path: &str) -> Option<String> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.rfind('/') {
+        Some(index) => Some(trimmed[..index].to_string()),
+        None => Some(String::new()),
+    }
+}
+
+/// ソースエントリを「ディレクトリ→ファイル」の順、各グループ内は名前昇順に並べ替える。
+fn sort_src_entries(entries: &mut [SrcEntry]) {
+    entries.sort_by(|a, b| {
+        // ディレクトリを先に（true が先）。
+        b.is_dir()
+            .cmp(&a.is_dir())
+            .then_with(|| a.name().to_lowercase().cmp(&b.name().to_lowercase()))
+    });
+}
+
+/// hash 文字列の短縮形（先頭 8 文字）。
+fn short_hash_str(hash: &str) -> String {
+    hash.chars().take(8).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1917,6 +2525,18 @@ mod tests {
         app
     }
 
+    fn make_repo(full_name: &str, main_branch: Option<&str>) -> Repository {
+        let name = full_name.rsplit('/').next().unwrap_or(full_name);
+        let mb = match main_branch {
+            Some(branch) => format!(r#", "mainbranch": {{ "name": "{branch}" }}"#),
+            None => String::new(),
+        };
+        let json = format!(
+            r#"{{ "full_name": "{full_name}", "name": "{name}", "is_private": false{mb} }}"#
+        );
+        serde_json::from_str(&json).expect("valid repo json")
+    }
+
     fn make_pr(id: u64, state: &str) -> PullRequest {
         let json = format!(
             r#"{{ "id": {id}, "title": "PR {id}", "state": "{state}",
@@ -1926,6 +2546,27 @@ mod tests {
                   "close_source_branch": true, "participants": [] }}"#
         );
         serde_json::from_str(&json).expect("valid pr json")
+    }
+
+    fn make_branch(name: &str, hash: &str) -> Branch {
+        let json = format!(
+            r#"{{ "name": "{name}", "target": {{ "hash": "{hash}",
+                  "date": "2026-07-01T00:00:00Z", "message": "msg subject" }} }}"#
+        );
+        serde_json::from_str(&json).expect("valid branch json")
+    }
+
+    fn make_commit(hash: &str, message: &str) -> Commit {
+        let json = format!(
+            r#"{{ "hash": "{hash}", "message": "{message}",
+                  "date": "2026-07-02T00:00:00Z", "author": {{ "raw": "Alice" }} }}"#
+        );
+        serde_json::from_str(&json).expect("valid commit json")
+    }
+
+    fn make_src_entry(entry_type: &str, path: &str) -> SrcEntry {
+        let json = format!(r#"{{ "type": "{entry_type}", "path": "{path}" }}"#);
+        serde_json::from_str(&json).expect("valid src entry json")
     }
 
     fn make_pipeline(uuid: &str, build: u64, state: &str, result: Option<&str>) -> Pipeline {
@@ -2040,12 +2681,7 @@ mod tests {
         app.selected_workspace = Some("current".to_string());
         app.update(Msg::RepositoriesLoaded {
             workspace: "stale".to_string(),
-            repos: vec![Repository {
-                full_name: "x/y".to_string(),
-                name: "y".to_string(),
-                updated_on: None,
-                is_private: false,
-            }],
+            repos: vec![make_repo("x/y", None)],
         });
         assert!(app.repositories.items.is_empty());
     }
@@ -2057,12 +2693,7 @@ mod tests {
         app.screen = Screen::Repositories;
         app.update(Msg::RepositoriesLoaded {
             workspace: "acme".to_string(),
-            repos: vec![Repository {
-                full_name: "acme/widget".to_string(),
-                name: "widget".to_string(),
-                updated_on: None,
-                is_private: true,
-            }],
+            repos: vec![make_repo("acme/widget", None)],
         });
         let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
         assert_eq!(app.screen, Screen::PullRequests);
@@ -2350,12 +2981,8 @@ mod tests {
         let mut app = review_app();
         app.selected_repo = None;
         app.screen = Screen::Repositories;
-        app.repositories.set_items(vec![Repository {
-            full_name: "acme/widget".to_string(),
-            name: "widget".to_string(),
-            updated_on: None,
-            is_private: false,
-        }]);
+        app.repositories
+            .set_items(vec![make_repo("acme/widget", None)]);
         let cmd = app.update(Msg::Key(key(KeyCode::Char('p'))));
         assert_eq!(app.screen, Screen::Pipelines);
         assert_eq!(app.selected_repo.as_deref(), Some("acme/widget"));
@@ -2654,5 +3281,428 @@ mod tests {
         assert!(!app.auto_refresh);
         app.update(Msg::Key(key(KeyCode::Char('a'))));
         assert!(app.auto_refresh);
+    }
+
+    // ---- M3: リポジトリブラウズ ----
+
+    #[test]
+    fn repositories_b_opens_branches() {
+        let mut app = review_app();
+        app.selected_repo = None;
+        app.screen = Screen::Repositories;
+        app.repositories
+            .set_items(vec![make_repo("acme/widget", Some("main"))]);
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('b'))));
+        assert_eq!(app.screen, Screen::Branches);
+        assert_eq!(app.selected_repo.as_deref(), Some("acme/widget"));
+        assert_eq!(app.repo_main_branch.as_deref(), Some("main"));
+        assert!(matches!(cmd, Command::LoadBranches { .. }));
+    }
+
+    #[test]
+    fn repositories_s_opens_source_root_with_main_branch() {
+        let mut app = review_app();
+        app.selected_repo = None;
+        app.screen = Screen::Repositories;
+        app.repositories
+            .set_items(vec![make_repo("acme/widget", Some("develop"))]);
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('s'))));
+        assert_eq!(app.screen, Screen::Source);
+        assert_eq!(app.repo_main_branch.as_deref(), Some("develop"));
+        let source = app.source.as_ref().expect("source state");
+        assert_eq!(source.reference, "develop");
+        assert!(source.path.is_empty());
+        match cmd {
+            Command::LoadSource {
+                reference, path, ..
+            } => {
+                assert_eq!(reference, "develop");
+                assert_eq!(path, "");
+            }
+            other => panic!("expected LoadSource, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repositories_s_falls_back_to_main_without_mainbranch() {
+        let mut app = review_app();
+        app.selected_repo = None;
+        app.screen = Screen::Repositories;
+        app.repositories
+            .set_items(vec![make_repo("acme/widget", None)]);
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('s'))));
+        match cmd {
+            Command::LoadSource { reference, .. } => assert_eq!(reference, "main"),
+            other => panic!("expected LoadSource, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pull_requests_b_and_s_enter_browse() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.repo_main_branch = Some("trunk".to_string());
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('b'))));
+        assert_eq!(app.screen, Screen::Branches);
+        assert!(matches!(cmd, Command::LoadBranches { .. }));
+
+        app.screen = Screen::PullRequests;
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('s'))));
+        assert_eq!(app.screen, Screen::Source);
+        match cmd {
+            Command::LoadSource { reference, .. } => assert_eq!(reference, "trunk"),
+            other => panic!("expected LoadSource, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn branches_loaded_sets_items_for_matching_repo() {
+        let mut app = review_app();
+        app.screen = Screen::Branches;
+        app.update(Msg::BranchesLoaded {
+            repo: "widget".to_string(),
+            branches: vec![
+                make_branch("main", "aaaaaaaa1111"),
+                make_branch("dev", "bbbbbbbb2222"),
+            ],
+        });
+        assert_eq!(app.branches.items.len(), 2);
+        assert_eq!(app.branches.state.selected(), Some(0));
+    }
+
+    #[test]
+    fn branches_loaded_ignored_for_stale_repo() {
+        let mut app = review_app();
+        app.screen = Screen::Branches;
+        app.update(Msg::BranchesLoaded {
+            repo: "other".to_string(),
+            branches: vec![make_branch("main", "aaaa")],
+        });
+        assert!(app.branches.items.is_empty());
+    }
+
+    #[test]
+    fn branches_enter_opens_commits() {
+        let mut app = review_app();
+        app.screen = Screen::Branches;
+        app.branches
+            .set_items(vec![make_branch("feature/x", "cccccccc3333")]);
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+        assert_eq!(app.screen, Screen::Commits);
+        assert_eq!(app.commits_revision.as_deref(), Some("feature/x"));
+        match cmd {
+            Command::LoadCommits { revision, .. } => {
+                assert_eq!(revision.as_deref(), Some("feature/x"));
+            }
+            other => panic!("expected LoadCommits, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn branches_s_opens_source_root_of_branch() {
+        let mut app = review_app();
+        app.screen = Screen::Branches;
+        app.branches.set_items(vec![make_branch("dev", "dddd4444")]);
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('s'))));
+        assert_eq!(app.screen, Screen::Source);
+        match cmd {
+            Command::LoadSource {
+                reference, path, ..
+            } => {
+                assert_eq!(reference, "dev");
+                assert_eq!(path, "");
+            }
+            other => panic!("expected LoadSource, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commits_loaded_matches_revision() {
+        let mut app = review_app();
+        app.screen = Screen::Commits;
+        app.commits_revision = Some("main".to_string());
+        app.update(Msg::CommitsLoaded {
+            revision: Some("main".to_string()),
+            commits: vec![make_commit("aaaa1111", "x"), make_commit("bbbb2222", "y")],
+        });
+        assert_eq!(app.commits.items.len(), 2);
+    }
+
+    #[test]
+    fn commits_loaded_ignored_for_stale_revision() {
+        let mut app = review_app();
+        app.screen = Screen::Commits;
+        app.commits_revision = Some("main".to_string());
+        app.update(Msg::CommitsLoaded {
+            revision: Some("other".to_string()),
+            commits: vec![make_commit("zzzz9999", "z")],
+        });
+        assert!(app.commits.items.is_empty());
+    }
+
+    #[test]
+    fn commit_enter_opens_detail() {
+        let mut app = review_app();
+        app.screen = Screen::Commits;
+        app.commits
+            .set_items(vec![make_commit("abcdef123456", "subject")]);
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+        assert_eq!(app.screen, Screen::CommitDetail);
+        assert_eq!(app.current_commit_hash(), Some("abcdef123456"));
+        match cmd {
+            Command::LoadCommitDetail { hash, .. } => assert_eq!(hash, "abcdef123456"),
+            other => panic!("expected LoadCommitDetail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commit_detail_d_opens_commit_diff() {
+        let mut app = review_app();
+        app.screen = Screen::CommitDetail;
+        app.current_commit = Some(make_commit("abcdef123456", "subject"));
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('d'))));
+        assert_eq!(app.screen, Screen::Diff);
+        assert_eq!(app.diff_return, Screen::CommitDetail);
+        match cmd {
+            Command::LoadCommitDiff { spec, .. } => assert_eq!(spec, "abcdef123456"),
+            other => panic!("expected LoadCommitDiff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commit_diff_loaded_parses_scrolls_and_esc_returns() {
+        let mut app = review_app();
+        app.current_commit = Some(make_commit("abcdef123456", "subject"));
+        app.screen = Screen::Diff;
+        app.diff_return = Screen::CommitDetail;
+        app.update(Msg::CommitDiffLoaded {
+            spec: "abcdef123456".to_string(),
+            text: "diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n".to_string(),
+        });
+        let diff = app.diff.as_ref().expect("diff present");
+        assert_eq!(diff.parsed.len(), 4);
+        assert_eq!(diff.title, "abcdef12");
+        app.update(Msg::Key(key(KeyCode::Char('j'))));
+        assert_eq!(app.diff.as_ref().expect("diff").scroll, 1);
+        // commit 由来の Diff は Esc で CommitDetail へ戻る。
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        assert_eq!(app.screen, Screen::CommitDetail);
+    }
+
+    #[test]
+    fn commit_diff_loaded_ignored_for_stale_spec() {
+        let mut app = review_app();
+        app.current_commit = Some(make_commit("abcdef123456", "subject"));
+        app.screen = Screen::Diff;
+        app.update(Msg::CommitDiffLoaded {
+            spec: "0000".to_string(),
+            text: "diff --git a/x b/x\n".to_string(),
+        });
+        assert!(app.diff.is_none());
+    }
+
+    #[test]
+    fn pr_diff_esc_returns_to_pull_request_detail() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequestDetail;
+        app.current_pr = Some(make_pr(9, "OPEN"));
+        app.update(Msg::Key(key(KeyCode::Char('d'))));
+        assert_eq!(app.screen, Screen::Diff);
+        assert_eq!(app.diff_return, Screen::PullRequestDetail);
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        assert_eq!(app.screen, Screen::PullRequestDetail);
+    }
+
+    #[test]
+    fn source_loaded_sorts_dirs_first_then_files() {
+        let mut app = review_app();
+        app.screen = Screen::Source;
+        app.source = Some(SourceState {
+            reference: "main".to_string(),
+            path: String::new(),
+            entries: SelectList::default(),
+        });
+        app.update(Msg::SourceLoaded {
+            reference: "main".to_string(),
+            path: String::new(),
+            entries: vec![
+                make_src_entry("commit_file", "README.md"),
+                make_src_entry("commit_directory", "src"),
+                make_src_entry("commit_file", "Cargo.toml"),
+                make_src_entry("commit_directory", "docs"),
+            ],
+        });
+        let entries = &app.source.as_ref().expect("source").entries.items;
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].name(), "docs");
+        assert_eq!(entries[1].name(), "src");
+        assert_eq!(entries[2].name(), "Cargo.toml");
+        assert_eq!(entries[3].name(), "README.md");
+    }
+
+    #[test]
+    fn source_loaded_ignored_for_stale_path() {
+        let mut app = review_app();
+        app.screen = Screen::Source;
+        app.source = Some(SourceState {
+            reference: "main".to_string(),
+            path: "src".to_string(),
+            entries: SelectList::default(),
+        });
+        app.update(Msg::SourceLoaded {
+            reference: "main".to_string(),
+            path: "docs".to_string(),
+            entries: vec![make_src_entry("commit_file", "docs/x.md")],
+        });
+        assert!(
+            app.source
+                .as_ref()
+                .expect("source")
+                .entries
+                .items
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn source_enter_descends_into_directory() {
+        let mut app = review_app();
+        app.screen = Screen::Source;
+        let mut state = SourceState {
+            reference: "main".to_string(),
+            path: String::new(),
+            entries: SelectList::default(),
+        };
+        state
+            .entries
+            .set_items(vec![make_src_entry("commit_directory", "src")]);
+        app.source = Some(state);
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+        assert_eq!(app.screen, Screen::Source);
+        assert_eq!(app.source.as_ref().expect("source").path, "src");
+        match cmd {
+            Command::LoadSource { path, .. } => assert_eq!(path, "src"),
+            other => panic!("expected LoadSource, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_enter_opens_file_view() {
+        let mut app = review_app();
+        app.screen = Screen::Source;
+        let mut state = SourceState {
+            reference: "main".to_string(),
+            path: "src".to_string(),
+            entries: SelectList::default(),
+        };
+        state
+            .entries
+            .set_items(vec![make_src_entry("commit_file", "src/main.rs")]);
+        app.source = Some(state);
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+        assert_eq!(app.screen, Screen::FileView);
+        assert_eq!(app.open_file_path.as_deref(), Some("src/main.rs"));
+        match cmd {
+            Command::LoadFile { path, .. } => assert_eq!(path, "src/main.rs"),
+            other => panic!("expected LoadFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_up_navigates_to_parent_directory() {
+        let mut app = review_app();
+        app.screen = Screen::Source;
+        app.source = Some(SourceState {
+            reference: "main".to_string(),
+            path: "src/tui".to_string(),
+            entries: SelectList::default(),
+        });
+        let cmd = app.update(Msg::Key(key(KeyCode::Backspace)));
+        assert_eq!(app.screen, Screen::Source);
+        assert_eq!(app.source.as_ref().expect("source").path, "src");
+        assert!(matches!(cmd, Command::LoadSource { .. }));
+    }
+
+    #[test]
+    fn source_up_at_root_returns_to_repositories() {
+        let mut app = review_app();
+        app.screen = Screen::Source;
+        app.source = Some(SourceState {
+            reference: "main".to_string(),
+            path: String::new(),
+            entries: SelectList::default(),
+        });
+        let cmd = app.update(Msg::Key(key(KeyCode::Esc)));
+        assert_eq!(app.screen, Screen::Repositories);
+        assert!(app.source.is_none());
+        assert!(matches!(cmd, Command::None));
+    }
+
+    #[test]
+    fn file_loaded_builds_scrollable_view() {
+        let mut app = review_app();
+        app.screen = Screen::FileView;
+        app.open_file_path = Some("src/main.rs".to_string());
+        app.open_file_mimetype = Some("text/x-rust".to_string());
+        app.update(Msg::FileLoaded {
+            path: "src/main.rs".to_string(),
+            text: "a\nb\nc\nd\n".to_string(),
+        });
+        let view = app.file_view.as_ref().expect("file view");
+        assert!(!view.missing);
+        assert_eq!(view.lines.len(), 4);
+        app.update(Msg::Key(key(KeyCode::Char('j'))));
+        assert_eq!(app.file_view.as_ref().expect("view").scroll, 1);
+    }
+
+    #[test]
+    fn file_loaded_binary_shows_placeholder() {
+        let mut app = review_app();
+        app.screen = Screen::FileView;
+        app.open_file_path = Some("logo.png".to_string());
+        app.open_file_mimetype = Some("image/png".to_string());
+        app.update(Msg::FileLoaded {
+            path: "logo.png".to_string(),
+            text: "\u{0}\u{0}PNG".to_string(),
+        });
+        let view = app.file_view.as_ref().expect("file view");
+        assert!(view.missing);
+        assert_eq!(view.lines, vec!["(バイナリ表示不可)".to_string()]);
+    }
+
+    #[test]
+    fn file_loaded_ignored_for_stale_path() {
+        let mut app = review_app();
+        app.screen = Screen::FileView;
+        app.open_file_path = Some("a.rs".to_string());
+        app.update(Msg::FileLoaded {
+            path: "b.rs".to_string(),
+            text: "x".to_string(),
+        });
+        assert!(app.file_view.is_none());
+    }
+
+    #[test]
+    fn parent_dir_navigates_up() {
+        assert_eq!(parent_dir(""), None);
+        assert_eq!(parent_dir("src"), Some(String::new()));
+        assert_eq!(parent_dir("src/tui"), Some("src".to_string()));
+        assert_eq!(parent_dir("src/tui/"), Some("src".to_string()));
+        assert_eq!(parent_dir("a/b/c"), Some("a/b".to_string()));
+    }
+
+    #[test]
+    fn sort_src_entries_puts_dirs_first_alphabetically() {
+        let mut entries = vec![
+            make_src_entry("commit_file", "b.rs"),
+            make_src_entry("commit_directory", "z_dir"),
+            make_src_entry("commit_file", "a.rs"),
+            make_src_entry("commit_directory", "a_dir"),
+        ];
+        sort_src_entries(&mut entries);
+        assert_eq!(entries[0].name(), "a_dir");
+        assert_eq!(entries[1].name(), "z_dir");
+        assert_eq!(entries[2].name(), "a.rs");
+        assert_eq!(entries[3].name(), "b.rs");
     }
 }

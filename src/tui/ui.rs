@@ -11,7 +11,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::api::{
-    Comment, DiffStatEntry, MergeStrategy, Pipeline, PipelineStatus, PipelineStep, PullRequest,
+    Branch, Comment, Commit, DiffStatEntry, MergeStrategy, Pipeline, PipelineStatus, PipelineStep,
+    PullRequest, SrcEntry,
 };
 use crate::tui::app::{
     App, CommentEditor, ConfirmModal, DiffState, MergeModal, Screen, SelectList, Status,
@@ -44,6 +45,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Screen::Pipelines => render_pipelines(frame, chunks[1], app),
         Screen::PipelineDetail => render_pipeline_detail(frame, chunks[1], app),
         Screen::StepLog => render_step_log(frame, chunks[1], app),
+        Screen::Branches => render_branches(frame, chunks[1], app),
+        Screen::Commits => render_commits(frame, chunks[1], app),
+        Screen::CommitDetail => render_commit_detail(frame, chunks[1], app),
+        Screen::Source => render_source(frame, chunks[1], app),
+        Screen::FileView => render_file_view(frame, chunks[1], app),
     }
 
     render_status(frame, chunks[2], &app.status);
@@ -75,6 +81,11 @@ fn screen_title(screen: Screen) -> &'static str {
         Screen::Pipelines => "パイプライン",
         Screen::PipelineDetail => "パイプライン詳細",
         Screen::StepLog => "ステップログ",
+        Screen::Branches => "ブランチ",
+        Screen::Commits => "コミット履歴",
+        Screen::CommitDetail => "コミット詳細",
+        Screen::Source => "ソース",
+        Screen::FileView => "ファイル",
     }
 }
 
@@ -708,6 +719,218 @@ fn render_step_log(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(paragraph, area);
 }
 
+// ---- リポジトリブラウズ（M3） ----
+
+fn render_branches(frame: &mut Frame, area: Rect, app: &mut App) {
+    if app.branches.items.is_empty() {
+        render_placeholder(frame, area, &app.status, "ブランチがありません");
+        return;
+    }
+    let items: Vec<ListItem> = app
+        .branches
+        .items
+        .iter()
+        .map(|branch| ListItem::new(branch_row(branch)))
+        .collect();
+    let title = format!(" ブランチ ({}) ", app.branches.items.len());
+    let list = list_widget(items, title);
+    frame.render_stateful_widget(list, area, &mut app.branches.state);
+}
+
+fn branch_row(branch: &Branch) -> Line<'static> {
+    let name: String = branch.name_str().chars().take(30).collect();
+    let summary: String = branch.target_summary().chars().take(50).collect();
+    Line::from(vec![
+        Span::styled(format!("{name:<30}"), Style::new().fg(Color::Green)),
+        Span::styled(
+            format!("  {}", branch.target_short_hash()),
+            Style::new().fg(Color::Yellow),
+        ),
+        Span::styled(
+            format!("  {}", short_datetime(branch.target_date())),
+            Style::new().dim(),
+        ),
+        Span::raw(format!("  {summary}")),
+    ])
+}
+
+fn render_commits(frame: &mut Frame, area: Rect, app: &mut App) {
+    if app.commits.items.is_empty() {
+        render_placeholder(frame, area, &app.status, "コミットがありません");
+        return;
+    }
+    let items: Vec<ListItem> = app
+        .commits
+        .items
+        .iter()
+        .map(|commit| ListItem::new(commit_row(commit)))
+        .collect();
+    let revision = app.commits_revision.as_deref().unwrap_or("既定ブランチ");
+    let title = format!(" コミット [{revision}] ({}) ", app.commits.items.len());
+    let list = list_widget(items, title);
+    frame.render_stateful_widget(list, area, &mut app.commits.state);
+}
+
+fn commit_row(commit: &Commit) -> Line<'static> {
+    let author: String = commit.author_name().chars().take(16).collect();
+    let summary: String = commit.summary().chars().take(50).collect();
+    Line::from(vec![
+        Span::styled(
+            format!("{:<8}", commit.short_hash()),
+            Style::new().fg(Color::Yellow),
+        ),
+        Span::styled(
+            format!("  {}", short_datetime(commit.date_str())),
+            Style::new().dim(),
+        ),
+        Span::styled(format!("  {author:<16}"), Style::new().fg(Color::Blue)),
+        Span::raw(format!("  {summary}")),
+    ])
+}
+
+fn render_commit_detail(frame: &mut Frame, area: Rect, app: &mut App) {
+    match app.current_commit.as_ref() {
+        Some(commit) => render_commit_meta_body(frame, area, commit, app.commit_scroll),
+        None => render_placeholder(frame, area, &app.status, "コミットを選択してください"),
+    }
+}
+
+fn render_commit_meta_body(frame: &mut Frame, area: Rect, commit: &Commit, scroll: u16) {
+    let parents = commit.parent_short_hashes();
+    let parents_label = if parents.is_empty() {
+        "（なし）".to_string()
+    } else {
+        parents.join(", ")
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("commit ", Style::new().dim()),
+            Span::styled(
+                commit.hash_str().to_string(),
+                Style::new().fg(Color::Yellow).bold(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("author: ", Style::new().dim()),
+            Span::raw(commit.author_name().to_string()),
+            Span::styled("   date: ", Style::new().dim()),
+            Span::raw(short_datetime(commit.date_str())),
+        ]),
+        Line::from(vec![
+            Span::styled("parents: ", Style::new().dim()),
+            Span::styled(parents_label, Style::new().fg(Color::Cyan)),
+        ]),
+        Line::raw(""),
+    ];
+    let message = commit.message_str();
+    if message.trim().is_empty() {
+        lines.push(Line::from(Span::styled(
+            "（メッセージなし）",
+            Style::new().dim(),
+        )));
+    } else {
+        for raw in message.lines() {
+            lines.push(Line::raw(raw.to_string()));
+        }
+    }
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(" コミット "))
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+    frame.render_widget(paragraph, area);
+}
+
+fn render_source(frame: &mut Frame, area: Rect, app: &mut App) {
+    let Some(source) = app.source.as_mut() else {
+        render_placeholder(frame, area, &app.status, "ソースがありません");
+        return;
+    };
+    let title = format!(
+        " src {} ({}) ",
+        source.location(),
+        source.entries.items.len()
+    );
+    if source.entries.items.is_empty() {
+        let block = Block::default().borders(Borders::ALL).title(title);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "（空のディレクトリ）",
+                Style::new().dim(),
+            )))
+            .block(block),
+            area,
+        );
+        return;
+    }
+    let items: Vec<ListItem> = source
+        .entries
+        .items
+        .iter()
+        .map(|entry| ListItem::new(src_entry_row(entry)))
+        .collect();
+    let list = list_widget(items, title);
+    frame.render_stateful_widget(list, area, &mut source.entries.state);
+}
+
+fn src_entry_row(entry: &SrcEntry) -> Line<'static> {
+    if entry.is_dir() {
+        Line::from(Span::styled(
+            format!("{}/", entry.name()),
+            Style::new().fg(Color::Cyan).bold(),
+        ))
+    } else {
+        let size = entry.size.map(human_size).unwrap_or_default();
+        Line::from(vec![
+            Span::raw(entry.name().to_string()),
+            Span::styled(format!("  {size}"), Style::new().dim()),
+        ])
+    }
+}
+
+/// バイト数を `1.2KB` / `3.4MB` 形式に整形する。
+fn human_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    if bytes >= MB {
+        format!("{:.1}MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1}KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
+fn render_file_view(frame: &mut Frame, area: Rect, app: &mut App) {
+    let Some(view) = app.file_view.as_mut() else {
+        render_placeholder(frame, area, &app.status, "ファイルを取得しています…");
+        return;
+    };
+    // 枠線ぶんを差し引いたビューポート高さを保持（スクロール上限計算に使う）。
+    view.viewport = area.height.saturating_sub(2) as usize;
+    view.clamp_scroll();
+
+    let line_style = if view.missing {
+        Style::new().dim()
+    } else {
+        Style::new()
+    };
+    let lines: Vec<Line> = view
+        .lines
+        .iter()
+        .map(|line| Line::from(Span::styled(line.clone(), line_style)))
+        .collect();
+    let count_label = if view.missing {
+        "バイナリ".to_string()
+    } else {
+        format!("{} 行", view.lines.len())
+    };
+    let title = format!(" file {} ({count_label}) ", view.title);
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .scroll((view.scroll.min(u16::MAX as usize) as u16, 0));
+    frame.render_widget(paragraph, area);
+}
+
 /// ISO8601 文字列を `YYYY-MM-DD HH:MM` へ短縮する（`T` を空白に）。
 fn short_datetime(value: &str) -> String {
     let truncated: String = value.chars().take(16).collect();
@@ -797,9 +1020,11 @@ fn render_hints(frame: &mut Frame, area: Rect, screen: Screen) {
     let hint = match screen {
         Screen::Onboarding => "Tab/↑↓: フィールド切替   Enter: 次へ/検証   Ctrl+C: 終了",
         Screen::Workspaces => "↑↓ / j k: 移動   Enter: 開く   ?: ヘルプ   q: 終了",
-        Screen::Repositories => "↑↓ / j k: 移動   Enter: 選択   Esc: 戻る   ?: ヘルプ   q: 終了",
+        Screen::Repositories => {
+            "↑↓/jk: 移動  Enter: PR  p: パイプライン  b: ブランチ  s: ソース  Esc: 戻る  q: 終了"
+        }
         Screen::PullRequests => {
-            "↑↓/jk: 移動  Enter: 詳細  o/m/d/a: 状態  r: 再読込  P: パイプライン  Esc: 戻る"
+            "↑↓/jk: 移動  Enter: 詳細  o/m/d/a: 状態  r: 再読込  P: パイプライン  b/s: ブラウズ  Esc: 戻る"
         }
         Screen::PullRequestDetail => {
             "d: Diff  c: コメント  a: 承認  x: 変更要求  M: マージ  ↑↓: ファイル  Esc: 戻る"
@@ -812,6 +1037,13 @@ fn render_hints(frame: &mut Frame, area: Rect, screen: Screen) {
             "↑↓/jk: ステップ  Enter: ログ  r: 再読込  a: 自動更新  S: 停止  R: 再実行  Esc: 戻る"
         }
         Screen::StepLog => "↑↓/jk PgUp/PgDn g/G: スクロール  r: 再取得  Esc: 戻る  q: 終了",
+        Screen::Branches => {
+            "↑↓/jk: 移動  Enter: コミット履歴  s: ソース  r: 再読込  Esc: 戻る  q: 終了"
+        }
+        Screen::Commits => "↑↓/jk: 移動  Enter: 詳細  r: 再読込  Esc: 戻る  q: 終了",
+        Screen::CommitDetail => "d: Diff  ↑↓/jk PgUp/PgDn: スクロール  Esc: 戻る  q: 終了",
+        Screen::Source => "↑↓/jk: 移動  Enter: 開く  Backspace/Esc: 親へ  r: 再読込  q: 終了",
+        Screen::FileView => "↑↓/jk PgUp/PgDn g/G: スクロール  Esc: 戻る  q: 終了",
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(hint, Style::new().dim()))),
@@ -940,6 +1172,8 @@ fn render_help(frame: &mut Frame, screen: Screen) {
             "o / m / d / a  状態フィルタ (OPEN/MERGED/DECLINED/ALL)",
             "r              再読込",
             "Enter          PR 詳細を開く",
+            "P              パイプライン一覧を開く",
+            "b / s          ブランチ一覧 / ソースを開く",
         ],
         Screen::PullRequestDetail => &[
             "d              Diff を開く",
@@ -958,6 +1192,8 @@ fn render_help(frame: &mut Frame, screen: Screen) {
         Screen::Repositories => &[
             "Enter          プルリクエスト一覧を開く",
             "p              パイプライン一覧を開く",
+            "b              ブランチ一覧を開く",
+            "s              ソース（既定ブランチのルート）を開く",
         ],
         Screen::Pipelines => &[
             "Enter          パイプライン詳細を開く",
@@ -978,6 +1214,29 @@ fn render_help(frame: &mut Frame, screen: Screen) {
             "PgUp/PgDn      1 画面スクロール",
             "g / G          先頭 / 末尾",
             "r              ログ再取得（擬似 tail）",
+        ],
+        Screen::Branches => &[
+            "Enter          そのブランチのコミット履歴",
+            "s              そのブランチのソースルート",
+            "r              一覧を再読込",
+        ],
+        Screen::Commits => &[
+            "Enter          コミット詳細を開く",
+            "r              履歴を再読込",
+        ],
+        Screen::CommitDetail => &[
+            "d              このコミットの Diff を開く",
+            "↑↓ / PgUp/PgDn メッセージをスクロール",
+        ],
+        Screen::Source => &[
+            "Enter          ディレクトリを開く / ファイルを表示",
+            "Backspace/Esc  親ディレクトリへ（ルートで repo へ戻る）",
+            "r              再読込",
+        ],
+        Screen::FileView => &[
+            "↑↓ / j k       1 行スクロール",
+            "PgUp/PgDn      1 画面スクロール",
+            "g / G          先頭 / 末尾",
         ],
         _ => &[],
     };

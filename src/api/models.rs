@@ -65,6 +65,18 @@ pub struct Repository {
     pub updated_on: Option<String>,
     #[serde(default)]
     pub is_private: bool,
+    /// 既定ブランチ（`{ "type": "branch", "name": "main" }`）。M3 の Source ルートに使う。
+    #[serde(default)]
+    pub mainbranch: Option<Branch>,
+}
+
+impl Repository {
+    /// 既定ブランチ名（`mainbranch.name`）。
+    pub fn main_branch_name(&self) -> Option<&str> {
+        self.mainbranch
+            .as_ref()
+            .and_then(|branch| branch.name.as_deref())
+    }
 }
 
 /// PR の source / destination を表すブランチ参照。
@@ -80,19 +92,158 @@ pub struct BranchRef {
     pub commit: Option<Commit>,
 }
 
-/// ブランチ（名前のみ利用）。
+/// ブランチ。PR の source/destination では `name` のみ、M3 のブランチ一覧では
+/// 最終コミット（`target`）も利用する。
 #[derive(Debug, Clone, Deserialize)]
 pub struct Branch {
     #[serde(default)]
     pub name: Option<String>,
+    /// 最終コミット（ブランチが指す先）。`refs/branches` 応答で付与される。
+    #[serde(default)]
+    pub target: Option<Commit>,
 }
 
-/// コミット参照（hash のみ）。
+impl Branch {
+    /// ブランチ名（無ければ `?`）。
+    pub fn name_str(&self) -> &str {
+        self.name.as_deref().unwrap_or("?")
+    }
+
+    /// 最終コミットの短縮 hash。
+    pub fn target_short_hash(&self) -> String {
+        self.target
+            .as_ref()
+            .map(Commit::short_hash)
+            .unwrap_or_else(|| "?".to_string())
+    }
+
+    /// 最終コミットの日時（無ければ空文字）。
+    pub fn target_date(&self) -> &str {
+        self.target.as_ref().map(Commit::date_str).unwrap_or("")
+    }
+
+    /// 最終コミットメッセージの 1 行目（概要）。
+    pub fn target_summary(&self) -> &str {
+        self.target.as_ref().map(Commit::summary).unwrap_or("")
+    }
+}
+
+/// コミット作者（`{ "raw": "Name <email>", "user": {..} }`）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommitAuthor {
+    #[serde(default)]
+    pub raw: Option<String>,
+    #[serde(default)]
+    pub user: Option<User>,
+}
+
+/// コミット。PR/pipeline では `hash` のみ、M3 のコミット履歴/詳細では
+/// message/date/author/parents も利用する。id/hash 以外は `Option`/`#[serde(default)]`。
 #[derive(Debug, Clone, Deserialize)]
 pub struct Commit {
     #[serde(default)]
-    #[allow(dead_code, reason = "コミット hash 表示で使用予定")]
     pub hash: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub date: Option<String>,
+    #[serde(default)]
+    pub author: Option<CommitAuthor>,
+    /// 親コミット（マージコミットは複数）。表示は hash のみ。
+    #[serde(default)]
+    pub parents: Vec<Commit>,
+}
+
+impl Commit {
+    /// hash 全体（無ければ `?`）。
+    pub fn hash_str(&self) -> &str {
+        self.hash.as_deref().unwrap_or("?")
+    }
+
+    /// 短縮 hash（先頭 8 文字、無ければ `?`）。
+    pub fn short_hash(&self) -> String {
+        match self.hash.as_deref() {
+            Some(hash) => hash.chars().take(8).collect(),
+            None => "?".to_string(),
+        }
+    }
+
+    /// メッセージ全文（無ければ空文字）。
+    pub fn message_str(&self) -> &str {
+        self.message.as_deref().unwrap_or("")
+    }
+
+    /// メッセージの 1 行目（概要）。
+    pub fn summary(&self) -> &str {
+        self.message
+            .as_deref()
+            .and_then(|message| message.lines().next())
+            .unwrap_or("(メッセージなし)")
+    }
+
+    /// コミット日時（無ければ空文字）。
+    pub fn date_str(&self) -> &str {
+        self.date.as_deref().unwrap_or("")
+    }
+
+    /// 作者の表示名（`user.display_name` 優先、無ければ `raw`、無ければ `?`）。
+    pub fn author_name(&self) -> &str {
+        if let Some(author) = &self.author {
+            if let Some(name) = author
+                .user
+                .as_ref()
+                .and_then(|user| user.display_name.as_deref())
+            {
+                return name;
+            }
+            if let Some(raw) = author.raw.as_deref() {
+                return raw;
+            }
+        }
+        "?"
+    }
+
+    /// 親コミットの短縮 hash 一覧。
+    pub fn parent_short_hashes(&self) -> Vec<String> {
+        self.parents.iter().map(Commit::short_hash).collect()
+    }
+}
+
+/// `GET .../src/{commit}/{path}` がディレクトリのとき返す列挙エントリ。
+///
+/// `type`（`commit_directory`/`commit_file`）でディレクトリ/ファイルを判定する。
+/// フィールドは実 API で要検証のため `Option`/`#[serde(default)]` で耐性を持たせる。
+#[derive(Debug, Clone, Deserialize)]
+pub struct SrcEntry {
+    #[serde(rename = "type", default)]
+    pub entry_type: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
+    #[serde(default)]
+    pub mimetype: Option<String>,
+}
+
+impl SrcEntry {
+    /// ディレクトリか（`type == "commit_directory"`）。
+    pub fn is_dir(&self) -> bool {
+        self.entry_type.as_deref() == Some("commit_directory")
+    }
+
+    /// リポジトリルートからのフルパス（無ければ空文字）。
+    pub fn path_str(&self) -> &str {
+        self.path.as_deref().unwrap_or("")
+    }
+
+    /// 末尾セグメント（表示名）。
+    pub fn name(&self) -> &str {
+        let path = self.path_str().trim_end_matches('/');
+        match path.rsplit('/').next() {
+            Some(name) if !name.is_empty() => name,
+            _ => path,
+        }
+    }
 }
 
 /// Bitbucket の「レンダリング済みテキスト」共通形（`{ "raw": .., "html": .. }`）。
@@ -741,6 +892,118 @@ mod tests {
         assert_eq!(repo.full_name, "acme/widget");
         assert!(repo.is_private);
         assert_eq!(repo.updated_on.as_deref(), Some("2026-07-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn repository_reads_main_branch() {
+        let json = r#"{
+            "full_name": "acme/widget",
+            "name": "widget",
+            "mainbranch": { "type": "branch", "name": "develop" }
+        }"#;
+        let repo: Repository = serde_json::from_str(json).expect("valid json");
+        assert_eq!(repo.main_branch_name(), Some("develop"));
+    }
+
+    #[test]
+    fn repository_without_main_branch_is_none() {
+        let json = r#"{ "full_name": "acme/widget", "name": "widget" }"#;
+        let repo: Repository = serde_json::from_str(json).expect("valid json");
+        assert_eq!(repo.main_branch_name(), None);
+    }
+
+    #[test]
+    fn deserializes_branch_with_target() {
+        let json = r#"{
+            "name": "main",
+            "target": {
+                "hash": "abcdef1234567890",
+                "date": "2026-07-01T00:00:00Z",
+                "message": "Fix bug\n\n詳細",
+                "author": { "raw": "Alice <a@example.com>", "user": { "display_name": "Alice" } }
+            }
+        }"#;
+        let branch: Branch = serde_json::from_str(json).expect("valid json");
+        assert_eq!(branch.name_str(), "main");
+        assert_eq!(branch.target_short_hash(), "abcdef12");
+        assert_eq!(branch.target_date(), "2026-07-01T00:00:00Z");
+        assert_eq!(branch.target_summary(), "Fix bug");
+        let commit = branch.target.as_ref().expect("target present");
+        assert_eq!(commit.author_name(), "Alice");
+    }
+
+    #[test]
+    fn branch_tolerates_missing_target() {
+        let branch: Branch =
+            serde_json::from_str(r#"{ "name": "feature/x" }"#).expect("valid json");
+        assert_eq!(branch.name_str(), "feature/x");
+        assert_eq!(branch.target_short_hash(), "?");
+        assert_eq!(branch.target_summary(), "");
+    }
+
+    #[test]
+    fn deserializes_commit_with_parents_and_author() {
+        let json = r#"{
+            "hash": "0123456789ab",
+            "message": "Subject line\n\nBody text",
+            "date": "2026-07-02T03:04:05Z",
+            "author": { "raw": "Bob <b@example.com>" },
+            "parents": [ { "hash": "aaaaaaaaaaaa" }, { "hash": "bbbbbbbbbbbb" } ]
+        }"#;
+        let commit: Commit = serde_json::from_str(json).expect("valid json");
+        assert_eq!(commit.short_hash(), "01234567");
+        assert_eq!(commit.summary(), "Subject line");
+        assert_eq!(commit.message_str(), "Subject line\n\nBody text");
+        assert_eq!(commit.date_str(), "2026-07-02T03:04:05Z");
+        // user が無ければ raw をフォールバックに使う。
+        assert_eq!(commit.author_name(), "Bob <b@example.com>");
+        assert_eq!(
+            commit.parent_short_hashes(),
+            vec!["aaaaaaaa".to_string(), "bbbbbbbb".to_string()]
+        );
+    }
+
+    #[test]
+    fn commit_tolerates_only_hash() {
+        let commit: Commit = serde_json::from_str(r#"{ "hash": "deadbeef" }"#).expect("valid json");
+        assert_eq!(commit.hash_str(), "deadbeef");
+        assert_eq!(commit.short_hash(), "deadbeef");
+        assert_eq!(commit.summary(), "(メッセージなし)");
+        assert_eq!(commit.author_name(), "?");
+        assert!(commit.parent_short_hashes().is_empty());
+    }
+
+    #[test]
+    fn deserializes_src_directory_entry() {
+        let json = r#"{ "type": "commit_directory", "path": "src/tui", "future": 1 }"#;
+        let entry: SrcEntry = serde_json::from_str(json).expect("valid json");
+        assert!(entry.is_dir());
+        assert_eq!(entry.name(), "tui");
+        assert_eq!(entry.path_str(), "src/tui");
+    }
+
+    #[test]
+    fn deserializes_src_file_entry() {
+        let json = r#"{
+            "type": "commit_file", "path": "src/main.rs", "size": 1024, "mimetype": "text/x-rust"
+        }"#;
+        let entry: SrcEntry = serde_json::from_str(json).expect("valid json");
+        assert!(!entry.is_dir());
+        assert_eq!(entry.name(), "main.rs");
+        assert_eq!(entry.size, Some(1024));
+        assert_eq!(entry.mimetype.as_deref(), Some("text/x-rust"));
+    }
+
+    #[test]
+    fn src_entry_name_handles_root_level_and_trailing_slash() {
+        let file: SrcEntry =
+            serde_json::from_str(r#"{ "type": "commit_file", "path": "README.md" }"#)
+                .expect("valid json");
+        assert_eq!(file.name(), "README.md");
+        let dir: SrcEntry =
+            serde_json::from_str(r#"{ "type": "commit_directory", "path": "docs/" }"#)
+                .expect("valid json");
+        assert_eq!(dir.name(), "docs");
     }
 
     #[test]

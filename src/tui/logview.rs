@@ -1,7 +1,11 @@
-//! ステップログのスクロール表示状態と、ログテキストの整形。
+//! ステップログ / ファイル内容のスクロール表示状態と、テキストの整形。
 //!
 //! M1 の `DiffState` と同じスクロール操作（1 行 / 1 画面 / 先頭 / 末尾）を提供する汎用の
-//! ログビューア。ログには ANSI エスケープや制御文字が混じり得るため、表示前に除去する。
+//! ページャ。ログには ANSI エスケープや制御文字が混じり得るため、表示前に除去する。
+//! M3 の FileView もこの型を流用し、バイナリ/巨大ファイルは安全に代替表示する。
+
+/// FileView で先頭から表示する最大行数（超過分は打ち切って末尾に注記を付す）。
+pub const MAX_FILE_LINES: usize = 5000;
 
 /// ステップログの表示状態。
 #[derive(Debug, Clone, Default)]
@@ -27,6 +31,37 @@ impl LogView {
             step_uuid,
             title,
             lines: sanitize_log(text),
+            scroll: 0,
+            viewport: 0,
+            missing: false,
+        }
+    }
+
+    /// ソースファイル内容の表示状態を作る（M3 FileView 用）。
+    ///
+    /// mimetype または内容の NUL バイトからバイナリと判定した場合は
+    /// 「(バイナリ表示不可)」を表示する。巨大ファイルは先頭 [`MAX_FILE_LINES`] 行で打ち切る。
+    /// `key` は取得結果の照合に使うキー（ファイルパス）、`title` は見出し。
+    pub fn from_file(key: String, title: String, mimetype: Option<&str>, content: &str) -> Self {
+        if looks_binary(mimetype, content) {
+            return Self {
+                step_uuid: key,
+                title,
+                lines: vec!["(バイナリ表示不可)".to_string()],
+                scroll: 0,
+                viewport: 0,
+                missing: true,
+            };
+        }
+        let mut lines = sanitize_log(content);
+        if lines.len() > MAX_FILE_LINES {
+            lines.truncate(MAX_FILE_LINES);
+            lines.push(format!("… (先頭 {MAX_FILE_LINES} 行のみ表示・以降を省略)"));
+        }
+        Self {
+            step_uuid: key,
+            title,
+            lines,
             scroll: 0,
             viewport: 0,
             missing: false,
@@ -113,6 +148,50 @@ fn strip_ansi(input: &str) -> String {
     out
 }
 
+/// mimetype または内容の NUL バイト有無からバイナリかどうかを判定する。
+///
+/// `reqwest` の `text()` は lossy な UTF-8 変換を行うため、NUL バイト（`\0`）は文字として
+/// 残る。NUL を含めば無条件でバイナリ扱い。mimetype がある場合は既知のバイナリ種別
+/// （image/audio/video/octet-stream/font/zip/pdf/wasm 等、テキスト種別を除く）ならバイナリ。
+pub fn looks_binary(mimetype: Option<&str>, content: &str) -> bool {
+    if content.contains('\0') {
+        return true;
+    }
+    match mimetype {
+        Some(mime) => {
+            let mime = mime.to_ascii_lowercase();
+            !is_textual_mime(&mime) && is_binary_mime(&mime)
+        }
+        None => false,
+    }
+}
+
+/// テキストとして表示してよい mimetype か。
+fn is_textual_mime(mime: &str) -> bool {
+    mime.starts_with("text/")
+        || mime.contains("json")
+        || mime.contains("xml")
+        || mime.contains("javascript")
+        || mime.contains("ecmascript")
+        || mime.contains("yaml")
+        || mime.contains("toml")
+        || mime.contains("x-sh")
+        || mime.contains("x-www-form")
+}
+
+/// 既知のバイナリ mimetype か。
+fn is_binary_mime(mime: &str) -> bool {
+    mime.starts_with("image/")
+        || mime.starts_with("audio/")
+        || mime.starts_with("video/")
+        || mime.starts_with("application/octet-stream")
+        || mime.contains("font")
+        || mime.contains("zip")
+        || mime.contains("gzip")
+        || mime.contains("pdf")
+        || mime.contains("wasm")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +240,58 @@ mod tests {
         assert_eq!(view.scroll, 0);
         view.scroll_to_bottom();
         assert_eq!(view.scroll, 3);
+    }
+
+    #[test]
+    fn looks_binary_detects_nul_and_mimetypes() {
+        // NUL バイトは無条件でバイナリ。
+        assert!(looks_binary(None, "hello\0world"));
+        // 既知バイナリ mimetype。
+        assert!(looks_binary(Some("image/png"), "not really png"));
+        assert!(looks_binary(Some("application/octet-stream"), "abc"));
+        // テキスト種別・NUL 無しはテキスト。
+        assert!(!looks_binary(Some("text/x-rust"), "fn main() {}"));
+        assert!(!looks_binary(Some("application/json"), "{}"));
+        // mimetype 不明・NUL 無しはテキスト扱い（表示を試みる）。
+        assert!(!looks_binary(None, "plain text"));
+    }
+
+    #[test]
+    fn from_file_shows_placeholder_for_binary() {
+        let view = LogView::from_file(
+            "src/logo.png".to_string(),
+            "src/logo.png".to_string(),
+            Some("image/png"),
+            "\0\0binary",
+        );
+        assert!(view.missing);
+        assert_eq!(view.lines, vec!["(バイナリ表示不可)".to_string()]);
+    }
+
+    #[test]
+    fn from_file_keeps_text_content() {
+        let view = LogView::from_file(
+            "a.rs".to_string(),
+            "a.rs".to_string(),
+            Some("text/x-rust"),
+            "line1\nline2\n",
+        );
+        assert!(!view.missing);
+        assert_eq!(view.lines, vec!["line1".to_string(), "line2".to_string()]);
+    }
+
+    #[test]
+    fn from_file_truncates_large_content() {
+        let content = "x\n".repeat(MAX_FILE_LINES + 10);
+        let view = LogView::from_file(
+            "big.txt".to_string(),
+            "big.txt".to_string(),
+            Some("text/plain"),
+            &content,
+        );
+        // 先頭 MAX_FILE_LINES 行 + 打切り注記の 1 行。
+        assert_eq!(view.lines.len(), MAX_FILE_LINES + 1);
+        assert!(view.lines.last().expect("marker line").contains("省略"));
     }
 
     #[test]

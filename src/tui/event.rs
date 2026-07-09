@@ -420,6 +420,116 @@ fn dispatch(command: Command, api_tx: &mpsc::Sender<Msg>) -> bool {
             });
             true
         }
+        Command::LoadBranches {
+            client,
+            workspace,
+            repo,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let msg = match client.list_branches(&workspace, &repo).await {
+                    Ok(branches) => Msg::BranchesLoaded { repo, branches },
+                    Err(error) => Msg::LoadFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
+        Command::LoadCommits {
+            client,
+            workspace,
+            repo,
+            revision,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let msg = match client
+                    .list_commits(&workspace, &repo, revision.as_deref())
+                    .await
+                {
+                    Ok(commits) => Msg::CommitsLoaded { revision, commits },
+                    Err(error) => Msg::LoadFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
+        Command::LoadCommitDetail {
+            client,
+            workspace,
+            repo,
+            hash,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let msg = match client.get_commit(&workspace, &repo, &hash).await {
+                    Ok(commit) => Msg::CommitDetailLoaded {
+                        hash,
+                        commit: Box::new(commit),
+                    },
+                    Err(error) => Msg::LoadFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
+        Command::LoadCommitDiff {
+            client,
+            workspace,
+            repo,
+            spec,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let msg = match client.get_commit_diff(&workspace, &repo, &spec).await {
+                    Ok(text) => Msg::CommitDiffLoaded { spec, text },
+                    Err(error) => Msg::LoadFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
+        Command::LoadSource {
+            client,
+            workspace,
+            repo,
+            reference,
+            path,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let msg = match client.list_src(&workspace, &repo, &reference, &path).await {
+                    Ok(entries) => Msg::SourceLoaded {
+                        reference,
+                        path,
+                        entries,
+                    },
+                    Err(error) => Msg::LoadFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
+        Command::LoadFile {
+            client,
+            workspace,
+            repo,
+            reference,
+            path,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let msg = match client
+                    .get_src_file(&workspace, &repo, &reference, &path)
+                    .await
+                {
+                    Ok(text) => Msg::FileLoaded { path, text },
+                    Err(error) => Msg::LoadFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
     }
 }
 
