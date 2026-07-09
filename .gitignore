@@ -1,0 +1,6 @@
+/target
+*.log
+
+# Vendored dependencies + local cargo offline config (regenerate with `cargo vendor`)
+/vendor
+/.cargo/config.toml
