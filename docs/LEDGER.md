@@ -5,7 +5,7 @@
 ## マイルストーン状況
 
 - **M0 基盤**: **実装完了(2026-07-09)**。`cargo build/clippy(--all-targets -D warnings)/fmt --check/test` すべて green(--offline)。ユニット22件 pass + ネットワーク依存の smoke テスト1件 `#[ignore]`。実 API 結合確認(`GET /2.0/user`)は環境に実 token が無いためスキップ(下記の未検証の仮定は据え置き)。
-- M1 PRレビュー: 未着手
+- **M1 PRレビュー**: **実装完了(2026-07-09)**。`cargo build/clippy(--all-targets -D warnings)/fmt --check/test` すべて green(--offline)。ユニット54件 pass(+22→54) + `#[ignore]` 1件。`RepoSelected` を廃し repo 選択→PR一覧→詳細→Diff(色付きスクロール)→approve/unapprove・request-changes/取消・一般コメント投稿・merge(確認モーダル+strategy 選択+close source branch)を実装。**実 API 結合確認は環境に実 token が無いためスキップ**(PR/Comment/DiffStat の serde フィールド・state 値・merge 202・inline 位置は下記「未検証の仮定」のまま。build+clippy+モックテストのみで検証)。
 - M2 パイプライン監視: 未着手
 - M3 リポジトリブラウズ: 未着手
 
@@ -20,6 +20,17 @@
 - **keyring バックエンド → 解決済み(2026-07-09)**: `keyring = { features = ["apple-native"] }` を有効化し、`security-framework`/`core-foundation`(+ `-sys`)を vendor 追加。実行時は **macOS Keychain 実バックエンド**を使用し、token はプロセス再起動を跨いで永続化される(受け入れ条件「再起動で Onboarding スキップ」を実挙動で満たす)。全ゲート green を再確認済み。token は Keychain のみ・平文保存なしは不変。
   - 注: 現状 macOS 専用(`apple-native`)。Linux ビルド時は `keyring` に `linux-native` 等の feature を足して再 vendor が必要。
 - ログ出力先はポータブルに `ProjectDirs::cache_dir()` を採用(Linux=`~/.cache/bitbucket-tui/`、macOS=`~/Library/Caches/dev.bitbucket-tui/`)。spec の `~/.cache/...` は Linux 表記。
+
+## M1 実装メモ (2026-07-09)
+
+- **モジュール拡張**: `api/models.rs` に `PullRequest`/`Participant`/`BranchRef`/`Branch`/`Commit`/`RenderedText`/`Comment`/`CommentContent`/`Inline`/`CommentParent`/`DiffStatEntry`/`PathEntry`/`MergeStrategy`/`MergeParams` を追加(id 以外は `Option`/`#[serde(default)]` で耐性)。`api/client.rs` に `list_pull_requests`(states 複数指定=`state` 繰り返しクエリ)/`get_pull_request`/`get_pr_diff`(生テキスト)/`get_pr_diffstat`/`list_comments`/`approve`/`unapprove`/`request_changes`/`unrequest_changes`/`create_comment`/`merge_pull_request` と、共通ヘルパ `send_get_text`/`send_empty`(POST/DELETE ボディ無)/`send_json`/`send_json_discard`/`send_json_text` + `comment_body` を追加。`tui/diff.rs` を新規追加(ユニファイド diff の行分類+着色、ファイル境界追跡)。`tui/app.rs` に `Screen`{PullRequests,PullRequestDetail,Diff}・`Msg`/`Command` 拡張・`PrStateFilter`/`Me`/`MergeModal`/`CommentEditor`/`DiffState` を追加。`tui/ui.rs`/`tui/event.rs` を対応拡張。
+- **Elm パターン維持**: `update()->Command`、非同期は `event::dispatch` が `tokio::spawn`→`Msg`。詳細を開くと `Command::Batch([LoadPrDetail, LoadDiffStat, LoadComments])` を発行(**新規に `Command::Batch(Vec<Command>)` を導入**し dispatch が再帰展開)。approve/request-changes/merge/comment 成功後は該当 `LoadPrDetail`/`LoadComments` を再発行して状態を反映。
+- **diff 着色は手動**(syntect 不使用): 行頭で `+`=緑/`-`=赤/`@@`=シアン/`diff --git`=黄(bold)/`index`等メタ=淡色/context=既定。`+++`/`---` は追加/削除より先にメタ判定。`str::lines()` で末尾空行を出さない。ファイル境界は `diff --git`(無ければ `--- ` にフォールバック)を `n`/`N` ジャンプに使用。Diff のスクロールは `Paragraph::scroll`、上限は描画時に確定した viewport で算出(`DiffState.viewport` を毎フレーム更新)。
+- **破壊的操作の確認**: merge は必ず確認モーダル(`MergeModal`)経由。`M`=モーダルを開くだけ(merge しない)、モーダル内 `Enter` で初めて `Command::Merge`。strategy は `←/→/Tab` 巡回、close source branch は `Space` トグル。approve/request-changes は即時トグルで結果を `Status::Success` に表示(**`Status` に `Success` を追加**)。
+- **自分の承認状態判定はベストエフォート**: participant の `user` を `Me`{account_id,uuid,display_name} と照合(uuid/account_id/display_name のいずれか一致)。再起動時は `GET /2.0/user` を再取得しないため display_name のみで照合になり得る。誤判定しても merge 後の再取得で表示は補正される。→ **未検証**(実 participant の識別フィールドが不明)。
+- **コメントエディタ**: 複数行の簡易バッファ(末尾追記/backspace/Enter=改行のみ、任意位置編集は非対応)。`Ctrl+S`=送信 / `Esc`=取消。ボディは `{"content":{"raw":".."}}`。inline 投稿は未実装(stretch。一覧では inline アンカー `path:line` を表示)。
+- **large_enum_variant 回避**: `Msg::PrDetailLoaded` の `PullRequest` は `Box` 化(他の巨大 variant は無し)。
+- **未実施**: 実 token が無いため approve→diff→comment→merge の実結合確認はしていない。build+clippy(-D warnings)+モックテストのみ green。
 
 ## 検証済みの事実 (2026-07-09)
 
@@ -39,8 +50,14 @@
 
 - 必要スコープ名(`account`/`repository`/`pullrequest`/`pullrequest:write`/`pipeline`)の正確さ — 実際の 200/403 応答で確定させる。
 - `GET /2.0/workspaces` と `GET /2.0/repositories/{workspace}?role=member` のパラメータ挙動 — 実データで確認。
+- **(M1) PR/Comment/DiffStat の serde フィールド**: 仕様書の推定名で実装(`PullRequest.participants[].{approved,state,role}`、`DiffStatEntry.{status,lines_added,lines_removed,old.path,new.path}`、`Comment.{content.raw,inline.{path,from,to},deleted}` 等)。実 API 初回応答で有無/名称/値(特に `participant.state` の `changes_requested` 表記、`status` の `modified/added/removed/renamed`、PR `state` の `OPEN/MERGED/DECLINED/SUPERSEDED`)を確定し、モデルとフィルタ判定を補正する。
+- **(M1) participant の自己識別フィールド**: uuid/account_id/display_name のどれが participant.user に含まれるか未確定。承認トグルの POST/DELETE 判定に使用。
+- **(M1) merge の非同期応答(202)**: 大きな merge は 202 + タスクポーリングになり得る。現状は成功ステータス扱いで「マージしました」を表示し PR を再取得するのみ(ポーリング未実装)。実挙動を確認して要否を判断。
+- **(M1) diff エンドポイントのリダイレクト/Content-Type**: `.../diff` は `text/plain` 前提で生テキスト取得。実際のリダイレクト有無・エンコーディングを確認。
 
 ## 未解決の問い
 
 - OAuth 2.0 対応の要否(現状 API token のみで足りる想定)。
-- M1 の PR 横断取得に最適なエンドポイント(repo単位 `.../pullrequests` の集約 vs 他)。M1着手時に確定。
+- M1 の PR 横断取得に最適なエンドポイント(repo単位 `.../pullrequests` の集約 vs 他)。→ **M1 では repo 単位 `.../pullrequests` を採用**(選択リポジトリ内の PR をレビューする体験を優先)。repo 横断は後続で検討。
+- (M1) inline コメント投稿(stretch)の要否と、inline アンカーの `from`/`to`(旧/新ファイル行)の正確な意味。一覧表示のみ実装済み、投稿は未実装。
+- (M1) コメント一覧・PR 一覧のページング UI(「さらに読み込む」)。現状は `get_paged` の安全上限(20 ページ)まで自動集約するのみで、明示的な追加読み込み UI は未実装。
