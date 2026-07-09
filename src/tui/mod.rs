@@ -1,6 +1,7 @@
 //! TUI レイヤ: 端末ガード（RAII + panic hook）・状態・イベントループ・描画。
 
 pub mod app;
+pub mod diff;
 pub mod event;
 pub mod onboarding;
 pub mod ui;

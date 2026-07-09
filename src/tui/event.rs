@@ -64,6 +64,14 @@ fn dispatch(command: Command, api_tx: &mpsc::Sender<Msg>) -> bool {
     match command {
         Command::None => true,
         Command::Quit => false,
+        Command::Batch(commands) => {
+            let mut keep_running = true;
+            for command in commands {
+                // いずれかが Quit（false）ならループを終える。
+                keep_running &= dispatch(command, api_tx);
+            }
+            keep_running
+        }
         Command::ValidateAuth { email, token } => {
             let tx = api_tx.clone();
             tokio::spawn(async move {
@@ -95,6 +103,187 @@ fn dispatch(command: Command, api_tx: &mpsc::Sender<Msg>) -> bool {
                 let msg = match client.list_repositories(&workspace).await {
                     Ok(repos) => Msg::RepositoriesLoaded { workspace, repos },
                     Err(error) => Msg::LoadFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
+        Command::LoadPullRequests {
+            client,
+            workspace,
+            repo,
+            filter,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let msg = match client
+                    .list_pull_requests(&workspace, &repo, filter.states())
+                    .await
+                {
+                    Ok(prs) => Msg::PullRequestsLoaded { repo, filter, prs },
+                    Err(error) => Msg::LoadFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
+        Command::LoadPrDetail {
+            client,
+            workspace,
+            repo,
+            id,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let msg = match client.get_pull_request(&workspace, &repo, id).await {
+                    Ok(pr) => Msg::PrDetailLoaded {
+                        id,
+                        pr: Box::new(pr),
+                    },
+                    Err(error) => Msg::LoadFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
+        Command::LoadDiffStat {
+            client,
+            workspace,
+            repo,
+            id,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let msg = match client.get_pr_diffstat(&workspace, &repo, id).await {
+                    Ok(entries) => Msg::DiffStatLoaded { id, entries },
+                    Err(error) => Msg::LoadFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
+        Command::LoadDiff {
+            client,
+            workspace,
+            repo,
+            id,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let msg = match client.get_pr_diff(&workspace, &repo, id).await {
+                    Ok(text) => Msg::DiffLoaded { id, text },
+                    Err(error) => Msg::LoadFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
+        Command::LoadComments {
+            client,
+            workspace,
+            repo,
+            id,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let msg = match client.list_comments(&workspace, &repo, id).await {
+                    Ok(comments) => Msg::CommentsLoaded { id, comments },
+                    Err(error) => Msg::LoadFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
+        Command::Approve {
+            client,
+            workspace,
+            repo,
+            id,
+            approve,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let result = if approve {
+                    client.approve(&workspace, &repo, id).await
+                } else {
+                    client.unapprove(&workspace, &repo, id).await
+                };
+                let msg = match result {
+                    Ok(()) => Msg::ReviewActionDone {
+                        id,
+                        message: if approve {
+                            "承認しました".to_string()
+                        } else {
+                            "承認を取り消しました".to_string()
+                        },
+                    },
+                    Err(error) => Msg::ActionFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
+        Command::RequestChanges {
+            client,
+            workspace,
+            repo,
+            id,
+            request,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let result = if request {
+                    client.request_changes(&workspace, &repo, id).await
+                } else {
+                    client.unrequest_changes(&workspace, &repo, id).await
+                };
+                let msg = match result {
+                    Ok(()) => Msg::ReviewActionDone {
+                        id,
+                        message: if request {
+                            "変更要求を出しました".to_string()
+                        } else {
+                            "変更要求を取り消しました".to_string()
+                        },
+                    },
+                    Err(error) => Msg::ActionFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
+        Command::CreateComment {
+            client,
+            workspace,
+            repo,
+            id,
+            raw,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let msg = match client.create_comment(&workspace, &repo, id, &raw).await {
+                    Ok(_comment) => Msg::CommentPosted { id },
+                    Err(error) => Msg::ActionFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
+        Command::Merge {
+            client,
+            workspace,
+            repo,
+            id,
+            params,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let msg = match client
+                    .merge_pull_request(&workspace, &repo, id, &params)
+                    .await
+                {
+                    Ok(()) => Msg::MergeDone { id },
+                    Err(error) => Msg::ActionFailed(error),
                 };
                 let _ = tx.send(msg).await;
             });

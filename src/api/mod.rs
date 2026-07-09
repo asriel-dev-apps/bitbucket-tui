@@ -8,4 +8,6 @@ pub mod models;
 
 pub use client::BitbucketClient;
 pub use error::ApiError;
-pub use models::{Repository, User, Workspace};
+pub use models::{
+    Comment, DiffStatEntry, MergeParams, MergeStrategy, PullRequest, Repository, User, Workspace,
+};

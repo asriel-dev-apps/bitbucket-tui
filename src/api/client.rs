@@ -6,11 +6,14 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use reqwest::Client as HttpClient;
+use reqwest::{Client as HttpClient, Method};
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::api::error::{ApiError, classify_error};
-use crate::api::models::{Paginated, Repository, User, Workspace};
+use crate::api::models::{
+    Comment, DiffStatEntry, MergeParams, Paginated, PullRequest, Repository, User, Workspace,
+};
 
 /// API のベース URL（Bitbucket Cloud）。
 const BASE_URL: &str = "https://api.bitbucket.org/2.0";
@@ -82,6 +85,130 @@ impl BitbucketClient {
         .await
     }
 
+    /// PR 一覧を取得する（更新日時降順）。
+    ///
+    /// `states` は繰り返し `state` クエリとして送る（例: `["OPEN","MERGED"]`）。空の場合は
+    /// Bitbucket 既定（OPEN のみ）になる。
+    pub async fn list_pull_requests(
+        &self,
+        workspace: &str,
+        repo: &str,
+        states: &[&str],
+    ) -> Result<Vec<PullRequest>, ApiError> {
+        let path = format!("/repositories/{workspace}/{repo}/pullrequests");
+        let mut query: Vec<(&str, &str)> = states.iter().map(|state| ("state", *state)).collect();
+        query.push(("pagelen", "50"));
+        query.push(("sort", "-updated_on"));
+        self.get_paged(&path, &query).await
+    }
+
+    /// PR 詳細を取得する。
+    pub async fn get_pull_request(
+        &self,
+        workspace: &str,
+        repo: &str,
+        id: u64,
+    ) -> Result<PullRequest, ApiError> {
+        let url = format!("{BASE_URL}/repositories/{workspace}/{repo}/pullrequests/{id}");
+        self.send_get(url, Vec::new()).await
+    }
+
+    /// PR のユニファイド diff を生テキスト（`text/plain`）で取得する。
+    pub async fn get_pr_diff(
+        &self,
+        workspace: &str,
+        repo: &str,
+        id: u64,
+    ) -> Result<String, ApiError> {
+        let url = format!("{BASE_URL}/repositories/{workspace}/{repo}/pullrequests/{id}/diff");
+        self.send_get_text(url).await
+    }
+
+    /// PR の diffstat（ファイル毎の変更統計）を取得する。
+    pub async fn get_pr_diffstat(
+        &self,
+        workspace: &str,
+        repo: &str,
+        id: u64,
+    ) -> Result<Vec<DiffStatEntry>, ApiError> {
+        let path = format!("/repositories/{workspace}/{repo}/pullrequests/{id}/diffstat");
+        self.get_paged(&path, &[("pagelen", "50")]).await
+    }
+
+    /// PR のコメント一覧を取得する。
+    pub async fn list_comments(
+        &self,
+        workspace: &str,
+        repo: &str,
+        id: u64,
+    ) -> Result<Vec<Comment>, ApiError> {
+        let path = format!("/repositories/{workspace}/{repo}/pullrequests/{id}/comments");
+        self.get_paged(&path, &[("pagelen", "50")]).await
+    }
+
+    /// PR を承認する（`POST .../approve`）。
+    pub async fn approve(&self, workspace: &str, repo: &str, id: u64) -> Result<(), ApiError> {
+        let url = format!("{BASE_URL}/repositories/{workspace}/{repo}/pullrequests/{id}/approve");
+        self.send_empty(Method::POST, url).await
+    }
+
+    /// PR の承認を取り消す（`DELETE .../approve`）。
+    pub async fn unapprove(&self, workspace: &str, repo: &str, id: u64) -> Result<(), ApiError> {
+        let url = format!("{BASE_URL}/repositories/{workspace}/{repo}/pullrequests/{id}/approve");
+        self.send_empty(Method::DELETE, url).await
+    }
+
+    /// PR に変更要求を出す（`POST .../request-changes`）。
+    pub async fn request_changes(
+        &self,
+        workspace: &str,
+        repo: &str,
+        id: u64,
+    ) -> Result<(), ApiError> {
+        let url =
+            format!("{BASE_URL}/repositories/{workspace}/{repo}/pullrequests/{id}/request-changes");
+        self.send_empty(Method::POST, url).await
+    }
+
+    /// PR の変更要求を取り消す（`DELETE .../request-changes`）。
+    pub async fn unrequest_changes(
+        &self,
+        workspace: &str,
+        repo: &str,
+        id: u64,
+    ) -> Result<(), ApiError> {
+        let url =
+            format!("{BASE_URL}/repositories/{workspace}/{repo}/pullrequests/{id}/request-changes");
+        self.send_empty(Method::DELETE, url).await
+    }
+
+    /// 一般コメントを投稿する（`POST .../comments`、body `{"content":{"raw":".."}}`）。
+    pub async fn create_comment(
+        &self,
+        workspace: &str,
+        repo: &str,
+        id: u64,
+        raw: &str,
+    ) -> Result<Comment, ApiError> {
+        let url = format!("{BASE_URL}/repositories/{workspace}/{repo}/pullrequests/{id}/comments");
+        self.send_json(Method::POST, url, &comment_body(raw)).await
+    }
+
+    /// PR をマージする（`POST .../merge`）。
+    ///
+    /// 大きなマージは 202（処理中）で返り得るが、いずれも成功ステータスなので `Ok(())` を返す。
+    /// 応答ボディ（マージ結果 PR）は使わず、呼び出し側が改めて PR を再取得する。
+    pub async fn merge_pull_request(
+        &self,
+        workspace: &str,
+        repo: &str,
+        id: u64,
+        params: &MergeParams,
+    ) -> Result<(), ApiError> {
+        let url = format!("{BASE_URL}/repositories/{workspace}/{repo}/pullrequests/{id}/merge");
+        self.send_json_discard(Method::POST, url, params).await
+    }
+
     /// ページングエンドポイントを `next` に従って全ページ集約する。
     ///
     /// 初回リクエストにのみ `query` を適用する。2 ページ目以降は Bitbucket が返す
@@ -129,6 +256,97 @@ impl BitbucketClient {
 
         serde_json::from_str::<T>(&body).map_err(|error| ApiError::Decode(error.to_string()))
     }
+
+    /// 認証付き GET を実行し、成功時は本文を生テキストで返す（diff 取得用）。
+    async fn send_get_text(&self, url: String) -> Result<String, ApiError> {
+        let response = self
+            .http
+            .get(&url)
+            .basic_auth(&self.email, Some(&self.token))
+            .send()
+            .await
+            .map_err(|error| ApiError::Network(error.to_string()))?;
+
+        if !response.status().is_success() {
+            return Err(response_to_error(response).await);
+        }
+
+        response
+            .text()
+            .await
+            .map_err(|error| ApiError::Network(error.to_string()))
+    }
+
+    /// ボディ無しの認証付きリクエスト（POST/DELETE）。成功なら `()`。
+    ///
+    /// approve/unapprove/request-changes は応答ボディ（participant）を持つが、UI は改めて PR を
+    /// 再取得して状態を反映するため、ここではボディを読まず成功可否のみ扱う。
+    async fn send_empty(&self, method: Method, url: String) -> Result<(), ApiError> {
+        let response = self
+            .http
+            .request(method, &url)
+            .basic_auth(&self.email, Some(&self.token))
+            .send()
+            .await
+            .map_err(|error| ApiError::Network(error.to_string()))?;
+
+        if !response.status().is_success() {
+            return Err(response_to_error(response).await);
+        }
+        Ok(())
+    }
+
+    /// JSON ボディ付きリクエストを実行し、応答を `T` にデシリアライズする。
+    async fn send_json<B: Serialize, T: DeserializeOwned>(
+        &self,
+        method: Method,
+        url: String,
+        body: &B,
+    ) -> Result<T, ApiError> {
+        let text = self.send_json_text(method, url, body).await?;
+        serde_json::from_str::<T>(&text).map_err(|error| ApiError::Decode(error.to_string()))
+    }
+
+    /// JSON ボディ付きリクエストを実行し、応答ボディを破棄する（成功可否のみ）。
+    async fn send_json_discard<B: Serialize>(
+        &self,
+        method: Method,
+        url: String,
+        body: &B,
+    ) -> Result<(), ApiError> {
+        self.send_json_text(method, url, body).await.map(|_| ())
+    }
+
+    /// JSON ボディ付きリクエストの共通処理。成功時は応答本文を生テキストで返す。
+    async fn send_json_text<B: Serialize>(
+        &self,
+        method: Method,
+        url: String,
+        body: &B,
+    ) -> Result<String, ApiError> {
+        let response = self
+            .http
+            .request(method, &url)
+            .basic_auth(&self.email, Some(&self.token))
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| ApiError::Network(error.to_string()))?;
+
+        if !response.status().is_success() {
+            return Err(response_to_error(response).await);
+        }
+
+        response
+            .text()
+            .await
+            .map_err(|error| ApiError::Network(error.to_string()))
+    }
+}
+
+/// 一般コメント投稿のリクエストボディ（`{"content":{"raw":".."}}`）を組み立てる。
+fn comment_body(raw: &str) -> serde_json::Value {
+    serde_json::json!({ "content": { "raw": raw } })
 }
 
 /// 非成功レスポンスから [`ApiError`] を組み立てる。
@@ -270,6 +488,12 @@ mod tests {
 
         // 3 ページ分だけ取得して打ち切る。
         assert_eq!(result, vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn comment_body_wraps_raw_content() {
+        let body = comment_body("hello\nworld");
+        assert_eq!(body["content"]["raw"], "hello\nworld");
     }
 
     #[tokio::test]
