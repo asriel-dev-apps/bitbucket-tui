@@ -6,7 +6,7 @@
 
 - **M0 基盤**: **実装完了(2026-07-09)**。`cargo build/clippy(--all-targets -D warnings)/fmt --check/test` すべて green(--offline)。ユニット22件 pass + ネットワーク依存の smoke テスト1件 `#[ignore]`。実 API 結合確認(`GET /2.0/user`)は環境に実 token が無いためスキップ(下記の未検証の仮定は据え置き)。
 - **M1 PRレビュー**: **実装完了(2026-07-09)**。`cargo build/clippy(--all-targets -D warnings)/fmt --check/test` すべて green(--offline)。ユニット54件 pass(+22→54) + `#[ignore]` 1件。`RepoSelected` を廃し repo 選択→PR一覧→詳細→Diff(色付きスクロール)→approve/unapprove・request-changes/取消・一般コメント投稿・merge(確認モーダル+strategy 選択+close source branch)を実装。**実 API 結合確認は環境に実 token が無いためスキップ**(PR/Comment/DiffStat の serde フィールド・state 値・merge 202・inline 位置は下記「未検証の仮定」のまま。build+clippy+モックテストのみで検証)。
-- M2 パイプライン監視: 未着手
+- **M2 パイプライン監視**: **実装完了(2026-07-10)**。`cargo build/clippy(--all-targets -D warnings)/fmt --check/test` すべて green(--offline)。ユニット93件 pass(+54→93) + `#[ignore]` 1件。repo から Pipelines 一覧(状態色)→PipelineDetail(ステップ一覧)→StepLog(スクロール/擬似 tail)、stop/re-run(確認モーダル)、進行中パイプラインの自動ポーリング更新(tokio timer tick、`a` で ON/OFF、全完了で停止)を実装。**実 API 結合確認は環境に実 token が無いためスキップ**(Pipeline/Step の serde フィールド・state/result 値・log 404 挙動・trigger body の正確形・pipelines エンドポイントの trailing slash は下記「未検証の仮定」のまま。build+clippy+モックテストのみで検証)。
 - M3 リポジトリブラウズ: 未着手
 
 ## M0 実装メモ (2026-07-09)
@@ -32,6 +32,19 @@
 - **large_enum_variant 回避**: `Msg::PrDetailLoaded` の `PullRequest` は `Box` 化(他の巨大 variant は無し)。
 - **未実施**: 実 token が無いため approve→diff→comment→merge の実結合確認はしていない。build+clippy(-D warnings)+モックテストのみ green。
 
+## M2 実装メモ (2026-07-10)
+
+- **モジュール拡張**: `api/models.rs` に `Pipeline`/`PipelineStep`/`PipelineState`/`NamedRef`/`PipelineTarget`/`PipelineSelector`/`PipelineStatus`(enum) と、状態判定 `classify_pipeline_status`・所要時間整形 `format_duration_secs`・re-run ボディ生成 `PipelineTarget::trigger_body` を追加(`uuid` 以外は `Option`/`#[serde(default)]` で耐性)。`api/client.rs` に `list_pipelines`/`get_pipeline`/`list_pipeline_steps`/`get_step_log`(text)/`stop_pipeline`/`trigger_pipeline` と **percent-encode ヘルパ `percent_encode`**(+`hex_digit`)を追加。`api/error.rs` に `ApiError::is_not_found`(404 判定)。`tui/logview.rs` を新規追加(`LogView`: スクロール状態 + ANSI/制御文字除去 `strip_ansi`/`sanitize_log`)。`tui/app.rs` に `Screen`{Pipelines,PipelineDetail,StepLog}・`PipelineAction`/`ConfirmModal`・`Msg`/`Command` 拡張・ポーリング tick 処理を追加。`tui/ui.rs`/`tui/event.rs` を対応拡張。
+- **uuid の波括弧エンコード(既知の罠)**: `pipeline_uuid`/`step_uuid` は `{...}` 込みの文字列。URL 化する箇所(`get_pipeline`/`list_pipeline_steps`/`get_step_log`/`stop_pipeline`)で `percent_encode` を通し、`{`→`%7B`/`}`→`%7D` にエンコードする(unreserved `A-Za-z0-9-._~` 以外を全て `%XX` 化)。素の `{...}` だと `The value provided is not a valid uuid` になる。ユニットテストで検証済み。
+- **自動ポーリング(監視の肝)**: イベントループの `tokio::select!` に `tokio::time::interval(5s)` の tick 枝を追加し、`Msg::Tick` を流す。最初の即時 tick は起動直後の無駄打ちを避けて捨てる。`update()` の `on_tick` が「自動更新 ON かつ Pipelines/PipelineDetail 画面かつ進行中(PENDING/IN_PROGRESS/BUILDING)がある」ときだけ静かな再取得コマンドを発行し、**全完了で自然停止**(発火しなくなる)。`a` キーで自動更新 ON/OFF をトグル。手動 `r` は常時可。tick→リフレッシュ発行はモックテストで検証。
+- **状態→色**: `PipelineStatus`(Successful/Failed/InProgress/Stopped/Pending/Unknown)へ `classify_pipeline_status` で丸め、`ui` 側で 緑/赤/黄/DarkGray/Gray/Reset にマップ。result 名優先(完了時)→state 名の順で判定。値は大文字化して寛容にマッチ。
+- **破壊的操作の確認**: stop/re-run は M1 の merge モーダルと同じく `ConfirmModal` 経由。`S`/`R` はモーダルを開くだけ、モーダル内 `Enter` で初めて `Command::StopPipeline`/`TriggerPipeline`。stop は進行中パイプラインのみ(完了済みは拒否してステータスにエラー)。**確認なしには走らない**(モックテストで検証)。実行成功後は `auto_refresh=true` にして静かに再取得(Loading を出さず成功メッセージを残す。M1 の `MergeDone`→`refresh_detail` と同じ挙動)。re-run 成功後は新しい実行が先頭に出るため一覧へ遷移。
+- **ステップログ**: `text/plain` を全取得(Range 末尾取得は未実装=任意)。404 は `is_not_found` で判定し `Msg::StepLogLoaded{text:None}`→`LogView::missing`→「(ログなし)」表示。ANSI エスケープ(CSI)と `\r` 等の制御文字は `strip_ansi` で除去(タブ・改行は温存)。スクロールは M1 の diff/pager と同じ操作(`↑↓/jk`・`PgUp/PgDn`・`g/G`)。`r` で再取得(擬似 tail、同一ステップならスクロール位置を維持)。
+- **ナビゲーション**: `Repositories` で `p`=Pipelines(既存 `Enter`=PullRequests はそのまま)。`PullRequests` で `P`=同 repo の Pipelines。`Pipelines`→`Esc`=Repositories、`PipelineDetail`→`Esc`=Pipelines、`StepLog`→`Esc`=PipelineDetail。`review_context()`(client+workspace+repo slug)をパイプライン系でも再利用。
+- **一覧の選択維持**: 自動ポーリングで一覧/ステップが毎回先頭に戻らないよう、`SelectList::set_items_keep_selection`(選択インデックスを新件数にクランプ)を追加してリフレッシュ時に使用。
+- **large_enum_variant 回避**: `Msg::PipelineLoaded` の `Pipeline` は `Box` 化(M1 の `PrDetailLoaded` と同様)。
+- **未実施**: 実 token が無いため一覧自動更新→ログ閲覧→stop→re-run の実結合確認はしていない。build+clippy(-D warnings)+モックテストのみ green。
+
 ## 検証済みの事実 (2026-07-09)
 
 - 認証は HTTP Basic、**username = Atlassianアカウントのメール / password = API token(スコープ付き)**。Bitbucketユーザー名・トークン名では通らない(出典: Atlassian support "Using API tokens" / 401 KB)。
@@ -54,6 +67,12 @@
 - **(M1) participant の自己識別フィールド**: uuid/account_id/display_name のどれが participant.user に含まれるか未確定。承認トグルの POST/DELETE 判定に使用。
 - **(M1) merge の非同期応答(202)**: 大きな merge は 202 + タスクポーリングになり得る。現状は成功ステータス扱いで「マージしました」を表示し PR を再取得するのみ(ポーリング未実装)。実挙動を確認して要否を判断。
 - **(M1) diff エンドポイントのリダイレクト/Content-Type**: `.../diff` は `text/plain` 前提で生テキスト取得。実際のリダイレクト有無・エンコーディングを確認。
+- **(M2) Pipeline/Step の serde フィールド**: 仕様書の推定名で実装(`Pipeline.{uuid,build_number,state{name,result{name},stage{name}},creator,created_on,completed_on,target{type,ref_type,ref_name,commit{hash},selector{type,pattern}},trigger{name},duration_in_seconds}`、`PipelineStep.{uuid,name,state,started_on,completed_on,duration_in_seconds}`)。実 API 初回応答で有無/名称を確定する。
+- **(M2) state/result 値**: pipeline `state.name`=`PENDING`/`IN_PROGRESS`/`BUILDING`/`COMPLETED`/`PAUSED`/`HALTED`/`STOPPED` 等、`result.name`=`SUCCESSFUL`/`FAILED`/`ERROR`/`STOPPED` 等を推定して `classify_pipeline_status` でマッチ(大文字化・寛容判定)。**進行中判定は PENDING/IN_PROGRESS/BUILDING/RUNNING**。実値(特に BUILDING/RUNNING の実在、result の正確な語彙)を確認して補正。
+- **(M2) pipelines エンドポイントの trailing slash**: list/detail/steps/trigger すべて `/pipelines/`(末尾スラッシュ)で実装。仕様書は list を `/pipelines`(スラッシュ無)と表記。実 API でどちらが正か(リダイレクト/404 有無)を確認。
+- **(M2) trigger(re-run) ボディの正確形**: `{"target":{"type":"pipeline_ref_target","ref_type":..,"ref_name":..,"selector":{"type":"default"|..}}}` を元 target から再構成(commit は送らずブランチ先端を再実行)。実 API で必須/任意フィールド・selector 種別(default/custom/pull_requests 等)を確認。custom selector の pattern は引き継ぐ実装。
+- **(M2) ステップログの 404/Range/Content-Type**: ログ未生成は 404 と仮定し「(ログなし)」表示。巨大ログの Range 末尾取得は未実装(全取得)。実際の 404 条件・`Content-Type`・進行中の追記挙動を確認。
+- **(M2) stop の応答**: `POST .../stopPipeline` は成功可否のみ扱い(ボディ未使用)、成功後は静かに再取得。実際のステータスコード(202 等)・非同期性を確認。
 
 ## 未解決の問い
 
@@ -61,3 +80,6 @@
 - M1 の PR 横断取得に最適なエンドポイント(repo単位 `.../pullrequests` の集約 vs 他)。→ **M1 では repo 単位 `.../pullrequests` を採用**(選択リポジトリ内の PR をレビューする体験を優先)。repo 横断は後続で検討。
 - (M1) inline コメント投稿(stretch)の要否と、inline アンカーの `from`/`to`(旧/新ファイル行)の正確な意味。一覧表示のみ実装済み、投稿は未実装。
 - (M1) コメント一覧・PR 一覧のページング UI(「さらに読み込む」)。現状は `get_paged` の安全上限(20 ページ)まで自動集約するのみで、明示的な追加読み込み UI は未実装。
+- (M2) 自動ポーリング間隔は固定 5 秒。実運用で適正か(レート制限との兼ね合い)、可変にすべきかは実挙動で判断。tick は常時 5 秒ごとに `Msg::Tick` を流すが、対象画面かつ進行中がある時のみ API を叩く設計。
+- (M2) `q` の終了スコープ: `StepLog`/`Diff` では `q`=終了、`Pipelines`/`PipelineDetail` でも `q`=終了(一覧系画面の共通踏襲)。監視中に誤終了しやすいなら要再検討。
+- (M2) BBQL フィルタ(`q=` によるブランチ/状態絞り込み)は未実装(既定の新しい順一覧のみ)。ステップ単位再実行・キャッシュ/アーティファクト操作・真のログストリーミングも後回し(スコープ外)。
