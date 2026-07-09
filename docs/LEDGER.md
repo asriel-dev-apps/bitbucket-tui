@@ -7,7 +7,8 @@
 - **M0 基盤**: **実装完了(2026-07-09)**。`cargo build/clippy(--all-targets -D warnings)/fmt --check/test` すべて green(--offline)。ユニット22件 pass + ネットワーク依存の smoke テスト1件 `#[ignore]`。実 API 結合確認(`GET /2.0/user`)は環境に実 token が無いためスキップ(下記の未検証の仮定は据え置き)。
 - **M1 PRレビュー**: **実装完了(2026-07-09)**。`cargo build/clippy(--all-targets -D warnings)/fmt --check/test` すべて green(--offline)。ユニット54件 pass(+22→54) + `#[ignore]` 1件。`RepoSelected` を廃し repo 選択→PR一覧→詳細→Diff(色付きスクロール)→approve/unapprove・request-changes/取消・一般コメント投稿・merge(確認モーダル+strategy 選択+close source branch)を実装。**実 API 結合確認は環境に実 token が無いためスキップ**(PR/Comment/DiffStat の serde フィールド・state 値・merge 202・inline 位置は下記「未検証の仮定」のまま。build+clippy+モックテストのみで検証)。
 - **M2 パイプライン監視**: **実装完了(2026-07-10)**。`cargo build/clippy(--all-targets -D warnings)/fmt --check/test` すべて green(--offline)。ユニット93件 pass(+54→93) + `#[ignore]` 1件。repo から Pipelines 一覧(状態色)→PipelineDetail(ステップ一覧)→StepLog(スクロール/擬似 tail)、stop/re-run(確認モーダル)、進行中パイプラインの自動ポーリング更新(tokio timer tick、`a` で ON/OFF、全完了で停止)を実装。**実 API 結合確認は環境に実 token が無いためスキップ**(Pipeline/Step の serde フィールド・state/result 値・log 404 挙動・trigger body の正確形・pipelines エンドポイントの trailing slash は下記「未検証の仮定」のまま。build+clippy+モックテストのみで検証)。
-- M3 リポジトリブラウズ: 未着手
+- **M3 リポジトリブラウズ**: **実装完了(2026-07-10)**。`cargo build/clippy(--all-targets -D warnings)/fmt --check/test` すべて green(--offline)。ユニット136件 pass(+93→136) + `#[ignore]` 1件。repo/PR から Branches 一覧→Commits 履歴→CommitDetail→Diff(M1 流用) / Source(ツリー閲覧: ディレクトリ潜り/親戻り)→FileView(内容ページャ: logview 流用)を実装。閲覧専用。**実 API 結合確認は環境に実 token が無いためスキップ**(Branch/Commit/SrcEntry の serde フィールド・src の dir/file 応答形・diff spec・branch 名/パスの URL エンコード方針は下記「未検証の仮定」のまま。build+clippy+モックテストのみで検証)。
+- **ロードマップ M0〜M3 すべて実装完了(2026-07-10)**。
 
 ## M0 実装メモ (2026-07-09)
 
@@ -45,6 +46,17 @@
 - **large_enum_variant 回避**: `Msg::PipelineLoaded` の `Pipeline` は `Box` 化(M1 の `PrDetailLoaded` と同様)。
 - **未実施**: 実 token が無いため一覧自動更新→ログ閲覧→stop→re-run の実結合確認はしていない。build+clippy(-D warnings)+モックテストのみ green。
 
+## M3 実装メモ (2026-07-10)
+
+- **モジュール拡張**: `api/models.rs` に `SrcEntry`{entry_type("commit_file"/"commit_directory"),path,size?,mimetype?}・`CommitAuthor`{raw?,user?} を追加し、既存 `Branch`(→ name + `target:Option<Commit>`)/`Commit`(→ hash + message/date/author/parents)/`Repository`(→ `mainbranch:Option<Branch>`) を後方互換に拡張(追加フィールドは全て `Option`/`#[serde(default)]`)。表示ヘルパ(`Commit::short_hash/summary/author_name/parent_short_hashes`、`Branch::target_*`、`SrcEntry::is_dir/name/path_str`、`Repository::main_branch_name`)を追加。`api/client.rs` に `list_branches`/`list_commits`(revision 可省略)/`get_commit`/`get_commit_diff`(text)/`list_src`(dir 列挙)/`get_src_file`(text) と **パス用エンコード `encode_path`**(`percent_encode` と違い `/` を温存)を追加。`tui/logview.rs` に `LogView::from_file`・`looks_binary`・`MAX_FILE_LINES` を追加(FileView へ流用)。`tui/app.rs` に `Screen`{Branches,Commits,CommitDetail,Source,FileView}・`SourceState`・`Msg`/`Command` 拡張・遷移ロジックを追加。`tui/ui.rs`/`tui/event.rs` を対応拡張。
+- **既存モデルの拡張方針**: 新規 `Branch`/`Commit` を別途作らず、PR/pipeline が使う既存 `Branch`/`Commit` を拡張して一本化(spec のモデル名に合わせる)。追加フィールドは optional なので PR/pipeline のデシリアライズは不変。`Commit` は `parents: Vec<Commit>`(Vec 経由の再帰で size 有限)。この拡張で `Commit` が肥大化し、`PipelineTarget`(commit を内包)を持つ `Command::TriggerPipeline` が **clippy `large_enum_variant`** を踏んだため、`target` を `Box<PipelineTarget>` に変更して解消(M1/M2 の `Box` 化と同方針)。
+- **Diff の共用**: commit 差分は M1 の `DiffState`/diff パーサ/着色をそのまま流用。`Screen::Diff` は PR と commit で共有し、`App.diff_return`(戻り先 Screen)で `Esc` の遷移先を出し分ける(PR→PullRequestDetail / commit→CommitDetail)。commit diff は PR id で照合できないため専用の `Command::LoadCommitDiff`/`Msg::CommitDiffLoaded{spec,text}` を追加し、`current_commit.hash == spec` で照合。CommitDetail/PR detail 遷移時に `diff` を None リセットして取り違えを防ぐ。
+- **FileView の共用**: M2 の `LogView` ページャを流用。`LogView::from_file(key,title,mimetype,content)` が **バイナリ判定 `looks_binary`**(内容の NUL バイト or 既知バイナリ mimetype)で「(バイナリ表示不可)」を出し、巨大は先頭 `MAX_FILE_LINES`(=5000)行 + 注記で打切り。**判定は sanitize 前の生テキストで行う**(sanitize が NUL を落とすため順序が重要)。照合キー(`step_uuid` フィールドを流用)にファイルパスを入れる。mimetype は開いた `SrcEntry.mimetype` を `App.open_file_mimetype` に持って FileLoaded 時に使用。
+- **Source の潜り/戻り**: `SrcEntry.path` はルートからのフルパス前提。ディレクトリへ潜るときは `entry.path` をそのまま新 path に採用、親へは純粋関数 `parent_dir`(末尾 `/` 無視、ルート=空文字は `None`→repo へ戻る)で算出。列挙は受信時に `sort_src_entries`(ディレクトリ→ファイル、各グループ名前昇順)で整列。dir/file の出し分けは `SrcEntry::is_dir`(`type=="commit_directory"`)で判定し、dir は `list_src`(JSON)、file は `get_src_file`(text)を呼ぶ。
+- **既定ブランチ**: repo 一覧応答の `mainbranch.name` を `Repository::main_branch_name` で取得し、`select_repo` 時に `App.repo_main_branch` へ保持。Source ルートはこれを使い、未取得時は `"main"` にフォールバック(**未検証の仮定**。master 等の repo では要 revision 指定)。
+- **ナビゲーション**: `Repositories` で `b`=Branches / `s`=Source root(既定ブランチ)。`Enter`=PR・`p`=Pipelines は不変。`PullRequests` からも `b`/`s`。Branches: `Enter`=Commits・`s`=そのブランチの Source root・`r`=再読込。Commits: `Enter`=CommitDetail・`r`=再読込。CommitDetail: `d`=Diff・`↑↓/PgUp/PgDn`=メッセージスクロール。Source: `Enter`=潜る/開く・`Backspace`/`Esc`=親(ルートで repo)・`r`=再読込。FileView: `↑↓/jk PgUp/PgDn g/G`=スクロール・`Esc`=Source。各画面 `q`/`Ctrl+C`/`?` 踏襲。
+- **未実施**: 実 token が無いため Branches→Commits→CommitDetail→Diff / Source 潜行→FileView の実結合確認はしていない。build+clippy(-D warnings)+モックテストのみ green。
+
 ## 検証済みの事実 (2026-07-09)
 
 - 認証は HTTP Basic、**username = Atlassianアカウントのメール / password = API token(スコープ付き)**。Bitbucketユーザー名・トークン名では通らない(出典: Atlassian support "Using API tokens" / 401 KB)。
@@ -73,6 +85,12 @@
 - **(M2) trigger(re-run) ボディの正確形**: `{"target":{"type":"pipeline_ref_target","ref_type":..,"ref_name":..,"selector":{"type":"default"|..}}}` を元 target から再構成(commit は送らずブランチ先端を再実行)。実 API で必須/任意フィールド・selector 種別(default/custom/pull_requests 等)を確認。custom selector の pattern は引き継ぐ実装。
 - **(M2) ステップログの 404/Range/Content-Type**: ログ未生成は 404 と仮定し「(ログなし)」表示。巨大ログの Range 末尾取得は未実装(全取得)。実際の 404 条件・`Content-Type`・進行中の追記挙動を確認。
 - **(M2) stop の応答**: `POST .../stopPipeline` は成功可否のみ扱い(ボディ未使用)、成功後は静かに再取得。実際のステータスコード(202 等)・非同期性を確認。
+- **(M3) Branch/Commit/SrcEntry の serde フィールド**: 仕様書の推定名で実装(`Branch.{name,target{hash,date,message,author}}`、`Commit.{hash,message,date,author{raw,user},parents[]{hash}}`、`SrcEntry.{type,path,size,mimetype}`)。実 API 初回応答で有無/名称(特に `type` の `commit_directory`/`commit_file` 表記、`author.raw` の形式、`refs/branches` の `target` 形)を確定する。
+- **(M3) src エンドポイントの dir/file 応答形**: `GET .../src/{commit}/{path}` は path がディレクトリなら JSON 列挙(ページング)、ファイルなら生バイト、という前提。判定は列挙側の `SrcEntry.type` で行い、ファイルは別メソッドで生テキスト取得。実際の Content-Type・リダイレクト・ルート(`.../src/{commit}/`)の trailing slash 挙動・ページング有無を確認。
+- **(M3) revision / path の URL エンコード**: `commits/{revision}`・`src/{commit}/{path}`・`diff/{spec}`・`commit/{hash}` は `encode_path`(unreserved + `/` を温存し他を `%XX`)でエンコード。ブランチ名の `/`(例 `feature/x`)は素のパスセパレータとして送る前提。実 API で `/` を含むブランチ名・特殊文字パスが正しく解決されるか(要 `%2F` 化かどうか)を確認。
+- **(M3) commit diff の spec**: `GET .../diff/{hash}` に単一ハッシュを渡して当該コミットの差分を取得(親との差分)前提。M1 の diff パーサ/着色をそのまま流用。実際のリダイレクト/Content-Type/マージコミットの差分表現を確認。
+- **(M3) 既定ブランチのフォールバック**: repo 一覧の `mainbranch.name` を使い、未取得時は `"main"` にフォールバック。`master` 等の repo では Source root が 404 になり得る(その場合はステータス行にエラー表示・Branches から明示選択で回避)。repo 詳細取得によるフォールバックは未実装。
+- **(M3) バイナリ/巨大ファイル判定**: `reqwest` の `text()`(lossy UTF-8)後の NUL バイト有無 + mimetype でバイナリ判定、`MAX_FILE_LINES`(5000)超で先頭打切り。実バイナリ応答が本当にテキストとして返る(=生バイトが text() を通る)のか、`?format=meta` を使うべきか等は実挙動で確認。size ヘッダによる事前打切りは未実装(全取得後に行数で打切り)。
 
 ## 未解決の問い
 
@@ -83,3 +101,7 @@
 - (M2) 自動ポーリング間隔は固定 5 秒。実運用で適正か(レート制限との兼ね合い)、可変にすべきかは実挙動で判断。tick は常時 5 秒ごとに `Msg::Tick` を流すが、対象画面かつ進行中がある時のみ API を叩く設計。
 - (M2) `q` の終了スコープ: `StepLog`/`Diff` では `q`=終了、`Pipelines`/`PipelineDetail` でも `q`=終了(一覧系画面の共通踏襲)。監視中に誤終了しやすいなら要再検討。
 - (M2) BBQL フィルタ(`q=` によるブランチ/状態絞り込み)は未実装(既定の新しい順一覧のみ)。ステップ単位再実行・キャッシュ/アーティファクト操作・真のログストリーミングも後回し(スコープ外)。
+- (M3) ページングは `get_paged` の安全上限(20 ページ)まで自動集約するのみで、明示的な追加読み込み UI は未実装(Branches/Commits/Source 共通)。ブランチ/コミットが大量にある repo での「もっと読む」体験は後続で検討。
+- (M3) シンタックスハイライトなし(ファイルはプレーン表示、diff のみ M1 の +/- 着色)。blame・検索・tags・branching model 詳細・ファイル/ブランチ編集は全てスコープ外(閲覧専用)。
+- (M3) Source の `s`(Branches/Repositories からのルート)と Branches の `Enter`(Commits)の使い分けは、既定ブランチ以外を見るときに一度 Branches を経由する導線。repo 直下から任意 revision の Source/Commits に飛ぶショートカット(revision 入力)は未実装。
+- (M3) 実 token での結合未確認のため、`docs/specs/M3.md` 検証方法の手動一巡(ブランチ→履歴→コミット差分、Source 潜行→ファイル表示)は未実施。実施時に判明したフィールド/挙動を上記「未検証の仮定」へ反映する。
