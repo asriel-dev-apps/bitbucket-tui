@@ -38,6 +38,13 @@ pub enum ApiError {
     Network(String),
 }
 
+impl ApiError {
+    /// 404 Not Found か（ステップログ未生成の判定などに使う）。
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, ApiError::Http { status: 404, .. })
+    }
+}
+
 /// HTTP ステータス・`Retry-After` ヘッダ・レスポンス本文から [`ApiError`] を組み立てる。
 ///
 /// ネットワークに依存しない純粋関数として切り出しているため、ユニットテストで
@@ -135,5 +142,12 @@ mod tests {
                 message: "plain text failure".to_string()
             }
         );
+    }
+
+    #[test]
+    fn is_not_found_detects_404_only() {
+        assert!(classify_error(404, None, "").is_not_found());
+        assert!(!classify_error(500, None, "").is_not_found());
+        assert!(!ApiError::Auth.is_not_found());
     }
 }

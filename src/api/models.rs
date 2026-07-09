@@ -375,6 +375,328 @@ pub struct MergeParams {
     pub close_source_branch: bool,
 }
 
+/// パイプライン/ステップの状態種別（色分け・ポーリング判定に使う）。
+///
+/// 実 API の `state.name` / `result.name` 文字列を [`classify_pipeline_status`] で
+/// この列挙へ丸める。未知の値は [`PipelineStatus::Unknown`] に落とす。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineStatus {
+    /// 成功（緑）。
+    Successful,
+    /// 失敗・エラー（赤）。
+    Failed,
+    /// 実行中（黄）。
+    InProgress,
+    /// 停止・中止（グレー）。
+    Stopped,
+    /// 保留（既定色）。
+    Pending,
+    /// 未知の状態（既定色）。
+    Unknown,
+}
+
+impl PipelineStatus {
+    /// 進行中（自動ポーリング対象）か。`PENDING` も含める。
+    pub fn is_active(self) -> bool {
+        matches!(self, PipelineStatus::InProgress | PipelineStatus::Pending)
+    }
+
+    /// UI 表示ラベル（アイコン付き）。
+    pub fn icon(self) -> &'static str {
+        match self {
+            PipelineStatus::Successful => "✔",
+            PipelineStatus::Failed => "✖",
+            PipelineStatus::InProgress => "▶",
+            PipelineStatus::Stopped => "■",
+            PipelineStatus::Pending => "…",
+            PipelineStatus::Unknown => "?",
+        }
+    }
+}
+
+/// `state.name` と `result.name` から [`PipelineStatus`] を判定する。
+///
+/// 完了時は `result.name`（`SUCCESSFUL`/`FAILED`/`STOPPED`/`ERROR` 等）で成否が決まるため
+/// result を優先する。値は実 API 未検証のため、大文字化して寛容にマッチする。
+pub fn classify_pipeline_status(state: Option<&str>, result: Option<&str>) -> PipelineStatus {
+    if let Some(result) = result {
+        match result.to_ascii_uppercase().as_str() {
+            "SUCCESSFUL" | "SUCCESS" | "PASSED" => return PipelineStatus::Successful,
+            "FAILED" | "ERROR" => return PipelineStatus::Failed,
+            "STOPPED" => return PipelineStatus::Stopped,
+            _ => {}
+        }
+    }
+    match state.map(str::to_ascii_uppercase).as_deref() {
+        Some("IN_PROGRESS" | "BUILDING" | "RUNNING") => PipelineStatus::InProgress,
+        Some("PENDING") => PipelineStatus::Pending,
+        Some("PAUSED" | "HALTED" | "STOPPED") => PipelineStatus::Stopped,
+        _ => PipelineStatus::Unknown,
+    }
+}
+
+/// 秒数を `1m 23s` / `45s` 形式に整形する（未設定は空文字）。
+pub fn format_duration_secs(seconds: Option<u64>) -> String {
+    match seconds {
+        Some(total) if total >= 60 => format!("{}m {}s", total / 60, total % 60),
+        Some(total) => format!("{total}s"),
+        None => String::new(),
+    }
+}
+
+/// パイプライン/ステップ共通の状態（`{ "name": .., "result": { "name": .. }, "stage": { "name": .. } }`）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct PipelineState {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub result: Option<NamedRef>,
+    #[serde(default)]
+    #[allow(
+        dead_code,
+        reason = "stage 名の詳細表示は未対応（state/result を優先）"
+    )]
+    pub stage: Option<NamedRef>,
+}
+
+/// `{ "name": ".." }` だけを持つ共通参照（result / stage）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct NamedRef {
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// パイプラインの実行対象（`{ "type": .., "ref_type": .., "ref_name": .., "commit": {..}, "selector": {..} }`）。
+///
+/// re-run（trigger）ではこの target を引き継いでリクエストボディを組み立てる。
+#[derive(Debug, Clone, Deserialize)]
+pub struct PipelineTarget {
+    #[serde(rename = "type", default)]
+    pub target_type: Option<String>,
+    #[serde(default)]
+    pub ref_type: Option<String>,
+    #[serde(default)]
+    pub ref_name: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code, reason = "commit hash の詳細表示は未対応")]
+    pub commit: Option<Commit>,
+    #[serde(default)]
+    pub selector: Option<PipelineSelector>,
+}
+
+/// パイプライン target の selector（`{ "type": "default"|"custom"|.., "pattern": ".." }`）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct PipelineSelector {
+    #[serde(rename = "type", default)]
+    pub selector_type: Option<String>,
+    #[serde(default)]
+    pub pattern: Option<String>,
+}
+
+impl PipelineSelector {
+    /// trigger ボディ用の JSON へ変換する。
+    fn to_json(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "type".to_string(),
+            serde_json::Value::String(
+                self.selector_type
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string()),
+            ),
+        );
+        if let Some(pattern) = &self.pattern {
+            map.insert(
+                "pattern".to_string(),
+                serde_json::Value::String(pattern.clone()),
+            );
+        }
+        serde_json::Value::Object(map)
+    }
+}
+
+impl PipelineTarget {
+    /// re-run（trigger）用のリクエストボディ `{"target": {...}}` を組み立てる。
+    ///
+    /// 元パイプラインの target（type/ref_type/ref_name/selector）を引き継ぐ。`type` は既定で
+    /// `pipeline_ref_target`、`selector` は既定で `{"type":"default"}`。commit は送らない
+    /// （ブランチ先端の再実行を意図するため）。
+    pub fn trigger_body(&self) -> serde_json::Value {
+        let mut target = serde_json::Map::new();
+        target.insert(
+            "type".to_string(),
+            serde_json::Value::String(
+                self.target_type
+                    .clone()
+                    .unwrap_or_else(|| "pipeline_ref_target".to_string()),
+            ),
+        );
+        if let Some(ref_type) = &self.ref_type {
+            target.insert(
+                "ref_type".to_string(),
+                serde_json::Value::String(ref_type.clone()),
+            );
+        }
+        if let Some(ref_name) = &self.ref_name {
+            target.insert(
+                "ref_name".to_string(),
+                serde_json::Value::String(ref_name.clone()),
+            );
+        }
+        let selector = self
+            .selector
+            .as_ref()
+            .map(PipelineSelector::to_json)
+            .unwrap_or_else(|| serde_json::json!({ "type": "default" }));
+        target.insert("selector".to_string(), selector);
+        serde_json::json!({ "target": serde_json::Value::Object(target) })
+    }
+}
+
+/// `GET /repositories/{ws}/{repo}/pipelines/` の要素 / 詳細。
+///
+/// `uuid` は波括弧 `{...}` を含む文字列。URL に入れる際は percent-encode が必須。
+/// `uuid` 以外は実 API 応答での有無が未確定のため `Option`/`#[serde(default)]` で耐性を持たせる。
+#[derive(Debug, Clone, Deserialize)]
+pub struct Pipeline {
+    pub uuid: String,
+    #[serde(default)]
+    pub build_number: Option<u64>,
+    #[serde(default)]
+    pub state: Option<PipelineState>,
+    #[serde(default)]
+    pub creator: Option<User>,
+    #[serde(default)]
+    pub created_on: Option<String>,
+    #[serde(default)]
+    pub completed_on: Option<String>,
+    #[serde(default)]
+    pub target: Option<PipelineTarget>,
+    #[serde(default)]
+    pub trigger: Option<NamedRef>,
+    #[serde(default)]
+    pub duration_in_seconds: Option<u64>,
+}
+
+impl Pipeline {
+    /// 状態種別（色分け・ポーリング判定）。
+    pub fn status(&self) -> PipelineStatus {
+        let state = self.state.as_ref();
+        classify_pipeline_status(
+            state.and_then(|s| s.name.as_deref()),
+            state
+                .and_then(|s| s.result.as_ref())
+                .and_then(|r| r.name.as_deref()),
+        )
+    }
+
+    /// 進行中（自動ポーリング対象・停止可能）か。
+    pub fn is_active(&self) -> bool {
+        self.status().is_active()
+    }
+
+    /// 表示用のビルド番号ラベル（`#123`）。
+    pub fn build_label(&self) -> String {
+        match self.build_number {
+            Some(number) => format!("#{number}"),
+            None => "#?".to_string(),
+        }
+    }
+
+    /// 状態文字列（`state.name`、無ければ `?`）。
+    pub fn state_name(&self) -> &str {
+        self.state
+            .as_ref()
+            .and_then(|state| state.name.as_deref())
+            .unwrap_or("?")
+    }
+
+    /// 結果文字列（`result.name`、無ければ `None`）。
+    pub fn result_name(&self) -> Option<&str> {
+        self.state
+            .as_ref()
+            .and_then(|state| state.result.as_ref())
+            .and_then(|result| result.name.as_deref())
+    }
+
+    /// 対象 ref 名（`target.ref_name`、無ければ `?`）。
+    pub fn target_ref(&self) -> &str {
+        self.target
+            .as_ref()
+            .and_then(|target| target.ref_name.as_deref())
+            .unwrap_or("?")
+    }
+
+    /// トリガ名（`trigger.name`、無ければ `?`）。
+    pub fn trigger_name(&self) -> &str {
+        self.trigger
+            .as_ref()
+            .and_then(|trigger| trigger.name.as_deref())
+            .unwrap_or("?")
+    }
+
+    /// 作成者の表示名（無ければ `?`）。
+    pub fn creator_name(&self) -> &str {
+        self.creator
+            .as_ref()
+            .and_then(|user| user.display_name.as_deref())
+            .unwrap_or("?")
+    }
+
+    /// 所要時間ラベル（`1m 23s` など）。
+    pub fn duration_label(&self) -> String {
+        format_duration_secs(self.duration_in_seconds)
+    }
+}
+
+/// `GET /repositories/{ws}/{repo}/pipelines/{uuid}/steps/` の要素。
+///
+/// `uuid` はステップ識別子（波括弧 `{...}` 込み、ログ取得の URL に使う）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct PipelineStep {
+    pub uuid: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub state: Option<PipelineState>,
+    #[serde(default)]
+    #[allow(dead_code, reason = "開始日時の詳細表示は未対応")]
+    pub started_on: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code, reason = "完了日時の詳細表示は未対応")]
+    pub completed_on: Option<String>,
+    #[serde(default)]
+    pub duration_in_seconds: Option<u64>,
+}
+
+impl PipelineStep {
+    /// 状態種別（色分け・ポーリング判定）。
+    pub fn status(&self) -> PipelineStatus {
+        let state = self.state.as_ref();
+        classify_pipeline_status(
+            state.and_then(|s| s.name.as_deref()),
+            state
+                .and_then(|s| s.result.as_ref())
+                .and_then(|r| r.name.as_deref()),
+        )
+    }
+
+    /// 進行中か。
+    pub fn is_active(&self) -> bool {
+        self.status().is_active()
+    }
+
+    /// ステップ名（無ければ `(名前なし)`）。
+    pub fn name_str(&self) -> &str {
+        self.name.as_deref().unwrap_or("(名前なし)")
+    }
+
+    /// 所要時間ラベル。
+    pub fn duration_label(&self) -> String {
+        format_duration_secs(self.duration_in_seconds)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,5 +872,139 @@ mod tests {
             serde_json::to_value(MergeStrategy::FastForward).expect("serializes"),
             serde_json::json!("fast_forward")
         );
+    }
+
+    #[test]
+    fn deserializes_pipeline_with_state_and_target() {
+        let json = r#"{
+            "uuid": "{1111-2222}",
+            "build_number": 42,
+            "state": { "name": "COMPLETED", "result": { "name": "SUCCESSFUL" } },
+            "creator": { "display_name": "Alice" },
+            "created_on": "2026-07-09T12:34:56Z",
+            "completed_on": "2026-07-09T12:40:00Z",
+            "target": { "type": "pipeline_ref_target", "ref_type": "branch", "ref_name": "main",
+                        "selector": { "type": "default" } },
+            "trigger": { "name": "PUSH" },
+            "duration_in_seconds": 83,
+            "future_field": { "x": 1 }
+        }"#;
+        let pipeline: Pipeline = serde_json::from_str(json).expect("valid json");
+        assert_eq!(pipeline.uuid, "{1111-2222}");
+        assert_eq!(pipeline.build_label(), "#42");
+        assert_eq!(pipeline.state_name(), "COMPLETED");
+        assert_eq!(pipeline.result_name(), Some("SUCCESSFUL"));
+        assert_eq!(pipeline.status(), PipelineStatus::Successful);
+        assert!(!pipeline.is_active());
+        assert_eq!(pipeline.target_ref(), "main");
+        assert_eq!(pipeline.trigger_name(), "PUSH");
+        assert_eq!(pipeline.creator_name(), "Alice");
+        assert_eq!(pipeline.duration_label(), "1m 23s");
+    }
+
+    #[test]
+    fn pipeline_tolerates_only_uuid() {
+        let pipeline: Pipeline =
+            serde_json::from_str(r#"{ "uuid": "{abc}" }"#).expect("valid json");
+        assert_eq!(pipeline.uuid, "{abc}");
+        assert_eq!(pipeline.build_label(), "#?");
+        assert_eq!(pipeline.state_name(), "?");
+        assert_eq!(pipeline.status(), PipelineStatus::Unknown);
+        assert_eq!(pipeline.target_ref(), "?");
+        assert!(pipeline.duration_label().is_empty());
+    }
+
+    #[test]
+    fn in_progress_pipeline_is_active() {
+        let json = r#"{ "uuid": "{x}", "state": { "name": "IN_PROGRESS" } }"#;
+        let pipeline: Pipeline = serde_json::from_str(json).expect("valid json");
+        assert_eq!(pipeline.status(), PipelineStatus::InProgress);
+        assert!(pipeline.is_active());
+    }
+
+    #[test]
+    fn deserializes_pipeline_step() {
+        let json = r#"{
+            "uuid": "{step-1}",
+            "name": "Build and test",
+            "state": { "name": "COMPLETED", "result": { "name": "FAILED" } },
+            "started_on": "2026-07-09T12:34:56Z",
+            "completed_on": "2026-07-09T12:35:41Z",
+            "duration_in_seconds": 45
+        }"#;
+        let step: PipelineStep = serde_json::from_str(json).expect("valid json");
+        assert_eq!(step.uuid, "{step-1}");
+        assert_eq!(step.name_str(), "Build and test");
+        assert_eq!(step.status(), PipelineStatus::Failed);
+        assert!(!step.is_active());
+        assert_eq!(step.duration_label(), "45s");
+    }
+
+    #[test]
+    fn classify_status_covers_known_values() {
+        assert_eq!(
+            classify_pipeline_status(Some("COMPLETED"), Some("SUCCESSFUL")),
+            PipelineStatus::Successful
+        );
+        assert_eq!(
+            classify_pipeline_status(Some("COMPLETED"), Some("ERROR")),
+            PipelineStatus::Failed
+        );
+        assert_eq!(
+            classify_pipeline_status(Some("COMPLETED"), Some("STOPPED")),
+            PipelineStatus::Stopped
+        );
+        assert_eq!(
+            classify_pipeline_status(Some("in_progress"), None),
+            PipelineStatus::InProgress
+        );
+        assert_eq!(
+            classify_pipeline_status(Some("PENDING"), None),
+            PipelineStatus::Pending
+        );
+        assert_eq!(
+            classify_pipeline_status(Some("HALTED"), None),
+            PipelineStatus::Stopped
+        );
+        assert_eq!(
+            classify_pipeline_status(Some("WHO_KNOWS"), None),
+            PipelineStatus::Unknown
+        );
+        assert_eq!(
+            classify_pipeline_status(None, None),
+            PipelineStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn format_duration_variants() {
+        assert_eq!(format_duration_secs(None), "");
+        assert_eq!(format_duration_secs(Some(5)), "5s");
+        assert_eq!(format_duration_secs(Some(83)), "1m 23s");
+        assert_eq!(format_duration_secs(Some(120)), "2m 0s");
+    }
+
+    #[test]
+    fn trigger_body_preserves_target() {
+        let json = r#"{ "type": "pipeline_ref_target", "ref_type": "branch",
+                        "ref_name": "feature/x", "selector": { "type": "custom", "pattern": "nightly" } }"#;
+        let target: PipelineTarget = serde_json::from_str(json).expect("valid json");
+        let body = target.trigger_body();
+        assert_eq!(body["target"]["type"], "pipeline_ref_target");
+        assert_eq!(body["target"]["ref_type"], "branch");
+        assert_eq!(body["target"]["ref_name"], "feature/x");
+        assert_eq!(body["target"]["selector"]["type"], "custom");
+        assert_eq!(body["target"]["selector"]["pattern"], "nightly");
+    }
+
+    #[test]
+    fn trigger_body_defaults_when_target_sparse() {
+        let target: PipelineTarget =
+            serde_json::from_str(r#"{ "ref_name": "main" }"#).expect("valid json");
+        let body = target.trigger_body();
+        assert_eq!(body["target"]["type"], "pipeline_ref_target");
+        assert_eq!(body["target"]["ref_name"], "main");
+        assert_eq!(body["target"]["selector"]["type"], "default");
+        assert!(body["target"].get("ref_type").is_none());
     }
 }

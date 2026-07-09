@@ -10,13 +10,17 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
-use crate::api::{Comment, DiffStatEntry, MergeStrategy, PullRequest};
-use crate::tui::app::{App, CommentEditor, DiffState, MergeModal, Screen, SelectList, Status};
+use crate::api::{
+    Comment, DiffStatEntry, MergeStrategy, Pipeline, PipelineStatus, PipelineStep, PullRequest,
+};
+use crate::tui::app::{
+    App, CommentEditor, ConfirmModal, DiffState, MergeModal, Screen, SelectList, Status,
+};
 use crate::tui::diff::DiffLineKind;
 use crate::tui::onboarding::Field;
 
 /// API token 発行に関する常時ヒント。
-const TOKEN_HINT: &str = "API token は Atlassian アカウント設定 > Security で発行。必要スコープ: account, repository, pullrequest, pullrequest:write, pipeline";
+const TOKEN_HINT: &str = "API token は Atlassian アカウント設定 > Security で発行。必要スコープ: account, repository, pullrequest, pullrequest:write, pipeline, pipeline:write";
 
 /// 画面全体を描画する。
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -37,17 +41,23 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Screen::PullRequests => render_pull_requests(frame, chunks[1], app),
         Screen::PullRequestDetail => render_pull_request_detail(frame, chunks[1], app),
         Screen::Diff => render_diff(frame, chunks[1], app),
+        Screen::Pipelines => render_pipelines(frame, chunks[1], app),
+        Screen::PipelineDetail => render_pipeline_detail(frame, chunks[1], app),
+        Screen::StepLog => render_step_log(frame, chunks[1], app),
     }
 
     render_status(frame, chunks[2], &app.status);
     render_hints(frame, chunks[3], app.screen);
 
-    // オーバーレイ（優先度: コメント/merge モーダル → ヘルプ）。
+    // オーバーレイ（優先度: コメント/merge/確認モーダル → ヘルプ）。
     if let Some(editor) = &app.comment_editor {
         render_comment_editor(frame, editor);
     }
     if let Some(modal) = &app.merge_modal {
         render_merge_modal(frame, modal, app.current_pr.as_ref());
+    }
+    if let Some(modal) = &app.confirm_modal {
+        render_confirm_modal(frame, modal);
     }
     if app.show_help {
         render_help(frame, app.screen);
@@ -62,6 +72,9 @@ fn screen_title(screen: Screen) -> &'static str {
         Screen::PullRequests => "プルリクエスト",
         Screen::PullRequestDetail => "PR 詳細",
         Screen::Diff => "差分",
+        Screen::Pipelines => "パイプライン",
+        Screen::PipelineDetail => "パイプライン詳細",
+        Screen::StepLog => "ステップログ",
     }
 }
 
@@ -480,6 +493,262 @@ fn diff_line_style(kind: DiffLineKind) -> Style {
     }
 }
 
+/// パイプライン/ステップ状態に対応する前景色。
+fn pipeline_status_color(status: PipelineStatus) -> Color {
+    match status {
+        // 成功=緑 / 失敗・エラー=赤 / 進行中=黄 / 停止・中止=グレー / 保留=既定色。
+        PipelineStatus::Successful => Color::Green,
+        PipelineStatus::Failed => Color::Red,
+        PipelineStatus::InProgress => Color::Yellow,
+        PipelineStatus::Stopped => Color::DarkGray,
+        PipelineStatus::Pending => Color::Reset,
+        PipelineStatus::Unknown => Color::Gray,
+    }
+}
+
+/// 状態バッジ（アイコン + `state`/`result` 名）の色付き Span。
+fn pipeline_status_span(status: PipelineStatus, label: String) -> Span<'static> {
+    Span::styled(
+        format!("{} {label}", status.icon()),
+        Style::new().fg(pipeline_status_color(status)),
+    )
+}
+
+fn render_pipelines(frame: &mut Frame, area: Rect, app: &mut App) {
+    let auto = if app.auto_refresh { "on" } else { "off" };
+    if app.pipelines.items.is_empty() {
+        render_placeholder(frame, area, &app.status, "パイプラインがありません");
+        return;
+    }
+    let items: Vec<ListItem> = app
+        .pipelines
+        .items
+        .iter()
+        .map(|pipeline| ListItem::new(pipeline_row(pipeline)))
+        .collect();
+    let title = format!(
+        " パイプライン ({}) [auto:{auto}] ",
+        app.pipelines.items.len()
+    );
+    let list = list_widget(items, title);
+    frame.render_stateful_widget(list, area, &mut app.pipelines.state);
+}
+
+fn pipeline_row(pipeline: &Pipeline) -> Line<'static> {
+    let status = pipeline.status();
+    let state_label = match pipeline.result_name() {
+        Some(result) => format!("{}/{result}", pipeline.state_name()),
+        None => pipeline.state_name().to_string(),
+    };
+    let created = pipeline
+        .created_on
+        .as_deref()
+        .map(short_datetime)
+        .unwrap_or_default();
+    Line::from(vec![
+        Span::styled(
+            format!("{:<7}", pipeline.build_label()),
+            Style::new().fg(Color::Yellow),
+        ),
+        pipeline_status_span(status, format!("{state_label:<20}")),
+        Span::styled(
+            format!("  {}", pipeline.target_ref()),
+            Style::new().fg(Color::Cyan),
+        ),
+        Span::styled(
+            format!("  {}", pipeline.trigger_name()),
+            Style::new().fg(Color::Blue),
+        ),
+        Span::styled(format!("  {created}"), Style::new().dim()),
+        Span::styled(
+            format!("  {}", pipeline.duration_label()),
+            Style::new().dim(),
+        ),
+    ])
+}
+
+fn render_pipeline_detail(frame: &mut Frame, area: Rect, app: &mut App) {
+    let rows =
+        Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)]).split(area);
+
+    match app.current_pipeline.as_ref() {
+        Some(pipeline) => render_pipeline_meta(frame, rows[0], pipeline, app.auto_refresh),
+        None => render_placeholder(
+            frame,
+            rows[0],
+            &app.status,
+            "パイプラインを選択してください",
+        ),
+    }
+    render_steps_list(frame, rows[1], &mut app.pipeline_steps);
+}
+
+fn render_pipeline_meta(frame: &mut Frame, area: Rect, pipeline: &Pipeline, auto_refresh: bool) {
+    let status = pipeline.status();
+    let state_label = match pipeline.result_name() {
+        Some(result) => format!("{} / {result}", pipeline.state_name()),
+        None => pipeline.state_name().to_string(),
+    };
+    let auto = if auto_refresh { "on" } else { "off" };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{} ", pipeline.build_label()),
+                Style::new().fg(Color::Yellow).bold(),
+            ),
+            pipeline_status_span(status, state_label),
+        ]),
+        Line::from(vec![
+            Span::styled("target: ", Style::new().dim()),
+            Span::styled(
+                pipeline.target_ref().to_string(),
+                Style::new().fg(Color::Cyan),
+            ),
+            Span::styled("   trigger: ", Style::new().dim()),
+            Span::raw(pipeline.trigger_name().to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("creator: ", Style::new().dim()),
+            Span::raw(pipeline.creator_name().to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("created: ", Style::new().dim()),
+            Span::raw(
+                pipeline
+                    .created_on
+                    .as_deref()
+                    .map(short_datetime)
+                    .unwrap_or_default(),
+            ),
+            Span::styled("   completed: ", Style::new().dim()),
+            Span::raw(
+                pipeline
+                    .completed_on
+                    .as_deref()
+                    .map(short_datetime)
+                    .unwrap_or_default(),
+            ),
+            Span::styled("   所要: ", Style::new().dim()),
+            Span::raw(pipeline.duration_label()),
+        ]),
+        Line::from(Span::styled(
+            format!("自動更新: {auto}"),
+            Style::new().dim(),
+        )),
+    ];
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(" 概要 "))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
+fn render_steps_list(frame: &mut Frame, area: Rect, steps: &mut SelectList<PipelineStep>) {
+    if steps.items.is_empty() {
+        let block = Block::default().borders(Borders::ALL).title(" ステップ ");
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "（ステップなし）",
+                Style::new().dim(),
+            )))
+            .block(block),
+            area,
+        );
+        return;
+    }
+    let items: Vec<ListItem> = steps
+        .items
+        .iter()
+        .map(|step| {
+            let status = step.status();
+            let state_label = step
+                .state
+                .as_ref()
+                .and_then(|state| state.name.as_deref())
+                .unwrap_or("?");
+            ListItem::new(Line::from(vec![
+                pipeline_status_span(status, format!("{state_label:<12}")),
+                Span::raw(step.name_str().to_string()),
+                Span::styled(format!("  {}", step.duration_label()), Style::new().dim()),
+            ]))
+        })
+        .collect();
+    let title = format!(" ステップ ({}) ", steps.items.len());
+    let list = list_widget(items, title);
+    frame.render_stateful_widget(list, area, &mut steps.state);
+}
+
+fn render_step_log(frame: &mut Frame, area: Rect, app: &mut App) {
+    let Some(log) = app.step_log.as_mut() else {
+        render_placeholder(frame, area, &app.status, "ログを取得しています…");
+        return;
+    };
+    // 枠線ぶんを差し引いたビューポート高さを保持（スクロール上限計算に使う）。
+    log.viewport = area.height.saturating_sub(2) as usize;
+    log.clamp_scroll();
+
+    let line_style = if log.missing {
+        Style::new().dim()
+    } else {
+        Style::new()
+    };
+    let lines: Vec<Line> = log
+        .lines
+        .iter()
+        .map(|line| Line::from(Span::styled(line.clone(), line_style)))
+        .collect();
+    let count_label = if log.missing {
+        "ログなし".to_string()
+    } else {
+        format!("{} 行", log.lines.len())
+    };
+    let title = format!(" ログ {} ({count_label}) ", log.title);
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .scroll((log.scroll.min(u16::MAX as usize) as u16, 0));
+    frame.render_widget(paragraph, area);
+}
+
+/// ISO8601 文字列を `YYYY-MM-DD HH:MM` へ短縮する（`T` を空白に）。
+fn short_datetime(value: &str) -> String {
+    let truncated: String = value.chars().take(16).collect();
+    truncated.replacen('T', " ", 1)
+}
+
+fn render_confirm_modal(frame: &mut Frame, modal: &ConfirmModal) {
+    let area = centered_rect(60, 40, frame.area());
+    frame.render_widget(Clear, area);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            modal.action.description(),
+            Style::new().fg(Color::Red).bold(),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("対象: ", Style::new().dim()),
+            Span::styled(modal.build_label.clone(), Style::new().fg(Color::Yellow)),
+        ]),
+        Line::raw(""),
+    ];
+    if modal.submitting {
+        lines.push(Line::from(Span::styled(
+            "実行中…",
+            Style::new().fg(Color::Yellow),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "Enter: 実行   Esc: 取消",
+        Style::new().dim(),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", modal.action.title()))
+        .border_style(Style::new().fg(Color::Red))
+        .style(Style::new().bg(Color::Black));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn render_placeholder(frame: &mut Frame, area: Rect, status: &Status, empty_text: &str) {
     let text = if matches!(status, Status::Loading(_)) {
         "読み込み中…"
@@ -530,12 +799,19 @@ fn render_hints(frame: &mut Frame, area: Rect, screen: Screen) {
         Screen::Workspaces => "↑↓ / j k: 移動   Enter: 開く   ?: ヘルプ   q: 終了",
         Screen::Repositories => "↑↓ / j k: 移動   Enter: 選択   Esc: 戻る   ?: ヘルプ   q: 終了",
         Screen::PullRequests => {
-            "↑↓/jk: 移動  Enter: 詳細  o/m/d/a: 状態  r: 再読込  Esc: 戻る  ?: ヘルプ"
+            "↑↓/jk: 移動  Enter: 詳細  o/m/d/a: 状態  r: 再読込  P: パイプライン  Esc: 戻る"
         }
         Screen::PullRequestDetail => {
             "d: Diff  c: コメント  a: 承認  x: 変更要求  M: マージ  ↑↓: ファイル  Esc: 戻る"
         }
         Screen::Diff => "↑↓/jk PgUp/PgDn g/G: スクロール  n/N: ファイル  Esc: 戻る  q: 終了",
+        Screen::Pipelines => {
+            "↑↓/jk: 移動  Enter: 詳細  r: 再読込  a: 自動更新  S: 停止  R: 再実行  Esc: 戻る"
+        }
+        Screen::PipelineDetail => {
+            "↑↓/jk: ステップ  Enter: ログ  r: 再読込  a: 自動更新  S: 停止  R: 再実行  Esc: 戻る"
+        }
+        Screen::StepLog => "↑↓/jk PgUp/PgDn g/G: スクロール  r: 再取得  Esc: 戻る  q: 終了",
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(hint, Style::new().dim()))),
@@ -679,6 +955,30 @@ fn render_help(frame: &mut Frame, screen: Screen) {
             "g / G          先頭 / 末尾",
             "n / N          次 / 前のファイル境界",
         ],
+        Screen::Repositories => &[
+            "Enter          プルリクエスト一覧を開く",
+            "p              パイプライン一覧を開く",
+        ],
+        Screen::Pipelines => &[
+            "Enter          パイプライン詳細を開く",
+            "r              一覧を再読込",
+            "a              自動更新の ON/OFF",
+            "S              停止（進行中のみ・確認モーダル）",
+            "R              再実行（確認モーダル）",
+        ],
+        Screen::PipelineDetail => &[
+            "↑↓ / j k       ステップ選択",
+            "Enter          ステップのログを開く",
+            "r              詳細を再読込",
+            "a              自動更新の ON/OFF",
+            "S / R          停止 / 再実行（確認モーダル）",
+        ],
+        Screen::StepLog => &[
+            "↑↓ / j k       1 行スクロール",
+            "PgUp/PgDn      1 画面スクロール",
+            "g / G          先頭 / 末尾",
+            "r              ログ再取得（擬似 tail）",
+        ],
         _ => &[],
     };
     if !screen_keys.is_empty() {
@@ -725,4 +1025,34 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         Constraint::Percentage((100 - percent_x) / 2),
     ])
     .split(vertical[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pipeline_status_colors_map_to_spec() {
+        // 成功=緑 / 失敗・エラー=赤 / 進行中=黄 / 停止・中止=グレー / 保留=既定色。
+        assert_eq!(
+            pipeline_status_color(PipelineStatus::Successful),
+            Color::Green
+        );
+        assert_eq!(pipeline_status_color(PipelineStatus::Failed), Color::Red);
+        assert_eq!(
+            pipeline_status_color(PipelineStatus::InProgress),
+            Color::Yellow
+        );
+        assert_eq!(
+            pipeline_status_color(PipelineStatus::Stopped),
+            Color::DarkGray
+        );
+        assert_eq!(pipeline_status_color(PipelineStatus::Pending), Color::Reset);
+    }
+
+    #[test]
+    fn short_datetime_formats_iso8601() {
+        assert_eq!(short_datetime("2026-07-10T12:34:56Z"), "2026-07-10 12:34");
+        assert_eq!(short_datetime("2026-07-10"), "2026-07-10");
+    }
 }

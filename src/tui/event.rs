@@ -5,17 +5,22 @@
 //! tokio mpsc へ橋渡しする（`event-stream` / `futures` へ依存を増やさないため）。
 //! API 呼び出しは `tokio::spawn` し、結果を [`Msg`] として返す。
 
+use std::time::Duration;
+
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use tokio::sync::mpsc;
 
 use crate::api::BitbucketClient;
 use crate::tui::Tui;
-use crate::tui::app::{App, Command, Msg};
+use crate::tui::app::{App, Command, Msg, PipelineAction};
 use crate::tui::ui;
 
 /// 入力・API チャネルの容量。
 const CHANNEL_CAPACITY: usize = 64;
+
+/// 進行中パイプラインの自動ポーリング間隔。
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// TUI のメインループ。`app` の状態が「終了」に達するまで描画と更新を繰り返す。
 pub async fn run(tui: &mut Tui, mut app: App) -> Result<()> {
@@ -28,6 +33,13 @@ pub async fn run(tui: &mut Tui, mut app: App) -> Result<()> {
     if !dispatch(app.init_command(), &api_tx) {
         return Ok(());
     }
+
+    // 自動ポーリング用のタイマ。tick を `Msg::Tick` として流し、update() 側が進行中
+    // パイプラインの有無・自動更新の ON/OFF を見てリフレッシュ要否を判断する。
+    let mut ticker = tokio::time::interval(POLL_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // 最初の tick は即時に完了するため、起動直後の無駄な発火を避けて捨てる。
+    ticker.tick().await;
 
     loop {
         tui.terminal
@@ -50,6 +62,11 @@ pub async fn run(tui: &mut Tui, mut app: App) -> Result<()> {
                 if let Some(msg) = maybe_msg
                     && !dispatch(app.update(msg), &api_tx)
                 {
+                    break;
+                }
+            }
+            _ = ticker.tick() => {
+                if !dispatch(app.update(Msg::Tick), &api_tx) {
                     break;
                 }
             }
@@ -283,6 +300,120 @@ fn dispatch(command: Command, api_tx: &mpsc::Sender<Msg>) -> bool {
                     .await
                 {
                     Ok(()) => Msg::MergeDone { id },
+                    Err(error) => Msg::ActionFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
+        Command::LoadPipelines {
+            client,
+            workspace,
+            repo,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let msg = match client.list_pipelines(&workspace, &repo).await {
+                    Ok(pipelines) => Msg::PipelinesLoaded { repo, pipelines },
+                    Err(error) => Msg::LoadFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
+        Command::LoadPipeline {
+            client,
+            workspace,
+            repo,
+            uuid,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let msg = match client.get_pipeline(&workspace, &repo, &uuid).await {
+                    Ok(pipeline) => Msg::PipelineLoaded {
+                        uuid,
+                        pipeline: Box::new(pipeline),
+                    },
+                    Err(error) => Msg::LoadFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
+        Command::LoadPipelineSteps {
+            client,
+            workspace,
+            repo,
+            uuid,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let msg = match client.list_pipeline_steps(&workspace, &repo, &uuid).await {
+                    Ok(steps) => Msg::PipelineStepsLoaded { uuid, steps },
+                    Err(error) => Msg::LoadFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
+        Command::LoadStepLog {
+            client,
+            workspace,
+            repo,
+            pipeline_uuid,
+            step_uuid,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                // 404（ログ未生成）は「ログなし」として扱い、それ以外はエラー表示。
+                let msg = match client
+                    .get_step_log(&workspace, &repo, &pipeline_uuid, &step_uuid)
+                    .await
+                {
+                    Ok(text) => Msg::StepLogLoaded {
+                        step_uuid,
+                        text: Some(text),
+                    },
+                    Err(error) if error.is_not_found() => Msg::StepLogLoaded {
+                        step_uuid,
+                        text: None,
+                    },
+                    Err(error) => Msg::LoadFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
+        Command::StopPipeline {
+            client,
+            workspace,
+            repo,
+            uuid,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let msg = match client.stop_pipeline(&workspace, &repo, &uuid).await {
+                    Ok(()) => Msg::PipelineActionDone {
+                        action: PipelineAction::Stop,
+                    },
+                    Err(error) => Msg::ActionFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
+        Command::TriggerPipeline {
+            client,
+            workspace,
+            repo,
+            target,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let msg = match client.trigger_pipeline(&workspace, &repo, &target).await {
+                    Ok(_pipeline) => Msg::PipelineActionDone {
+                        action: PipelineAction::Rerun,
+                    },
                     Err(error) => Msg::ActionFailed(error),
                 };
                 let _ = tx.send(msg).await;

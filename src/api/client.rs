@@ -12,7 +12,8 @@ use serde::de::DeserializeOwned;
 
 use crate::api::error::{ApiError, classify_error};
 use crate::api::models::{
-    Comment, DiffStatEntry, MergeParams, Paginated, PullRequest, Repository, User, Workspace,
+    Comment, DiffStatEntry, MergeParams, Paginated, Pipeline, PipelineStep, PipelineTarget,
+    PullRequest, Repository, User, Workspace,
 };
 
 /// API のベース URL（Bitbucket Cloud）。
@@ -209,6 +210,86 @@ impl BitbucketClient {
         self.send_json_discard(Method::POST, url, params).await
     }
 
+    /// パイプライン一覧を作成日時降順で取得する。
+    pub async fn list_pipelines(
+        &self,
+        workspace: &str,
+        repo: &str,
+    ) -> Result<Vec<Pipeline>, ApiError> {
+        let path = format!("/repositories/{workspace}/{repo}/pipelines/");
+        self.get_paged(&path, &[("sort", "-created_on"), ("pagelen", "50")])
+            .await
+    }
+
+    /// パイプライン詳細を取得する。
+    ///
+    /// `uuid` は波括弧 `{...}` を含むため、URL 化する際に percent-encode する。
+    pub async fn get_pipeline(
+        &self,
+        workspace: &str,
+        repo: &str,
+        uuid: &str,
+    ) -> Result<Pipeline, ApiError> {
+        let encoded = percent_encode(uuid);
+        let url = format!("{BASE_URL}/repositories/{workspace}/{repo}/pipelines/{encoded}");
+        self.send_get(url, Vec::new()).await
+    }
+
+    /// パイプラインのステップ一覧を取得する。
+    pub async fn list_pipeline_steps(
+        &self,
+        workspace: &str,
+        repo: &str,
+        uuid: &str,
+    ) -> Result<Vec<PipelineStep>, ApiError> {
+        let encoded = percent_encode(uuid);
+        let path = format!("/repositories/{workspace}/{repo}/pipelines/{encoded}/steps/");
+        self.get_paged(&path, &[("pagelen", "100")]).await
+    }
+
+    /// ステップログを生テキスト（`text/plain`）で取得する。
+    ///
+    /// ログ未生成時は 404 になり得る（呼び出し側で「ログなし」を表示）。
+    pub async fn get_step_log(
+        &self,
+        workspace: &str,
+        repo: &str,
+        pipeline_uuid: &str,
+        step_uuid: &str,
+    ) -> Result<String, ApiError> {
+        let pipeline = percent_encode(pipeline_uuid);
+        let step = percent_encode(step_uuid);
+        let url = format!(
+            "{BASE_URL}/repositories/{workspace}/{repo}/pipelines/{pipeline}/steps/{step}/log"
+        );
+        self.send_get_text(url).await
+    }
+
+    /// パイプラインを停止する（未完了ステップを停止）。
+    pub async fn stop_pipeline(
+        &self,
+        workspace: &str,
+        repo: &str,
+        uuid: &str,
+    ) -> Result<(), ApiError> {
+        let encoded = percent_encode(uuid);
+        let url =
+            format!("{BASE_URL}/repositories/{workspace}/{repo}/pipelines/{encoded}/stopPipeline");
+        self.send_empty(Method::POST, url).await
+    }
+
+    /// パイプラインを再実行する（元 target を引き継いで trigger）。
+    pub async fn trigger_pipeline(
+        &self,
+        workspace: &str,
+        repo: &str,
+        target: &PipelineTarget,
+    ) -> Result<Pipeline, ApiError> {
+        let url = format!("{BASE_URL}/repositories/{workspace}/{repo}/pipelines/");
+        self.send_json(Method::POST, url, &target.trigger_body())
+            .await
+    }
+
     /// ページングエンドポイントを `next` に従って全ページ集約する。
     ///
     /// 初回リクエストにのみ `query` を適用する。2 ページ目以降は Bitbucket が返す
@@ -347,6 +428,36 @@ impl BitbucketClient {
 /// 一般コメント投稿のリクエストボディ（`{"content":{"raw":".."}}`）を組み立てる。
 fn comment_body(raw: &str) -> serde_json::Value {
     serde_json::json!({ "content": { "raw": raw } })
+}
+
+/// URL パスセグメント用の percent-encode。
+///
+/// unreserved 文字（`A-Z a-z 0-9 - . _ ~`）以外をすべて `%XX` へエンコードする。
+/// pipeline_uuid / step_uuid に含まれる波括弧 `{...}` を確実にエンコードするのが目的
+/// （素の `{...}` を送ると Bitbucket が `The value provided is not a valid uuid` を返す）。
+fn percent_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for &byte in input.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(hex_digit(byte >> 4));
+                out.push(hex_digit(byte & 0x0f));
+            }
+        }
+    }
+    out
+}
+
+/// 4bit のニブルを大文字 16 進数字へ変換する。
+fn hex_digit(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        _ => (b'A' + (nibble - 10)) as char,
+    }
 }
 
 /// 非成功レスポンスから [`ApiError`] を組み立てる。
@@ -494,6 +605,25 @@ mod tests {
     fn comment_body_wraps_raw_content() {
         let body = comment_body("hello\nworld");
         assert_eq!(body["content"]["raw"], "hello\nworld");
+    }
+
+    #[test]
+    fn percent_encode_escapes_uuid_braces() {
+        // 波括弧が %7B / %7D に、ハイフンは温存されること。
+        assert_eq!(
+            percent_encode("{d3f5e4b0-1234-5678-9abc-def012345678}"),
+            "%7Bd3f5e4b0-1234-5678-9abc-def012345678%7D"
+        );
+    }
+
+    #[test]
+    fn percent_encode_leaves_unreserved_untouched() {
+        assert_eq!(percent_encode("abcXYZ0-9._~"), "abcXYZ0-9._~");
+    }
+
+    #[test]
+    fn percent_encode_escapes_slash_and_space() {
+        assert_eq!(percent_encode("a/b c"), "a%2Fb%20c");
     }
 
     #[tokio::test]

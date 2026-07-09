@@ -7,12 +7,13 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
 
 use crate::api::{
-    ApiError, BitbucketClient, Comment, DiffStatEntry, MergeParams, MergeStrategy, PullRequest,
-    Repository, User, Workspace,
+    ApiError, BitbucketClient, Comment, DiffStatEntry, MergeParams, MergeStrategy, Pipeline,
+    PipelineStep, PipelineTarget, PullRequest, Repository, User, Workspace,
 };
 use crate::auth;
 use crate::config::Config;
 use crate::tui::diff::{ParsedDiff, parse as parse_diff};
+use crate::tui::logview::LogView;
 use crate::tui::onboarding::{Field, OnboardingState};
 
 /// 画面種別。
@@ -24,6 +25,9 @@ pub enum Screen {
     PullRequests,
     PullRequestDetail,
     Diff,
+    Pipelines,
+    PipelineDetail,
+    StepLog,
 }
 
 /// PR 一覧の state フィルタ。
@@ -94,6 +98,59 @@ impl MergeModal {
 
     fn cycle_strategy(&mut self) {
         self.strategy = (self.strategy + 1) % MergeStrategy::ALL.len();
+    }
+}
+
+/// パイプラインへの破壊的操作の種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineAction {
+    /// 未完了ステップを停止する。
+    Stop,
+    /// 元 target で再実行する。
+    Rerun,
+}
+
+impl PipelineAction {
+    /// 確認モーダルの見出し。
+    pub fn title(self) -> &'static str {
+        match self {
+            PipelineAction::Stop => "パイプライン停止の確認",
+            PipelineAction::Rerun => "パイプライン再実行の確認",
+        }
+    }
+
+    /// 確認モーダルの本文（破壊的操作の説明）。
+    pub fn description(self) -> &'static str {
+        match self {
+            PipelineAction::Stop => "破壊的操作: 実行中のステップを停止します。",
+            PipelineAction::Rerun => "破壊的操作: 同じ target でパイプラインを再実行します。",
+        }
+    }
+}
+
+/// stop / re-run の確認モーダル状態（M1 の merge モーダルと同じ「確認しないと実行しない」仕組み）。
+#[derive(Debug, Clone)]
+pub struct ConfirmModal {
+    pub action: PipelineAction,
+    /// 対象パイプラインの uuid（波括弧込み）。
+    pub pipeline_uuid: String,
+    /// 表示用のビルドラベル（`#123`）。
+    pub build_label: String,
+    /// re-run 用に元 target を引き継ぐ（stop では使わない）。
+    pub target: Option<PipelineTarget>,
+    pub submitting: bool,
+}
+
+impl ConfirmModal {
+    /// 対象パイプラインに対する確認モーダルを作る。
+    fn new(action: PipelineAction, pipeline: &Pipeline) -> Self {
+        Self {
+            action,
+            pipeline_uuid: pipeline.uuid.clone(),
+            build_label: pipeline.build_label(),
+            target: pipeline.target.clone(),
+            submitting: false,
+        }
     }
 }
 
@@ -223,6 +280,30 @@ pub enum Msg {
     MergeDone { id: u64 },
     /// レビュー系アクション（approve/comment/merge 等）の失敗。
     ActionFailed(ApiError),
+    /// 自動ポーリングのタイマ tick（進行中パイプラインの定期リフレッシュ）。
+    Tick,
+    /// パイプライン一覧の取得完了。
+    PipelinesLoaded {
+        repo: String,
+        pipelines: Vec<Pipeline>,
+    },
+    /// パイプライン詳細の取得完了。
+    PipelineLoaded {
+        uuid: String,
+        pipeline: Box<Pipeline>,
+    },
+    /// パイプラインステップ一覧の取得完了。
+    PipelineStepsLoaded {
+        uuid: String,
+        steps: Vec<PipelineStep>,
+    },
+    /// ステップログの取得完了（`text` が `None` なら 404＝ログなし）。
+    StepLogLoaded {
+        step_uuid: String,
+        text: Option<String>,
+    },
+    /// stop / re-run の成功。
+    PipelineActionDone { action: PipelineAction },
 }
 
 /// `update()` が返す副作用の指示。実行は `event` モジュールが担う。
@@ -310,6 +391,48 @@ pub enum Command {
         id: u64,
         params: MergeParams,
     },
+    /// パイプライン一覧を取得する。
+    LoadPipelines {
+        client: BitbucketClient,
+        workspace: String,
+        repo: String,
+    },
+    /// パイプライン詳細を取得する。
+    LoadPipeline {
+        client: BitbucketClient,
+        workspace: String,
+        repo: String,
+        uuid: String,
+    },
+    /// パイプラインステップ一覧を取得する。
+    LoadPipelineSteps {
+        client: BitbucketClient,
+        workspace: String,
+        repo: String,
+        uuid: String,
+    },
+    /// ステップログを取得する。
+    LoadStepLog {
+        client: BitbucketClient,
+        workspace: String,
+        repo: String,
+        pipeline_uuid: String,
+        step_uuid: String,
+    },
+    /// パイプラインを停止する。
+    StopPipeline {
+        client: BitbucketClient,
+        workspace: String,
+        repo: String,
+        uuid: String,
+    },
+    /// パイプラインを再実行する。
+    TriggerPipeline {
+        client: BitbucketClient,
+        workspace: String,
+        repo: String,
+        target: PipelineTarget,
+    },
 }
 
 /// 選択状態を持つリスト。ratatui の `ListState` を内包し、スクロールは List ウィジェットに委ねる。
@@ -335,6 +458,19 @@ impl<T> SelectList<T> {
     pub fn set_items(&mut self, items: Vec<T>) {
         self.state
             .select(if items.is_empty() { None } else { Some(0) });
+        self.items = items;
+    }
+
+    /// 要素を差し替えつつ、選択インデックスを可能な限り維持する（新しい件数にクランプ）。
+    ///
+    /// 自動ポーリングでの一覧リフレッシュ時に、選択位置が毎回先頭へ戻らないようにするために使う。
+    pub fn set_items_keep_selection(&mut self, items: Vec<T>) {
+        let selection = if items.is_empty() {
+            None
+        } else {
+            Some(self.state.selected().unwrap_or(0).min(items.len() - 1))
+        };
+        self.state.select(selection);
         self.items = items;
     }
 
@@ -391,6 +527,15 @@ pub struct App {
     pub diff: Option<DiffState>,
     pub comment_editor: Option<CommentEditor>,
     pub merge_modal: Option<MergeModal>,
+    pub pipelines: SelectList<Pipeline>,
+    pub current_pipeline: Option<Pipeline>,
+    pub pipeline_steps: SelectList<PipelineStep>,
+    pub step_log: Option<LogView>,
+    /// StepLog 画面で開いているステップの uuid（受信ログ・再取得の照合に使う）。
+    pub open_step_uuid: Option<String>,
+    pub confirm_modal: Option<ConfirmModal>,
+    /// 進行中パイプラインの自動ポーリング更新が有効か。
+    pub auto_refresh: bool,
     pub status: Status,
     pub show_help: bool,
 }
@@ -429,6 +574,13 @@ impl App {
             diff: None,
             comment_editor: None,
             merge_modal: None,
+            pipelines: SelectList::default(),
+            current_pipeline: None,
+            pipeline_steps: SelectList::default(),
+            step_log: None,
+            open_step_uuid: None,
+            confirm_modal: None,
+            auto_refresh: true,
             status: Status::Idle,
             show_help: false,
         }
@@ -549,8 +701,70 @@ impl App {
                 if let Some(modal) = self.merge_modal.as_mut() {
                     modal.submitting = false;
                 }
+                if let Some(modal) = self.confirm_modal.as_mut() {
+                    modal.submitting = false;
+                }
                 self.status = Status::Error(error.to_string());
                 Command::None
+            }
+            Msg::Tick => self.on_tick(),
+            Msg::PipelinesLoaded { repo, pipelines } => {
+                if self.repo_slug().as_deref() == Some(repo.as_str()) {
+                    self.clear_loading();
+                    self.pipelines.set_items_keep_selection(pipelines);
+                }
+                Command::None
+            }
+            Msg::PipelineLoaded { uuid, pipeline } => {
+                if self.current_pipeline_uuid() == Some(uuid.as_str()) {
+                    self.clear_loading();
+                    self.current_pipeline = Some(*pipeline);
+                }
+                Command::None
+            }
+            Msg::PipelineStepsLoaded { uuid, steps } => {
+                if self.current_pipeline_uuid() == Some(uuid.as_str()) {
+                    self.pipeline_steps.set_items_keep_selection(steps);
+                }
+                Command::None
+            }
+            Msg::StepLogLoaded { step_uuid, text } => {
+                if self.open_step_uuid.as_deref() == Some(step_uuid.as_str()) {
+                    self.clear_loading();
+                    let title = self.step_log_title(&step_uuid);
+                    // 同じステップの再取得ではスクロール位置を維持する（擬似 tail）。
+                    let prev_scroll = self
+                        .step_log
+                        .as_ref()
+                        .filter(|view| view.step_uuid == step_uuid)
+                        .map(|view| view.scroll);
+                    let mut view = match text {
+                        Some(text) => LogView::from_text(step_uuid, title, &text),
+                        None => LogView::missing(step_uuid, title),
+                    };
+                    if let Some(scroll) = prev_scroll {
+                        view.scroll = scroll;
+                    }
+                    self.step_log = Some(view);
+                }
+                Command::None
+            }
+            Msg::PipelineActionDone { action } => {
+                self.confirm_modal = None;
+                self.auto_refresh = true;
+                match action {
+                    PipelineAction::Stop => {
+                        self.status = Status::Success("パイプラインを停止しました".to_string());
+                        // Loading 表示を出さず（成功メッセージを残して）静かに再取得する。
+                        self.refresh_pipeline_view_silent()
+                    }
+                    PipelineAction::Rerun => {
+                        self.status = Status::Success("パイプラインを再実行しました".to_string());
+                        // 新しい実行が一覧の先頭に現れるため一覧へ戻し、静かに再取得する。
+                        self.screen = Screen::Pipelines;
+                        self.refresh_pipelines_silent()
+                    }
+                }
             }
         }
     }
@@ -617,6 +831,9 @@ impl App {
         if self.merge_modal.is_some() {
             return self.on_key_merge_modal(key);
         }
+        if self.confirm_modal.is_some() {
+            return self.on_key_confirm_modal(key);
+        }
 
         match self.screen {
             Screen::Onboarding => self.on_key_onboarding(key),
@@ -625,6 +842,9 @@ impl App {
             Screen::PullRequests => self.on_key_pull_requests(key),
             Screen::PullRequestDetail => self.on_key_pull_request_detail(key),
             Screen::Diff => self.on_key_diff(key),
+            Screen::Pipelines => self.on_key_pipelines(key),
+            Screen::PipelineDetail => self.on_key_pipeline_detail(key),
+            Screen::StepLog => self.on_key_step_log(key),
         }
     }
 
@@ -753,6 +973,13 @@ impl App {
                 }
                 Command::None
             }
+            KeyCode::Char('p') => {
+                if let Some(repo) = self.repositories.selected() {
+                    self.selected_repo = Some(repo.full_name.clone());
+                    return self.open_pipelines();
+                }
+                Command::None
+            }
             _ => Command::None,
         }
     }
@@ -809,6 +1036,7 @@ impl App {
             KeyCode::Char('d') => self.set_pr_filter(PrStateFilter::Declined),
             KeyCode::Char('a') => self.set_pr_filter(PrStateFilter::All),
             KeyCode::Char('r') => self.reload_pull_requests(),
+            KeyCode::Char('P') => self.open_pipelines(),
             KeyCode::Enter => self.open_pr_detail(),
             _ => Command::None,
         }
@@ -1150,6 +1378,427 @@ impl App {
         Command::None
     }
 
+    // ---- パイプライン監視（M2） ----
+
+    /// Pipelines 一覧画面へ遷移し、一覧取得を開始する。
+    fn open_pipelines(&mut self) -> Command {
+        self.screen = Screen::Pipelines;
+        self.pipelines.set_items(Vec::new());
+        self.current_pipeline = None;
+        self.reload_pipelines()
+    }
+
+    /// パイプライン一覧を取得する（Loading 表示あり・手動 `r` / 再実行後に使う）。
+    fn reload_pipelines(&mut self) -> Command {
+        let Some((client, workspace, repo)) = self.review_context() else {
+            self.status = Status::Error("認証クライアントが未初期化です".to_string());
+            return Command::None;
+        };
+        self.status = Status::Loading("パイプライン一覧を取得中…".to_string());
+        Command::LoadPipelines {
+            client,
+            workspace,
+            repo,
+        }
+    }
+
+    /// パイプライン一覧を静かに再取得する（自動ポーリング用・Loading 表示なし）。
+    fn refresh_pipelines_silent(&mut self) -> Command {
+        let Some((client, workspace, repo)) = self.review_context() else {
+            return Command::None;
+        };
+        Command::LoadPipelines {
+            client,
+            workspace,
+            repo,
+        }
+    }
+
+    fn on_key_pipelines(&mut self, key: KeyEvent) -> Command {
+        match key.code {
+            KeyCode::Char('q') => Command::Quit,
+            KeyCode::Char('?') => {
+                self.show_help = true;
+                Command::None
+            }
+            KeyCode::Esc => {
+                self.screen = Screen::Repositories;
+                self.status = Status::Idle;
+                Command::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.pipelines.select_next();
+                Command::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.pipelines.select_prev();
+                Command::None
+            }
+            KeyCode::Char('r') => self.reload_pipelines(),
+            KeyCode::Char('a') => self.toggle_auto_refresh(),
+            KeyCode::Char('S') => {
+                let pipeline = self.pipelines.selected().cloned();
+                self.open_stop_confirm(pipeline)
+            }
+            KeyCode::Char('R') => {
+                let pipeline = self.pipelines.selected().cloned();
+                self.open_rerun_confirm(pipeline)
+            }
+            KeyCode::Enter => self.open_pipeline_detail(),
+            _ => Command::None,
+        }
+    }
+
+    /// 選択中パイプラインの詳細画面へ遷移し、詳細とステップ一覧の取得を開始する。
+    fn open_pipeline_detail(&mut self) -> Command {
+        let Some(pipeline) = self.pipelines.selected().cloned() else {
+            return Command::None;
+        };
+        let label = pipeline.build_label();
+        let uuid = pipeline.uuid.clone();
+        self.current_pipeline = Some(pipeline);
+        self.pipeline_steps.set_items(Vec::new());
+        self.step_log = None;
+        self.open_step_uuid = None;
+        self.screen = Screen::PipelineDetail;
+
+        let Some((client, workspace, repo)) = self.review_context() else {
+            self.status = Status::Error("認証クライアントが未初期化です".to_string());
+            return Command::None;
+        };
+        self.status = Status::Loading(format!("パイプライン {label} を取得中…"));
+        self.pipeline_detail_commands(client, workspace, repo, uuid)
+    }
+
+    /// パイプライン詳細を再取得する（Loading 表示あり・手動 `r` / 停止後に使う）。
+    fn reload_pipeline_detail(&mut self) -> Command {
+        let Some(uuid) = self.current_pipeline_uuid().map(str::to_string) else {
+            return Command::None;
+        };
+        let Some((client, workspace, repo)) = self.review_context() else {
+            self.status = Status::Error("認証クライアントが未初期化です".to_string());
+            return Command::None;
+        };
+        self.status = Status::Loading("パイプラインを再取得中…".to_string());
+        self.pipeline_detail_commands(client, workspace, repo, uuid)
+    }
+
+    /// パイプライン詳細を静かに再取得する（自動ポーリング用・Loading 表示なし）。
+    fn refresh_pipeline_detail_silent(&mut self) -> Command {
+        let Some(uuid) = self.current_pipeline_uuid().map(str::to_string) else {
+            return Command::None;
+        };
+        let Some((client, workspace, repo)) = self.review_context() else {
+            return Command::None;
+        };
+        self.pipeline_detail_commands(client, workspace, repo, uuid)
+    }
+
+    /// 詳細＋ステップ一覧を一括取得する [`Command::Batch`] を組み立てる。
+    fn pipeline_detail_commands(
+        &self,
+        client: BitbucketClient,
+        workspace: String,
+        repo: String,
+        uuid: String,
+    ) -> Command {
+        Command::Batch(vec![
+            Command::LoadPipeline {
+                client: client.clone(),
+                workspace: workspace.clone(),
+                repo: repo.clone(),
+                uuid: uuid.clone(),
+            },
+            Command::LoadPipelineSteps {
+                client,
+                workspace,
+                repo,
+                uuid,
+            },
+        ])
+    }
+
+    fn on_key_pipeline_detail(&mut self, key: KeyEvent) -> Command {
+        match key.code {
+            KeyCode::Char('q') => Command::Quit,
+            KeyCode::Char('?') => {
+                self.show_help = true;
+                Command::None
+            }
+            KeyCode::Esc => {
+                self.screen = Screen::Pipelines;
+                self.status = Status::Idle;
+                Command::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.pipeline_steps.select_next();
+                Command::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.pipeline_steps.select_prev();
+                Command::None
+            }
+            KeyCode::Char('r') => self.reload_pipeline_detail(),
+            KeyCode::Char('a') => self.toggle_auto_refresh(),
+            KeyCode::Char('S') => {
+                let pipeline = self.current_pipeline.clone();
+                self.open_stop_confirm(pipeline)
+            }
+            KeyCode::Char('R') => {
+                let pipeline = self.current_pipeline.clone();
+                self.open_rerun_confirm(pipeline)
+            }
+            KeyCode::Enter => self.open_step_log(),
+            _ => Command::None,
+        }
+    }
+
+    /// 選択中ステップのログ画面へ遷移し、ログ取得を開始する。
+    fn open_step_log(&mut self) -> Command {
+        let Some(step) = self.pipeline_steps.selected().cloned() else {
+            return Command::None;
+        };
+        let Some(pipeline_uuid) = self.current_pipeline_uuid().map(str::to_string) else {
+            return Command::None;
+        };
+        let step_uuid = step.uuid.clone();
+        self.open_step_uuid = Some(step_uuid.clone());
+        self.step_log = None;
+        self.screen = Screen::StepLog;
+
+        let Some((client, workspace, repo)) = self.review_context() else {
+            self.status = Status::Error("認証クライアントが未初期化です".to_string());
+            return Command::None;
+        };
+        self.status = Status::Loading("ログを取得中…".to_string());
+        Command::LoadStepLog {
+            client,
+            workspace,
+            repo,
+            pipeline_uuid,
+            step_uuid,
+        }
+    }
+
+    /// 開いているステップのログを再取得する（進行中の擬似 tail・スクロール位置は維持）。
+    fn reload_step_log(&mut self) -> Command {
+        let Some(step_uuid) = self.open_step_uuid.clone() else {
+            return Command::None;
+        };
+        let Some(pipeline_uuid) = self.current_pipeline_uuid().map(str::to_string) else {
+            return Command::None;
+        };
+        let Some((client, workspace, repo)) = self.review_context() else {
+            self.status = Status::Error("認証クライアントが未初期化です".to_string());
+            return Command::None;
+        };
+        self.status = Status::Loading("ログを再取得中…".to_string());
+        Command::LoadStepLog {
+            client,
+            workspace,
+            repo,
+            pipeline_uuid,
+            step_uuid,
+        }
+    }
+
+    fn on_key_step_log(&mut self, key: KeyEvent) -> Command {
+        match key.code {
+            KeyCode::Char('q') => return Command::Quit,
+            KeyCode::Char('?') => {
+                self.show_help = true;
+                return Command::None;
+            }
+            KeyCode::Esc => {
+                self.screen = Screen::PipelineDetail;
+                self.status = Status::Idle;
+                return Command::None;
+            }
+            KeyCode::Char('r') => return self.reload_step_log(),
+            _ => {}
+        }
+
+        let Some(log) = self.step_log.as_mut() else {
+            return Command::None;
+        };
+        let page = log.viewport.max(1);
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => log.scroll_down(1),
+            KeyCode::Up | KeyCode::Char('k') => log.scroll_up(1),
+            KeyCode::PageDown | KeyCode::Char('f') => log.scroll_down(page),
+            KeyCode::PageUp | KeyCode::Char('b') => log.scroll_up(page),
+            KeyCode::Char('g') | KeyCode::Home => log.scroll_to_top(),
+            KeyCode::Char('G') | KeyCode::End => log.scroll_to_bottom(),
+            _ => {}
+        }
+        Command::None
+    }
+
+    fn on_key_confirm_modal(&mut self, key: KeyEvent) -> Command {
+        match key.code {
+            KeyCode::Esc => {
+                self.confirm_modal = None;
+                Command::None
+            }
+            KeyCode::Enter => self.confirm_pipeline_action(),
+            _ => Command::None,
+        }
+    }
+
+    /// stop 確認モーダルを開く（進行中のパイプラインのみ）。
+    fn open_stop_confirm(&mut self, pipeline: Option<Pipeline>) -> Command {
+        let Some(pipeline) = pipeline else {
+            return Command::None;
+        };
+        if !pipeline.is_active() {
+            self.status = Status::Error("進行中のパイプラインのみ停止できます".to_string());
+            return Command::None;
+        }
+        self.confirm_modal = Some(ConfirmModal::new(PipelineAction::Stop, &pipeline));
+        Command::None
+    }
+
+    /// re-run 確認モーダルを開く。
+    fn open_rerun_confirm(&mut self, pipeline: Option<Pipeline>) -> Command {
+        let Some(pipeline) = pipeline else {
+            return Command::None;
+        };
+        self.confirm_modal = Some(ConfirmModal::new(PipelineAction::Rerun, &pipeline));
+        Command::None
+    }
+
+    /// 確認モーダルの内容で stop / re-run を実行する。
+    fn confirm_pipeline_action(&mut self) -> Command {
+        let Some(modal) = self.confirm_modal.as_ref() else {
+            return Command::None;
+        };
+        if modal.submitting {
+            return Command::None;
+        }
+        let action = modal.action;
+        let uuid = modal.pipeline_uuid.clone();
+        let target = modal.target.clone();
+        let Some((client, workspace, repo)) = self.review_context() else {
+            self.status = Status::Error("認証クライアントが未初期化です".to_string());
+            return Command::None;
+        };
+        match action {
+            PipelineAction::Stop => {
+                if let Some(modal) = self.confirm_modal.as_mut() {
+                    modal.submitting = true;
+                }
+                self.status = Status::Loading("パイプラインを停止中…".to_string());
+                Command::StopPipeline {
+                    client,
+                    workspace,
+                    repo,
+                    uuid,
+                }
+            }
+            PipelineAction::Rerun => {
+                let Some(target) = target else {
+                    self.confirm_modal = None;
+                    self.status =
+                        Status::Error("再実行に必要な target 情報がありません".to_string());
+                    return Command::None;
+                };
+                if let Some(modal) = self.confirm_modal.as_mut() {
+                    modal.submitting = true;
+                }
+                self.status = Status::Loading("パイプラインを再実行中…".to_string());
+                Command::TriggerPipeline {
+                    client,
+                    workspace,
+                    repo,
+                    target,
+                }
+            }
+        }
+    }
+
+    /// 自動リフレッシュを切り替える。
+    fn toggle_auto_refresh(&mut self) -> Command {
+        self.auto_refresh = !self.auto_refresh;
+        self.status = Status::Success(format!(
+            "自動更新: {}",
+            if self.auto_refresh { "ON" } else { "OFF" }
+        ));
+        Command::None
+    }
+
+    /// 自動ポーリングの tick。進行中のパイプラインがある間だけリフレッシュを発行する。
+    fn on_tick(&mut self) -> Command {
+        if !self.auto_refresh {
+            return Command::None;
+        }
+        match self.screen {
+            Screen::Pipelines => {
+                if self.pipelines.items.iter().any(Pipeline::is_active) {
+                    self.refresh_pipelines_silent()
+                } else {
+                    Command::None
+                }
+            }
+            Screen::PipelineDetail => {
+                let pipeline_active = self
+                    .current_pipeline
+                    .as_ref()
+                    .is_some_and(Pipeline::is_active);
+                let steps_active = self
+                    .pipeline_steps
+                    .items
+                    .iter()
+                    .any(PipelineStep::is_active);
+                if pipeline_active || steps_active {
+                    self.refresh_pipeline_detail_silent()
+                } else {
+                    Command::None
+                }
+            }
+            _ => Command::None,
+        }
+    }
+
+    /// 現在の画面に応じてパイプライン状態を静かに再取得する（stop 実行後の反映用）。
+    ///
+    /// Loading 表示を出さないため直前の成功メッセージが残る。停止したパイプラインは進行中の
+    /// うちは自動ポーリングでも更新され続ける。
+    fn refresh_pipeline_view_silent(&mut self) -> Command {
+        match self.screen {
+            Screen::Pipelines => self.refresh_pipelines_silent(),
+            Screen::PipelineDetail => self.refresh_pipeline_detail_silent(),
+            _ => Command::None,
+        }
+    }
+
+    /// 現在のパイプラインの uuid。
+    fn current_pipeline_uuid(&self) -> Option<&str> {
+        self.current_pipeline
+            .as_ref()
+            .map(|pipeline| pipeline.uuid.as_str())
+    }
+
+    /// StepLog の見出し（`#123 / ステップ名`）を組み立てる。
+    fn step_log_title(&self, step_uuid: &str) -> String {
+        let build = self
+            .current_pipeline
+            .as_ref()
+            .map(Pipeline::build_label)
+            .unwrap_or_default();
+        let name = self
+            .pipeline_steps
+            .items
+            .iter()
+            .find(|step| step.uuid == step_uuid)
+            .map(PipelineStep::name_str)
+            .unwrap_or("ステップ");
+        if build.is_empty() {
+            name.to_string()
+        } else {
+            format!("{build} / {name}")
+        }
+    }
+
     /// 詳細を再取得する（承認/マージ後の状態反映用。Loading 表示はしない）。
     fn refresh_detail(&mut self) -> Command {
         let Some(id) = self.current_pr_id() else {
@@ -1277,6 +1926,33 @@ mod tests {
                   "close_source_branch": true, "participants": [] }}"#
         );
         serde_json::from_str(&json).expect("valid pr json")
+    }
+
+    fn make_pipeline(uuid: &str, build: u64, state: &str, result: Option<&str>) -> Pipeline {
+        let result_json = match result {
+            Some(result_name) => format!(r#", "result": {{ "name": "{result_name}" }}"#),
+            None => String::new(),
+        };
+        let json = format!(
+            r#"{{ "uuid": "{uuid}", "build_number": {build},
+                  "state": {{ "name": "{state}"{result_json} }},
+                  "target": {{ "type": "pipeline_ref_target", "ref_type": "branch",
+                              "ref_name": "main", "selector": {{ "type": "default" }} }},
+                  "trigger": {{ "name": "PUSH" }} }}"#
+        );
+        serde_json::from_str(&json).expect("valid pipeline json")
+    }
+
+    fn make_step(uuid: &str, name: &str, state: &str, result: Option<&str>) -> PipelineStep {
+        let result_json = match result {
+            Some(result_name) => format!(r#", "result": {{ "name": "{result_name}" }}"#),
+            None => String::new(),
+        };
+        let json = format!(
+            r#"{{ "uuid": "{uuid}", "name": "{name}",
+                  "state": {{ "name": "{state}"{result_json} }} }}"#
+        );
+        serde_json::from_str(&json).expect("valid step json")
     }
 
     #[test]
@@ -1665,5 +2341,318 @@ mod tests {
             state: ratatui::crossterm::event::KeyEventState::NONE,
         }));
         assert!(!app.show_help);
+    }
+
+    // ---- M2: パイプライン監視 ----
+
+    #[test]
+    fn repositories_p_opens_pipelines() {
+        let mut app = review_app();
+        app.selected_repo = None;
+        app.screen = Screen::Repositories;
+        app.repositories.set_items(vec![Repository {
+            full_name: "acme/widget".to_string(),
+            name: "widget".to_string(),
+            updated_on: None,
+            is_private: false,
+        }]);
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('p'))));
+        assert_eq!(app.screen, Screen::Pipelines);
+        assert_eq!(app.selected_repo.as_deref(), Some("acme/widget"));
+        match cmd {
+            Command::LoadPipelines { repo, .. } => assert_eq!(repo, "widget"),
+            other => panic!("expected LoadPipelines, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pull_requests_capital_p_opens_pipelines() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('P'))));
+        assert_eq!(app.screen, Screen::Pipelines);
+        assert!(matches!(cmd, Command::LoadPipelines { .. }));
+    }
+
+    #[test]
+    fn pipelines_loaded_sets_items_for_matching_repo() {
+        let mut app = review_app();
+        app.screen = Screen::Pipelines;
+        app.update(Msg::PipelinesLoaded {
+            repo: "widget".to_string(),
+            pipelines: vec![
+                make_pipeline("{p1}", 1, "IN_PROGRESS", None),
+                make_pipeline("{p2}", 2, "COMPLETED", Some("SUCCESSFUL")),
+            ],
+        });
+        assert_eq!(app.pipelines.items.len(), 2);
+        assert_eq!(app.pipelines.state.selected(), Some(0));
+    }
+
+    #[test]
+    fn pipelines_loaded_ignored_for_stale_repo() {
+        let mut app = review_app();
+        app.screen = Screen::Pipelines;
+        app.update(Msg::PipelinesLoaded {
+            repo: "other".to_string(),
+            pipelines: vec![make_pipeline("{p1}", 1, "IN_PROGRESS", None)],
+        });
+        assert!(app.pipelines.items.is_empty());
+    }
+
+    #[test]
+    fn refresh_keeps_selection_index() {
+        let mut app = review_app();
+        app.screen = Screen::Pipelines;
+        app.pipelines.set_items(vec![
+            make_pipeline("{p1}", 1, "IN_PROGRESS", None),
+            make_pipeline("{p2}", 2, "IN_PROGRESS", None),
+        ]);
+        app.pipelines.select_next();
+        assert_eq!(app.pipelines.state.selected(), Some(1));
+        // ポーリング更新で選択位置が保たれる。
+        app.update(Msg::PipelinesLoaded {
+            repo: "widget".to_string(),
+            pipelines: vec![
+                make_pipeline("{p1}", 1, "COMPLETED", Some("SUCCESSFUL")),
+                make_pipeline("{p2}", 2, "IN_PROGRESS", None),
+            ],
+        });
+        assert_eq!(app.pipelines.state.selected(), Some(1));
+    }
+
+    #[test]
+    fn entering_pipeline_detail_emits_batch() {
+        let mut app = review_app();
+        app.screen = Screen::Pipelines;
+        app.pipelines
+            .set_items(vec![make_pipeline("{p1}", 7, "IN_PROGRESS", None)]);
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+        assert_eq!(app.screen, Screen::PipelineDetail);
+        assert_eq!(
+            app.current_pipeline.as_ref().map(|p| p.uuid.clone()),
+            Some("{p1}".to_string())
+        );
+        match cmd {
+            Command::Batch(cmds) => {
+                assert_eq!(cmds.len(), 2);
+                assert!(matches!(&cmds[0], Command::LoadPipeline { uuid, .. } if uuid == "{p1}"));
+                assert!(
+                    matches!(&cmds[1], Command::LoadPipelineSteps { uuid, .. } if uuid == "{p1}")
+                );
+            }
+            other => panic!("expected Batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipeline_detail_enter_opens_step_log() {
+        let mut app = review_app();
+        app.screen = Screen::PipelineDetail;
+        app.current_pipeline = Some(make_pipeline("{p1}", 3, "IN_PROGRESS", None));
+        app.pipeline_steps
+            .set_items(vec![make_step("{s1}", "Build", "IN_PROGRESS", None)]);
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+        assert_eq!(app.screen, Screen::StepLog);
+        assert_eq!(app.open_step_uuid.as_deref(), Some("{s1}"));
+        match cmd {
+            Command::LoadStepLog {
+                pipeline_uuid,
+                step_uuid,
+                ..
+            } => {
+                assert_eq!(pipeline_uuid, "{p1}");
+                assert_eq!(step_uuid, "{s1}");
+            }
+            other => panic!("expected LoadStepLog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_log_loaded_parses_and_scrolls() {
+        let mut app = review_app();
+        app.current_pipeline = Some(make_pipeline("{p1}", 3, "IN_PROGRESS", None));
+        app.pipeline_steps
+            .set_items(vec![make_step("{s1}", "Build", "IN_PROGRESS", None)]);
+        app.open_step_uuid = Some("{s1}".to_string());
+        app.screen = Screen::StepLog;
+        app.update(Msg::StepLogLoaded {
+            step_uuid: "{s1}".to_string(),
+            text: Some("line1\nline2\nline3\n".to_string()),
+        });
+        let log = app.step_log.as_ref().expect("log present");
+        assert_eq!(log.lines.len(), 3);
+        assert!(!log.missing);
+        app.update(Msg::Key(key(KeyCode::Char('j'))));
+        assert_eq!(app.step_log.as_ref().expect("log").scroll, 1);
+    }
+
+    #[test]
+    fn step_log_missing_shows_placeholder() {
+        let mut app = review_app();
+        app.current_pipeline = Some(make_pipeline("{p1}", 3, "IN_PROGRESS", None));
+        app.pipeline_steps
+            .set_items(vec![make_step("{s1}", "Build", "IN_PROGRESS", None)]);
+        app.open_step_uuid = Some("{s1}".to_string());
+        app.screen = Screen::StepLog;
+        app.update(Msg::StepLogLoaded {
+            step_uuid: "{s1}".to_string(),
+            text: None,
+        });
+        let log = app.step_log.as_ref().expect("log present");
+        assert!(log.missing);
+        assert_eq!(log.lines, vec!["(ログなし)".to_string()]);
+    }
+
+    #[test]
+    fn stop_requires_active_and_modal_confirmation() {
+        let mut app = review_app();
+        app.screen = Screen::Pipelines;
+        app.pipelines
+            .set_items(vec![make_pipeline("{p1}", 3, "IN_PROGRESS", None)]);
+        // 'S' はモーダルを開くだけで停止しない。
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('S'))));
+        assert!(matches!(cmd, Command::None));
+        assert!(app.confirm_modal.is_some());
+        // モーダルで Enter して初めて停止。
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+        match cmd {
+            Command::StopPipeline { uuid, .. } => assert_eq!(uuid, "{p1}"),
+            other => panic!("expected StopPipeline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_rejected_on_completed_pipeline() {
+        let mut app = review_app();
+        app.screen = Screen::Pipelines;
+        app.pipelines.set_items(vec![make_pipeline(
+            "{p1}",
+            3,
+            "COMPLETED",
+            Some("SUCCESSFUL"),
+        )]);
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('S'))));
+        assert!(matches!(cmd, Command::None));
+        assert!(app.confirm_modal.is_none());
+        assert!(matches!(app.status, Status::Error(_)));
+    }
+
+    #[test]
+    fn rerun_requires_modal_and_emits_trigger_with_target() {
+        let mut app = review_app();
+        app.screen = Screen::Pipelines;
+        app.pipelines
+            .set_items(vec![make_pipeline("{p1}", 3, "COMPLETED", Some("FAILED"))]);
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('R'))));
+        assert!(matches!(cmd, Command::None));
+        assert!(app.confirm_modal.is_some());
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+        match cmd {
+            Command::TriggerPipeline { target, .. } => {
+                assert_eq!(target.ref_name.as_deref(), Some("main"));
+            }
+            other => panic!("expected TriggerPipeline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confirm_modal_esc_cancels() {
+        let mut app = review_app();
+        app.screen = Screen::Pipelines;
+        app.pipelines
+            .set_items(vec![make_pipeline("{p1}", 3, "IN_PROGRESS", None)]);
+        app.update(Msg::Key(key(KeyCode::Char('S'))));
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        assert!(app.confirm_modal.is_none());
+    }
+
+    #[test]
+    fn tick_refreshes_pipelines_when_active() {
+        let mut app = review_app();
+        app.screen = Screen::Pipelines;
+        app.pipelines
+            .set_items(vec![make_pipeline("{p1}", 1, "IN_PROGRESS", None)]);
+        assert!(matches!(
+            app.update(Msg::Tick),
+            Command::LoadPipelines { .. }
+        ));
+    }
+
+    #[test]
+    fn tick_noop_when_all_complete() {
+        let mut app = review_app();
+        app.screen = Screen::Pipelines;
+        app.pipelines.set_items(vec![make_pipeline(
+            "{p1}",
+            1,
+            "COMPLETED",
+            Some("SUCCESSFUL"),
+        )]);
+        assert!(matches!(app.update(Msg::Tick), Command::None));
+    }
+
+    #[test]
+    fn tick_noop_when_auto_refresh_off() {
+        let mut app = review_app();
+        app.screen = Screen::Pipelines;
+        app.auto_refresh = false;
+        app.pipelines
+            .set_items(vec![make_pipeline("{p1}", 1, "IN_PROGRESS", None)]);
+        assert!(matches!(app.update(Msg::Tick), Command::None));
+    }
+
+    #[test]
+    fn tick_refreshes_detail_when_step_active() {
+        let mut app = review_app();
+        app.screen = Screen::PipelineDetail;
+        app.current_pipeline = Some(make_pipeline("{p1}", 1, "COMPLETED", Some("SUCCESSFUL")));
+        app.pipeline_steps
+            .set_items(vec![make_step("{s1}", "Build", "IN_PROGRESS", None)]);
+        assert!(matches!(app.update(Msg::Tick), Command::Batch(_)));
+    }
+
+    #[test]
+    fn pipeline_action_done_stop_refreshes_and_clears_modal() {
+        let mut app = review_app();
+        app.screen = Screen::Pipelines;
+        app.pipelines
+            .set_items(vec![make_pipeline("{p1}", 1, "IN_PROGRESS", None)]);
+        app.confirm_modal = Some(ConfirmModal {
+            action: PipelineAction::Stop,
+            pipeline_uuid: "{p1}".to_string(),
+            build_label: "#1".to_string(),
+            target: None,
+            submitting: true,
+        });
+        let cmd = app.update(Msg::PipelineActionDone {
+            action: PipelineAction::Stop,
+        });
+        assert!(app.confirm_modal.is_none());
+        assert!(matches!(app.status, Status::Success(_)));
+        assert!(matches!(cmd, Command::LoadPipelines { .. }));
+    }
+
+    #[test]
+    fn pipeline_action_done_rerun_navigates_to_list() {
+        let mut app = review_app();
+        app.screen = Screen::PipelineDetail;
+        app.current_pipeline = Some(make_pipeline("{p1}", 1, "COMPLETED", Some("FAILED")));
+        let cmd = app.update(Msg::PipelineActionDone {
+            action: PipelineAction::Rerun,
+        });
+        assert_eq!(app.screen, Screen::Pipelines);
+        assert!(matches!(cmd, Command::LoadPipelines { .. }));
+    }
+
+    #[test]
+    fn toggle_auto_refresh_flips_flag() {
+        let mut app = review_app();
+        app.screen = Screen::Pipelines;
+        assert!(app.auto_refresh);
+        app.update(Msg::Key(key(KeyCode::Char('a'))));
+        assert!(!app.auto_refresh);
+        app.update(Msg::Key(key(KeyCode::Char('a'))));
+        assert!(app.auto_refresh);
     }
 }
