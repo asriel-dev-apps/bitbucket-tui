@@ -1505,22 +1505,21 @@ fn render_status(frame: &mut Frame, area: Rect, status: &Status, theme: &Theme) 
 
 /// 画面ごとのキーヒント（`(key, 説明)` の並び）。フッターとヘルプ双方の元データにはしない
 /// （ヘルプは操作範囲が広く独立して管理する方が読みやすいため）。フッターは要点のみ。
-fn hint_entries(screen: Screen) -> &'static [(&'static str, &'static str)] {
-    match screen {
-        Screen::Onboarding => &[
+///
+/// `Ctrl+K`（ジャンプパレット）/ `?`（ヘルプ）/ `q`（終了）は `on_key` の優先度チェーン上
+/// Onboarding を除く全画面で有効なため、末尾に共通で付与する（画面ごとの重複記述を避ける）。
+/// Onboarding だけは対象外: `Ctrl+K` は emacs 風の「行末まで削除」に使用中で、`?` もヘルプでは
+/// なく通常の入力文字として扱われる（[`crate::tui::app::App::on_key_onboarding`] 参照）。
+fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
+    let mut entries: Vec<(&'static str, &'static str)> = match screen {
+        Screen::Onboarding => vec![
             ("Tab/↑↓", "フィールド切替"),
             ("Enter", "次へ/検証"),
+            ("Esc", "エラー消去"),
             ("Ctrl+C", "終了"),
         ],
-        Screen::Workspaces => &[
-            ("↑↓/jk", "移動"),
-            ("Enter", "開く"),
-            ("/", "検索"),
-            ("Ctrl+K", "ジャンプ"),
-            ("?", "ヘルプ"),
-            ("q", "終了"),
-        ],
-        Screen::Repositories => &[
+        Screen::Workspaces => vec![("↑↓/jk", "移動"), ("Enter", "開く"), ("/", "検索")],
+        Screen::Repositories => vec![
             ("↑↓/jk", "移動"),
             ("Enter", "PR"),
             ("p", "パイプライン"),
@@ -1528,11 +1527,9 @@ fn hint_entries(screen: Screen) -> &'static [(&'static str, &'static str)] {
             ("s", "ソース"),
             ("/", "検索"),
             ("S", "並び替え"),
-            ("Ctrl+K", "ジャンプ"),
             ("Esc", "戻る"),
-            ("q", "終了"),
         ],
-        Screen::PullRequests => &[
+        Screen::PullRequests => vec![
             ("↑↓/jk", "移動"),
             ("Enter", "詳細"),
             ("o/m/d/a", "状態"),
@@ -1541,29 +1538,27 @@ fn hint_entries(screen: Screen) -> &'static [(&'static str, &'static str)] {
             ("b/s", "ブラウズ"),
             ("/", "検索"),
             ("S", "並び替え"),
-            ("Ctrl+K", "ジャンプ"),
             ("Esc", "戻る"),
         ],
-        Screen::PullRequestDetail => &[
+        Screen::PullRequestDetail => vec![
             ("d", "Diff"),
             ("c", "コメント"),
             ("a", "承認"),
             ("x", "変更要求"),
             ("M", "マージ"),
             ("o", "ブラウザで開く"),
-            ("↑↓", "ファイル"),
+            ("↑↓/jk", "ファイル"),
             ("Esc", "戻る"),
         ],
-        Screen::Diff => &[
+        Screen::Diff => vec![
             ("Tab", "一覧/本文"),
             ("↑↓/jk", "選択/スクロール"),
             ("n/N", "ファイル境界"),
             ("PgUp/PgDn", "1画面"),
             ("g/G", "先頭/末尾"),
             ("Esc", "戻る"),
-            ("q", "終了"),
         ],
-        Screen::Pipelines => &[
+        Screen::Pipelines => vec![
             ("↑↓/jk", "移動"),
             ("Enter", "詳細"),
             ("r", "再読込"),
@@ -1572,7 +1567,7 @@ fn hint_entries(screen: Screen) -> &'static [(&'static str, &'static str)] {
             ("R", "再実行"),
             ("Esc", "戻る"),
         ],
-        Screen::PipelineDetail => &[
+        Screen::PipelineDetail => vec![
             ("↑↓/jk", "ステップ"),
             ("Enter", "ログ"),
             ("r", "再読込"),
@@ -1581,50 +1576,52 @@ fn hint_entries(screen: Screen) -> &'static [(&'static str, &'static str)] {
             ("R", "再実行"),
             ("Esc", "戻る"),
         ],
-        Screen::StepLog => &[
+        Screen::StepLog => vec![
             ("↑↓/jk", "スクロール"),
             ("PgUp/PgDn", "1画面"),
             ("g/G", "先頭/末尾"),
             ("r", "再取得"),
             ("Esc", "戻る"),
-            ("q", "終了"),
         ],
-        Screen::Branches => &[
+        Screen::Branches => vec![
             ("↑↓/jk", "移動"),
             ("Enter", "コミット履歴"),
             ("s", "ソース"),
             ("r", "再読込"),
             ("Esc", "戻る"),
-            ("q", "終了"),
         ],
-        Screen::Commits => &[
+        Screen::Commits => vec![
             ("↑↓/jk", "移動"),
             ("Enter", "詳細"),
             ("r", "再読込"),
             ("Esc", "戻る"),
-            ("q", "終了"),
         ],
-        Screen::CommitDetail => &[
+        Screen::CommitDetail => vec![
             ("d", "Diff"),
             ("↑↓/jk/PgUp/PgDn", "スクロール"),
             ("Esc", "戻る"),
-            ("q", "終了"),
         ],
-        Screen::Source => &[
+        Screen::Source => vec![
             ("↑↓/jk", "移動"),
             ("Enter", "開く"),
             ("Backspace/Esc", "親へ"),
             ("r", "再読込"),
-            ("q", "終了"),
         ],
-        Screen::FileView => &[
+        Screen::FileView => vec![
             ("↑↓/jk", "スクロール"),
             ("PgUp/PgDn", "1画面"),
             ("g/G", "先頭/末尾"),
             ("Esc", "戻る"),
-            ("q", "終了"),
         ],
+    };
+
+    if screen != Screen::Onboarding {
+        entries.push(("Ctrl+K", "ジャンプ"));
+        entries.push(("?", "ヘルプ"));
+        entries.push(("q", "終了"));
     }
+
+    entries
 }
 
 fn render_hints(frame: &mut Frame, area: Rect, screen: Screen, theme: &Theme) {
@@ -1754,38 +1751,54 @@ fn render_help(frame: &mut Frame, screen: Screen, theme: &Theme) {
         Line::raw(""),
         Line::raw("↑ / k, ↓ / j   上下へ移動"),
         Line::raw("Enter          決定 / 開く"),
-        Line::raw("Esc            戻る"),
-        Line::raw("?              このヘルプ"),
-        Line::raw("q              終了"),
-        Line::raw("Ctrl+T         テーマ切替"),
-        Line::raw("Ctrl+K         ジャンプパレット（保持済みデータへ一気に移動）"),
-        Line::raw("Ctrl+C         強制終了"),
-        Line::raw("/              検索（Workspaces/Repositories/PullRequests）"),
-        Line::raw("S              並び替え（Repositories/PullRequests）"),
+        Line::raw("Esc            戻る（Onboarding はエラー消去 / Workspaces は非対応）"),
+        Line::raw("?              このヘルプ（Onboarding では非対応）"),
+        Line::raw("q              終了（Onboarding では非対応。Ctrl+C は常に有効）"),
+        Line::raw("Ctrl+T         テーマ切替（常に有効）"),
+        Line::raw("Ctrl+K         ジャンプパレット（保持済みデータへ一気に移動。Onboarding 以外の"),
+        Line::raw("               全画面で有効。検索編集中や各種モーダル表示中は無効）"),
+        Line::raw("Ctrl+C         強制終了（常に有効）"),
+        Line::raw("/              検索（Workspaces/Repositories/PullRequests。文字入力で絞込み、"),
+        Line::raw("               Enter で確定、Esc で解除）"),
     ];
 
     let screen_keys: &[&str] = match screen {
+        Screen::Onboarding => &[
+            "Tab / ↑↓       Email ⇔ Token フィールド切替",
+            "Enter          Email 入力後は Token へ / Token 入力後は認証検証を開始",
+            "←→ / Home/End  カーソル移動",
+            "Backspace/Delete カーソルの前 / 後ろを 1 文字削除",
+            "Ctrl+A / E     行頭 / 行末へ移動",
+            "Ctrl+B / F     カーソルを1つ左 / 右へ移動",
+            "Ctrl+U         カーソルから行頭まで削除",
+            "Ctrl+K         カーソルから行末まで削除（ジャンプパレットではない）",
+            "Ctrl+W         直前の単語を削除",
+            "Ctrl+D / H     Delete / Backspace と同じ",
+        ],
         Screen::PullRequests => &[
             "o / m / d / a  状態フィルタ (OPEN/MERGED/DECLINED/ALL)",
             "r              再読込",
             "Enter          PR 詳細を開く",
             "P              パイプライン一覧を開く",
             "b / s          ブランチ一覧 / ソースを開く",
+            "S              並び替え（取得順→名前昇順→更新日時降順→使用頻度降順の順に巡回）",
         ],
         Screen::PullRequestDetail => &[
             "d              Diff を開く",
-            "c              コメント投稿（Ctrl+S 送信 / Esc 取消）",
+            "c              コメント投稿（Enter 改行 / Ctrl+S 送信 / Esc 取消）",
             "a              approve / unapprove トグル",
             "x              request-changes / 取消 トグル",
-            "M              マージ（確認モーダル）",
+            "M              マージ（確認モーダル: ←→/Tab 戦略切替, Space ブランチ削除切替,",
+            "               Enter 実行, Esc 取消）",
             "o              ブラウザで開く（`open` コマンドで既定ブラウザに開く）",
-            "↑↓             変更ファイル選択  PgUp/PgDn: 本文スクロール",
+            "↑↓ / j k       変更ファイル選択",
+            "PgUp/PgDn      本文スクロール（±5 行）",
         ],
         Screen::Diff => &[
             "Tab            ファイル一覧 / 本文フォーカス切替",
             "↑↓ / j k       (一覧) ファイル選択  /  (本文) 1 行スクロール",
-            "PgUp/PgDn      1 画面スクロール（本文）",
-            "g / G          先頭 / 末尾（本文）",
+            "PgUp/PgDn / f/b 1 画面スクロール（本文）",
+            "g / Home, G / End 先頭 / 末尾（本文）",
             "n / N          次 / 前のファイル境界（フォーカス問わず）",
         ],
         Screen::Repositories => &[
@@ -1793,25 +1806,26 @@ fn render_help(frame: &mut Frame, screen: Screen, theme: &Theme) {
             "p              パイプライン一覧を開く",
             "b              ブランチ一覧を開く",
             "s              ソース（既定ブランチのルート）を開く",
+            "S              並び替え（取得順→名前昇順→更新日時降順→使用頻度降順の順に巡回）",
         ],
         Screen::Pipelines => &[
             "Enter          パイプライン詳細を開く",
             "r              一覧を再読込",
             "a              自動更新の ON/OFF",
-            "S              停止（進行中のみ・確認モーダル）",
-            "R              再実行（確認モーダル）",
+            "S              停止（進行中のみ・確認モーダル: Enter 実行 / Esc 取消）",
+            "R              再実行（確認モーダル: Enter 実行 / Esc 取消）",
         ],
         Screen::PipelineDetail => &[
             "↑↓ / j k       ステップ選択",
             "Enter          ステップのログを開く",
             "r              詳細を再読込",
             "a              自動更新の ON/OFF",
-            "S / R          停止 / 再実行（確認モーダル）",
+            "S / R          停止 / 再実行（確認モーダル: Enter 実行 / Esc 取消）",
         ],
         Screen::StepLog => &[
             "↑↓ / j k       1 行スクロール",
-            "PgUp/PgDn      1 画面スクロール",
-            "g / G          先頭 / 末尾",
+            "PgUp/PgDn / f/b 1 画面スクロール",
+            "g / Home, G / End 先頭 / 末尾",
             "r              ログ再取得（擬似 tail）",
         ],
         Screen::Branches => &[
@@ -1825,7 +1839,7 @@ fn render_help(frame: &mut Frame, screen: Screen, theme: &Theme) {
         ],
         Screen::CommitDetail => &[
             "d              このコミットの Diff を開く",
-            "↑↓ / PgUp/PgDn メッセージをスクロール",
+            "↑↓ / j k       1 行スクロール（PgUp/PgDn で ±5 行）",
         ],
         Screen::Source => &[
             "Enter          ディレクトリを開く / ファイルを表示",
@@ -1834,10 +1848,10 @@ fn render_help(frame: &mut Frame, screen: Screen, theme: &Theme) {
         ],
         Screen::FileView => &[
             "↑↓ / j k       1 行スクロール",
-            "PgUp/PgDn      1 画面スクロール",
-            "g / G          先頭 / 末尾",
+            "PgUp/PgDn / f/b 1 画面スクロール",
+            "g / Home, G / End 先頭 / 末尾",
         ],
-        _ => &[],
+        Screen::Workspaces => &[],
     };
     if !screen_keys.is_empty() {
         lines.push(Line::raw(""));
@@ -2608,6 +2622,83 @@ mod tests {
             assert!(
                 !hint_entries(screen).is_empty(),
                 "{screen:?} のヒントが空です"
+            );
+        }
+    }
+
+    /// `Ctrl+K`（ジャンプパレット）/ `?`（ヘルプ）/ `q`（終了）は `on_key` の優先度チェーン上
+    /// Onboarding を除く全画面で有効なため、フッターにも必ず出す（実装との食い違い防止）。
+    #[test]
+    fn hint_entries_include_global_keys_for_every_screen_except_onboarding() {
+        for screen in [
+            Screen::Workspaces,
+            Screen::Repositories,
+            Screen::PullRequests,
+            Screen::PullRequestDetail,
+            Screen::Diff,
+            Screen::Pipelines,
+            Screen::PipelineDetail,
+            Screen::StepLog,
+            Screen::Branches,
+            Screen::Commits,
+            Screen::CommitDetail,
+            Screen::Source,
+            Screen::FileView,
+        ] {
+            let keys: Vec<&str> = hint_entries(screen).iter().map(|(key, _)| *key).collect();
+            for expected in ["Ctrl+K", "?", "q"] {
+                assert!(
+                    keys.contains(&expected),
+                    "{screen:?} のフッターに {expected} がありません: {keys:?}"
+                );
+            }
+        }
+    }
+
+    /// Onboarding は `Ctrl+K`（emacs 風の行末まで削除）と衝突するため、ジャンプパレットの
+    /// フッター表示は出さない（実装 [`crate::tui::app::App::on_key_onboarding`] の通り）。
+    #[test]
+    fn hint_entries_exclude_jump_palette_key_on_onboarding() {
+        let keys: Vec<&str> = hint_entries(Screen::Onboarding)
+            .iter()
+            .map(|(key, _)| *key)
+            .collect();
+        assert!(!keys.contains(&"Ctrl+K"));
+        assert!(!keys.contains(&"?"));
+        assert!(!keys.contains(&"q"));
+    }
+
+    /// `/`（検索）は Workspaces/Repositories/PullRequests のみ、`S`（並び替え）は
+    /// Repositories/PullRequests のみで有効（[`crate::tui::app::App::current_filter_text`] /
+    /// [`crate::tui::app::App::cycle_repositories_sort`] / 同 `cycle_pull_requests_sort`）。
+    #[test]
+    fn hint_entries_search_and_sort_are_scoped_to_list_screens() {
+        let search_screens = [
+            Screen::Workspaces,
+            Screen::Repositories,
+            Screen::PullRequests,
+        ];
+        for screen in search_screens {
+            let keys: Vec<&str> = hint_entries(screen).iter().map(|(key, _)| *key).collect();
+            assert!(keys.contains(&"/"), "{screen:?} に検索キーがありません");
+        }
+
+        let sort_screens = [Screen::Repositories, Screen::PullRequests];
+        for screen in sort_screens {
+            let keys: Vec<&str> = hint_entries(screen).iter().map(|(key, _)| *key).collect();
+            assert!(keys.contains(&"S"), "{screen:?} に並び替えキーがありません");
+        }
+
+        // Pipelines/PipelineDetail の `S` は「停止」であり「並び替え」ではないため、
+        // hint の説明文が sort 由来ではないことを確認する（食い違い防止）。
+        for screen in [Screen::Pipelines, Screen::PipelineDetail] {
+            let entries = hint_entries(screen);
+            let sort_labeled = entries
+                .iter()
+                .any(|(key, desc)| *key == "S" && *desc == "並び替え");
+            assert!(
+                !sort_labeled,
+                "{screen:?} の S が誤って並び替えと表示されています"
             );
         }
     }
