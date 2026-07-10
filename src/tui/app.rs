@@ -306,7 +306,10 @@ impl DiffState {
 /// Source（ソースツリー閲覧）画面の状態。
 ///
 /// 現在の `reference`（ブランチ名/ハッシュ）と `path`（ルートからのディレクトリパス。
-/// 空文字がルート）を保持し、ディレクトリ列挙を選択リストで表示する。
+/// 空文字がルート）を保持し、ディレクトリ列挙を選択リストで表示する。`path` は
+/// API 応答由来ではなく TUI 自身が `open_source`/`source_enter`/`source_up` で
+/// 一貫して更新する自己追跡状態（`child_path`/`parent_dir` はこの `path` にのみ
+/// 依存し、`SrcEntry.path` の値には依存しない）。
 #[derive(Debug, Default)]
 pub struct SourceState {
     pub reference: String,
@@ -3596,6 +3599,11 @@ impl App {
     }
 
     /// 選択中エントリを開く（ディレクトリなら潜る / ファイルなら FileView）。
+    ///
+    /// 子パスは `entry.path_str()`（API 由来、フルパス前提だが未検証）をそのまま
+    /// 使わず、`source.path`（自己追跡している現在地）+ `entry.name()`（リーフ名）
+    /// から [`child_path`] で合成する。API がフルパスを返す通常ケースと同じ結果
+    /// になりつつ、リーフ名しか返さないケースでも階層追跡が壊れない。
     fn source_enter(&mut self) -> Command {
         let Some(source) = self.source.as_ref() else {
             return Command::None;
@@ -3604,7 +3612,7 @@ impl App {
             return Command::None;
         };
         let reference = source.reference.clone();
-        let path = entry.path_str().to_string();
+        let path = child_path(&source.path, entry.name());
         if entry.is_dir() {
             self.open_source(reference, path)
         } else {
@@ -4033,6 +4041,22 @@ fn parent_dir(path: &str) -> Option<String> {
     match trimmed.rfind('/') {
         Some(index) => Some(trimmed[..index].to_string()),
         None => Some(String::new()),
+    }
+}
+
+/// 現在のディレクトリ `parent`（TUI 自身が追跡する信頼できる状態）と、選択エントリの
+/// リーフ名 `leaf`（[`SrcEntry::name`]）から子パスを合成する。
+///
+/// `SrcEntry::path`（[`SrcEntry::path_str`]）はリポジトリルートからのフルパスで
+/// 返る前提だが、これは実 API で未検証の仮定（`docs/LEDGER.md` 参照）。この関数を
+/// 使うことで、API がフルパスを正しく返す場合はもちろん、リーフ名しか返さない
+/// 場合でも `source_up`/`parent_dir` が前提とする「`source.path` は常にルートから
+/// のフルパス」を壊さずに階層移動できる（[`App::source_enter`] 参照）。
+fn child_path(parent: &str, leaf: &str) -> String {
+    if parent.is_empty() {
+        leaf.to_string()
+    } else {
+        format!("{parent}/{leaf}")
     }
 }
 
@@ -5784,6 +5808,114 @@ diff --git a/two.txt b/two.txt\n\
         assert!(matches!(cmd, Command::None));
     }
 
+    /// サブディレクトリを多段で潜っても Backspace/Esc が毎回「直前の親」へ戻り、
+    /// 入口画面（`browse_return`）へ抜けないことを固定する回帰テスト。
+    /// API が `entry.path` をルートからのフルパスで正しく返すケース（想定どおりの
+    /// 実 API 応答）を模す。
+    #[test]
+    fn source_backspace_walks_up_multi_level_subdirectories_with_full_api_paths() {
+        let mut app = review_app();
+        app.screen = Screen::Source;
+
+        // ルート → "src" へ潜る。
+        let mut root = SourceState {
+            reference: "main".to_string(),
+            path: String::new(),
+            entries: SelectList::default(),
+        };
+        root.entries
+            .set_items(vec![make_src_entry("commit_directory", "src")]);
+        app.source = Some(root);
+        app.update(Msg::Key(key(KeyCode::Enter)));
+        assert_eq!(app.source.as_ref().expect("source").path, "src");
+
+        // "src" → "src/tui" へ潜る（子エントリの path はフルパス）。
+        let entries = app.source.as_mut().expect("source");
+        entries
+            .entries
+            .set_items(vec![make_src_entry("commit_directory", "src/tui")]);
+        app.update(Msg::Key(key(KeyCode::Enter)));
+        assert_eq!(app.source.as_ref().expect("source").path, "src/tui");
+
+        // Backspace で "src" へ（入口画面へは抜けない）。
+        app.update(Msg::Key(key(KeyCode::Backspace)));
+        assert_eq!(app.screen, Screen::Source);
+        assert_eq!(app.source.as_ref().expect("source").path, "src");
+
+        // さらに Esc でルートへ。
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        assert_eq!(app.screen, Screen::Source);
+        assert_eq!(app.source.as_ref().expect("source").path, "");
+
+        // ルートでの Esc で初めて入口画面へ抜ける。
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        assert_eq!(app.screen, Screen::Repositories);
+        assert!(app.source.is_none());
+    }
+
+    /// API が子エントリの `path` にリーフ名しか返さない（フルパス前提が崩れる）
+    /// ケースでも、`source.path`（自己追跡）+ リーフ名から子パスを合成するため
+    /// 階層追跡が壊れず、Backspace/Esc が正しく親ディレクトリへ戻ることを固定する。
+    /// （このケースが実 API で起き得るかは未検証だが、起きても壊れないことを保証する
+    /// 堅牢化のテスト）
+    #[test]
+    fn source_backspace_walks_up_when_api_returns_leaf_names_only() {
+        let mut app = review_app();
+        app.screen = Screen::Source;
+
+        // ルート → "src" へ潜る（ルートではリーフ名==フルパス）。
+        let mut root = SourceState {
+            reference: "main".to_string(),
+            path: String::new(),
+            entries: SelectList::default(),
+        };
+        root.entries
+            .set_items(vec![make_src_entry("commit_directory", "src")]);
+        app.source = Some(root);
+        app.update(Msg::Key(key(KeyCode::Enter)));
+        assert_eq!(app.source.as_ref().expect("source").path, "src");
+
+        // "src" 配下の子エントリがリーフ名のみを返す（フルパス "src/tui" ではなく "tui"）。
+        let source = app.source.as_mut().expect("source");
+        source
+            .entries
+            .set_items(vec![make_src_entry("commit_directory", "tui")]);
+        app.update(Msg::Key(key(KeyCode::Enter)));
+        // child_path("src", "tui") == "src/tui" になっていること（API のリーフ名だけを
+        // 使わず、自己追跡している現在地と組み合わせて合成している）。
+        assert_eq!(app.source.as_ref().expect("source").path, "src/tui");
+
+        // Backspace で "src" へ戻る（"" へ飛んだり入口画面へ抜けたりしない）。
+        app.update(Msg::Key(key(KeyCode::Backspace)));
+        assert_eq!(app.screen, Screen::Source);
+        assert_eq!(app.source.as_ref().expect("source").path, "src");
+    }
+
+    /// ファイルを開く際の子パスも同様に `source.path` + リーフ名から合成される
+    /// （API がリーフ名しか返さないケースでも `get_src_file` に正しいフルパスを渡す）。
+    #[test]
+    fn source_enter_builds_file_path_from_current_dir_and_leaf_name() {
+        let mut app = review_app();
+        app.screen = Screen::Source;
+        let mut state = SourceState {
+            reference: "main".to_string(),
+            path: "src".to_string(),
+            entries: SelectList::default(),
+        };
+        // API がリーフ名のみを返すケース。
+        state
+            .entries
+            .set_items(vec![make_src_entry("commit_file", "main.rs")]);
+        app.source = Some(state);
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+        assert_eq!(app.screen, Screen::FileView);
+        assert_eq!(app.open_file_path.as_deref(), Some("src/main.rs"));
+        match cmd {
+            Command::LoadFile { path, .. } => assert_eq!(path, "src/main.rs"),
+            other => panic!("expected LoadFile, got {other:?}"),
+        }
+    }
+
     #[test]
     fn file_loaded_builds_scrollable_view() {
         let mut app = review_app();
@@ -5835,6 +5967,23 @@ diff --git a/two.txt b/two.txt\n\
         assert_eq!(parent_dir("src/tui"), Some("src".to_string()));
         assert_eq!(parent_dir("src/tui/"), Some("src".to_string()));
         assert_eq!(parent_dir("a/b/c"), Some("a/b".to_string()));
+    }
+
+    #[test]
+    fn child_path_combines_parent_and_leaf() {
+        assert_eq!(child_path("", "src"), "src");
+        assert_eq!(child_path("src", "tui"), "src/tui");
+        assert_eq!(child_path("src/tui", "app.rs"), "src/tui/app.rs");
+    }
+
+    /// `child_path` の結果に `parent_dir` を適用すると元の `parent` に戻る
+    /// （潜る/戻るが可逆であることの回帰確認）。
+    #[test]
+    fn child_path_and_parent_dir_are_inverse() {
+        for (parent, leaf) in [("", "src"), ("src", "tui"), ("src/tui", "app.rs")] {
+            let child = child_path(parent, leaf);
+            assert_eq!(parent_dir(&child), Some(parent.to_string()));
+        }
     }
 
     #[test]

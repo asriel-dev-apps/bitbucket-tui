@@ -1784,7 +1784,7 @@ fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("↑↓/jk", "移動"),
             ("Shift+J/K", "10件移動"),
             ("Enter", "開く"),
-            ("Backspace/Esc", "親へ"),
+            ("Backspace/Esc", "親へ（ルートは戻る）"),
             ("r", "再読込"),
         ],
         Screen::FileView => vec![

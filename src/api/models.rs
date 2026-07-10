@@ -343,7 +343,12 @@ impl SrcEntry {
         self.entry_type.as_deref() == Some("commit_directory")
     }
 
-    /// リポジトリルートからのフルパス（無ければ空文字）。
+    /// API が返した `path` の生値（無ければ空文字）。
+    ///
+    /// 名目上はリポジトリルートからのフルパスだが、実 API で未検証の仮定
+    /// （`docs/LEDGER.md`）。ディレクトリ階層の追跡（潜る/親へ戻る）にはこの値を
+    /// 直接使わず、TUI 自身が管理する現在地 + [`SrcEntry::name`] から合成した
+    /// パスを使うこと（`tui/app.rs` の `child_path`/`SourceState::path` 参照）。
     pub fn path_str(&self) -> &str {
         self.path.as_deref().unwrap_or("")
     }
