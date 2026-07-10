@@ -20,8 +20,8 @@ use crate::api::{
     PipelineStep, PullRequest, SrcEntry,
 };
 use crate::tui::app::{
-    App, CommentEditor, ConfirmModal, DiffFocus, DiffState, JumpPaletteState, MergeModal, Screen,
-    SelectList, Status,
+    App, CommentEditor, ConfirmModal, DiffFocus, DiffState, JumpPaletteState, MergeModal,
+    PageJumpModal, Screen, SelectList, Status,
 };
 use crate::tui::diff::DiffLineKind;
 use crate::tui::onboarding::Field;
@@ -71,6 +71,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
     if let Some(modal) = &app.confirm_modal {
         render_confirm_modal(frame, modal, &app.theme);
+    }
+    if let Some(modal) = &app.page_jump {
+        render_page_jump(frame, modal, &app.theme);
     }
     if app.show_help {
         render_help(frame, app.screen, &app.theme);
@@ -1564,6 +1567,28 @@ fn render_confirm_modal(frame: &mut Frame, modal: &ConfirmModal, theme: &Theme) 
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// ページ番号ジャンプ（`g`）の入力プロンプトを描画する。数字入力 + `Enter` で移動、`Esc` で取消。
+fn render_page_jump(frame: &mut Frame, modal: &PageJumpModal, theme: &Theme) {
+    let area = centered_rect(46, 22, frame.area());
+    frame.render_widget(Clear, area);
+
+    // 入力中のカーソルを反転ブロックで示す（未入力でも位置が分かるように）。
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("ページ番号: ", Style::new().fg(theme.accent).bold()),
+            Span::styled(modal.input.clone(), Style::new().fg(theme.fg)),
+            Span::styled(" ", Style::new().bg(theme.accent)),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled("Enter: 移動   Esc: 取消", Style::new().dim())),
+    ];
+
+    let block = rounded_block(theme, theme.border_focus)
+        .title(" ページ番号ジャンプ (g) ")
+        .style(Style::new().bg(theme.bg));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn render_placeholder(
     frame: &mut Frame,
     area: Rect,
@@ -2351,6 +2376,36 @@ mod tests {
         app.screen = Screen::Diff;
         app.diff = Some(diff);
         app
+    }
+
+    #[test]
+    fn render_draws_page_jump_prompt_when_open() {
+        // `g` のページ番号ジャンプはモーダルを開くだけで、トップレベル render() に描画が
+        // 配線されていないと画面に何も出ず「効かない」ように見える。オーバーレイが確実に
+        // 描画されることを保証する回帰テスト（入力中の数字も表示されること）。
+        let mut app = App::new(crate::config::Config::default(), None);
+        app.screen = Screen::PullRequests;
+        app.page_jump = Some(PageJumpModal {
+            input: "3".to_string(),
+        });
+
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("draw succeeds");
+
+        let content = buffer_text(terminal.backend().buffer());
+        // `buffer_text` は全角文字をセル単位で空白区切りに展開するため、空白を除いて照合する。
+        let compact = content.replace(' ', "");
+        assert!(
+            compact.contains("ページ番号ジャンプ"),
+            "page-jump prompt not rendered: {content}"
+        );
+        assert!(
+            compact.contains('3'),
+            "typed page number missing: {content}"
+        );
     }
 
     #[test]
