@@ -20,7 +20,8 @@ use crate::api::{
     PullRequest, SrcEntry,
 };
 use crate::tui::app::{
-    App, CommentEditor, ConfirmModal, DiffState, MergeModal, Screen, SelectList, Status,
+    App, CommentEditor, ConfirmModal, DiffState, JumpPaletteState, MergeModal, Screen, SelectList,
+    Status,
 };
 use crate::tui::diff::DiffLineKind;
 use crate::tui::onboarding::Field;
@@ -39,7 +40,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     ])
     .split(frame.area());
 
-    render_header(frame, chunks[0], app.screen, &app.theme);
+    render_header(frame, chunks[0], app);
 
     match app.screen {
         Screen::Onboarding => render_onboarding(frame, chunks[1], app),
@@ -73,6 +74,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
     if app.show_help {
         render_help(frame, app.screen, &app.theme);
+    }
+    // ジャンプパレットは最前面（他のどのオーバーレイより優先して開ける想定のため）。
+    let theme = app.theme;
+    if let Some(palette) = app.jump_palette.as_mut() {
+        render_jump_palette(frame, palette, &theme);
     }
 }
 
@@ -121,19 +127,42 @@ fn themed_block<'a>(theme: &Theme, focused: bool) -> Block<'a> {
     )
 }
 
-fn render_header(frame: &mut Frame, area: Rect, screen: Screen, theme: &Theme) {
-    let line = Line::from(vec![
+fn render_header(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
+    let mut spans = vec![
         Span::styled(
             " bitbucket-tui ",
             Style::new().fg(theme.bg).bg(theme.accent).bold(),
         ),
         Span::raw(" "),
         Span::styled(
-            screen_title(screen),
+            screen_title(app.screen),
             Style::new().add_modifier(Modifier::BOLD),
         ),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+    ];
+    // インクリメンタル検索中、またはフィルタが残っている間はヘッダに検索文字列を表示する
+    // （`/` で開始・編集中はカーソルを付ける・Enter 確定後もフィルタ自体は表示し続ける）。
+    if let Some(filter) = current_screen_filter(app)
+        && (app.search_editing || !filter.is_empty())
+    {
+        let cursor = if app.search_editing { "▏" } else { "" };
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(
+            format!("検索: {filter}{cursor}"),
+            Style::new().fg(theme.warning),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// 現在の画面がインクリメンタル検索に対応するリストを持つ場合、そのフィルタ文字列。
+fn current_screen_filter(app: &App) -> Option<&str> {
+    match app.screen {
+        Screen::Workspaces => Some(app.workspaces.filter.as_str()),
+        Screen::Repositories => Some(app.repositories.filter.as_str()),
+        Screen::PullRequests => Some(app.pull_requests.filter.as_str()),
+        _ => None,
+    }
 }
 
 fn render_onboarding(frame: &mut Frame, area: Rect, app: &App) {
@@ -249,22 +278,35 @@ fn input_spans<'a>(
     }
 }
 
+/// フィルタ適用中の一覧が空になったときの案内文（データ自体は無いのか、フィルタで
+/// 絞られただけなのかを区別する）。
+fn list_empty_text<T>(list: &SelectList<T>, no_data_text: &str) -> String {
+    if list.items.is_empty() {
+        no_data_text.to_string()
+    } else {
+        "検索条件に一致するものがありません".to_string()
+    }
+}
+
+/// `(N)` または（フィルタ適用中は）`(絞込件数/全件数)` の件数表示。
+fn count_label<T>(list: &SelectList<T>) -> String {
+    if list.filter.is_empty() {
+        format!("{}", list.items.len())
+    } else {
+        format!("{}/{}", list.matches.len(), list.items.len())
+    }
+}
+
 fn render_workspaces(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = app.theme;
-    if app.workspaces.items.is_empty() {
-        render_placeholder(
-            frame,
-            area,
-            &app.status,
-            "参加しているワークスペースがありません",
-            &theme,
-        );
+    if app.workspaces.matches.is_empty() {
+        let text = list_empty_text(&app.workspaces, "参加しているワークスペースがありません");
+        render_placeholder(frame, area, &app.status, &text, &theme);
         return;
     }
     let items: Vec<ListItem> = app
         .workspaces
-        .items
-        .iter()
+        .visible()
         .map(|workspace| {
             ListItem::new(Line::from(vec![
                 Span::raw(workspace.display_name().to_string()),
@@ -272,21 +314,21 @@ fn render_workspaces(frame: &mut Frame, area: Rect, app: &mut App) {
             ]))
         })
         .collect();
-    let title = format!(" ワークスペース ({}) ", app.workspaces.items.len());
+    let title = format!(" ワークスペース ({}) ", count_label(&app.workspaces));
     let list = list_widget(&theme, items, title);
     frame.render_stateful_widget(list, area, &mut app.workspaces.state);
 }
 
 fn render_repositories(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = app.theme;
-    if app.repositories.items.is_empty() {
-        render_placeholder(frame, area, &app.status, "リポジトリがありません", &theme);
+    if app.repositories.matches.is_empty() {
+        let text = list_empty_text(&app.repositories, "リポジトリがありません");
+        render_placeholder(frame, area, &app.status, &text, &theme);
         return;
     }
     let items: Vec<ListItem> = app
         .repositories
-        .items
-        .iter()
+        .visible()
         .map(|repo| {
             let visibility = if repo.is_private { "private" } else { "public" };
             let visibility_style = if repo.is_private {
@@ -307,7 +349,11 @@ fn render_repositories(frame: &mut Frame, area: Rect, app: &mut App) {
             ]))
         })
         .collect();
-    let title = format!(" リポジトリ ({}) ", app.repositories.items.len());
+    let title = format!(
+        " リポジトリ ({}) [{}] ",
+        count_label(&app.repositories),
+        app.repositories_sort.label()
+    );
     let list = list_widget(&theme, items, title);
     frame.render_stateful_widget(list, area, &mut app.repositories.state);
 }
@@ -315,23 +361,23 @@ fn render_repositories(frame: &mut Frame, area: Rect, app: &mut App) {
 fn render_pull_requests(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = app.theme;
     let filter = app.pr_state_filter.label();
-    if app.pull_requests.items.is_empty() {
-        render_placeholder(
-            frame,
-            area,
-            &app.status,
-            &format!("{filter} の PR がありません"),
-            &theme,
-        );
+    if app.pull_requests.matches.is_empty() {
+        let no_data_text = format!("{filter} の PR がありません");
+        let text = list_empty_text(&app.pull_requests, &no_data_text);
+        render_placeholder(frame, area, &app.status, &text, &theme);
         return;
     }
     let items: Vec<ListItem> = app
         .pull_requests
-        .items
-        .iter()
+        .visible()
         .map(|pr| ListItem::new(pull_request_row(pr, &theme)))
         .collect();
-    let title = format!(" PR [{}] ({}) ", filter, app.pull_requests.items.len());
+    let title = format!(
+        " PR [{}] ({}) [{}] ",
+        filter,
+        count_label(&app.pull_requests),
+        app.pull_requests_sort.label()
+    );
     let list = list_widget(&theme, items, title);
     frame.render_stateful_widget(list, area, &mut app.pull_requests.state);
 }
@@ -1225,6 +1271,8 @@ fn hint_entries(screen: Screen) -> &'static [(&'static str, &'static str)] {
         Screen::Workspaces => &[
             ("↑↓/jk", "移動"),
             ("Enter", "開く"),
+            ("/", "検索"),
+            ("Ctrl+K", "ジャンプ"),
             ("?", "ヘルプ"),
             ("q", "終了"),
         ],
@@ -1234,6 +1282,9 @@ fn hint_entries(screen: Screen) -> &'static [(&'static str, &'static str)] {
             ("p", "パイプライン"),
             ("b", "ブランチ"),
             ("s", "ソース"),
+            ("/", "検索"),
+            ("S", "並び替え"),
+            ("Ctrl+K", "ジャンプ"),
             ("Esc", "戻る"),
             ("q", "終了"),
         ],
@@ -1244,6 +1295,9 @@ fn hint_entries(screen: Screen) -> &'static [(&'static str, &'static str)] {
             ("r", "再読込"),
             ("P", "パイプライン"),
             ("b/s", "ブラウズ"),
+            ("/", "検索"),
+            ("S", "並び替え"),
+            ("Ctrl+K", "ジャンプ"),
             ("Esc", "戻る"),
         ],
         Screen::PullRequestDetail => &[
@@ -1458,7 +1512,10 @@ fn render_help(frame: &mut Frame, screen: Screen, theme: &Theme) {
         Line::raw("?              このヘルプ"),
         Line::raw("q              終了"),
         Line::raw("Ctrl+T         テーマ切替"),
+        Line::raw("Ctrl+K         ジャンプパレット（保持済みデータへ一気に移動）"),
         Line::raw("Ctrl+C         強制終了"),
+        Line::raw("/              検索（Workspaces/Repositories/PullRequests）"),
+        Line::raw("S              並び替え（Repositories/PullRequests）"),
     ];
 
     let screen_keys: &[&str] = match screen {
@@ -1561,6 +1618,63 @@ fn render_help(frame: &mut Frame, screen: Screen, theme: &Theme) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+/// ジャンプパレット（`Ctrl+K`）を描画する。入力行 + ヒント行 + 候補一覧の 3 段構成。
+fn render_jump_palette(frame: &mut Frame, palette: &mut JumpPaletteState, theme: &Theme) {
+    let area = centered_rect(70, 60, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = rounded_block(theme, theme.border_focus)
+        .title(" ジャンプ (Ctrl+K) ")
+        .style(Style::new().bg(theme.bg));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ])
+    .split(inner);
+
+    let input_line = Line::from(vec![
+        Span::styled("> ", Style::new().fg(theme.accent).bold()),
+        Span::raw(palette.entries.filter.clone()),
+        Span::styled("▏", Style::new().fg(theme.accent)),
+    ]);
+    frame.render_widget(Paragraph::new(input_line), rows[0]);
+
+    let hint_line = Line::from(Span::styled(
+        "↑↓: 選択   Enter: 移動   Esc: 閉じる",
+        Style::new().dim(),
+    ));
+    frame.render_widget(Paragraph::new(hint_line), rows[1]);
+
+    if palette.entries.matches.is_empty() {
+        let paragraph = Paragraph::new(Line::from(Span::styled(
+            "一致するものがありません",
+            Style::new().dim(),
+        )));
+        frame.render_widget(paragraph, rows[2]);
+        return;
+    }
+
+    let items: Vec<ListItem> = palette
+        .entries
+        .visible()
+        .map(|entry| ListItem::new(entry.label.clone()))
+        .collect();
+    let list = List::new(items)
+        .highlight_style(
+            Style::new()
+                .bg(theme.selection_bg)
+                .fg(theme.selection_fg)
+                .bold(),
+        )
+        .highlight_symbol("▌ ")
+        .highlight_spacing(HighlightSpacing::Always);
+    frame.render_stateful_widget(list, rows[2], &mut palette.entries.state);
 }
 
 /// 中央に指定パーセントの矩形を作る（ポップアップ用）。

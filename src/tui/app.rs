@@ -3,6 +3,9 @@
 //! bubbletea の `Model`/`Msg`/`Cmd` に相当する構造。`update()` は状態を更新し、副作用を
 //! [`Command`] として返す。実際の非同期実行（API 呼び出しの spawn）は `event` モジュールが行う。
 
+use std::cmp::Ordering;
+use std::collections::HashMap;
+
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Line;
 use ratatui::widgets::ListState;
@@ -532,11 +535,21 @@ pub enum Command {
 
 /// 選択状態を持つリスト。ratatui の `ListState` を内包し、スクロールは List ウィジェットに委ねる。
 ///
+/// `matches` は `items` のうちフィルタ（`filter`）を通過した要素のインデックスを表示順で
+/// 保持する。`filter` が空文字なら `matches` は恒等写像（`0..items.len()`）になるため、
+/// 検索を使わない画面（pipelines/branches/commits/source 等）は `filter`/`matches` に
+/// 一切触れないままで従来と同じ挙動（全件・`items` のインデックスそのままの選択）になる。
+/// 選択（`state`）は常に「`matches` 上の位置」を指す。
+///
 /// `T: Default` を要求しないよう `Default` は手動実装する。
 #[derive(Debug)]
 pub struct SelectList<T> {
     pub items: Vec<T>,
     pub state: ListState,
+    /// 検索フィルタ文字列（空ならフィルタなし）。検索を使わない画面では常に空のまま。
+    pub filter: String,
+    /// フィルタ通過した `items` のインデックス（表示順）。`ui` の一覧描画はこれを辿る。
+    pub matches: Vec<usize>,
 }
 
 impl<T> Default for SelectList<T> {
@@ -544,13 +557,18 @@ impl<T> Default for SelectList<T> {
         Self {
             items: Vec::new(),
             state: ListState::default(),
+            filter: String::new(),
+            matches: Vec::new(),
         }
     }
 }
 
 impl<T> SelectList<T> {
-    /// 要素を差し替え、選択位置を先頭（空なら未選択）にリセットする。
+    /// 要素を差し替え、選択位置を先頭（空なら未選択）にリセットする。フィルタも解除する
+    /// （新しいデータセットに古いフィルタを引き継がないため）。
     pub fn set_items(&mut self, items: Vec<T>) {
+        self.filter.clear();
+        self.matches = (0..items.len()).collect();
         self.state
             .select(if items.is_empty() { None } else { Some(0) });
         self.items = items;
@@ -559,7 +577,9 @@ impl<T> SelectList<T> {
     /// 要素を差し替えつつ、選択インデックスを可能な限り維持する（新しい件数にクランプ）。
     ///
     /// 自動ポーリングでの一覧リフレッシュ時に、選択位置が毎回先頭へ戻らないようにするために使う。
+    /// 検索を使わない画面専用（`filter` は常に空のまま・`matches` は恒等写像を保つ）。
     pub fn set_items_keep_selection(&mut self, items: Vec<T>) {
+        self.matches = (0..items.len()).collect();
         let selection = if items.is_empty() {
             None
         } else {
@@ -569,13 +589,61 @@ impl<T> SelectList<T> {
         self.items = items;
     }
 
-    /// 選択を 1 つ下へ（末尾で停止）。
+    /// 検索フィルタ文字列を更新し、`key_fn` が返す文字列（大文字小文字は無視）に対する
+    /// 部分一致で `matches` を再計算する。選択位置は新しい `matches` の範囲にクランプする。
+    pub fn set_filter<F>(&mut self, filter: String, key_fn: F)
+    where
+        F: Fn(&T) -> String,
+    {
+        self.filter = filter;
+        self.recompute_matches(key_fn);
+    }
+
+    /// 現在のフィルタを保ったまま要素の並びを差し替える（ソート適用に使う）。
+    pub fn reorder<F>(&mut self, items: Vec<T>, key_fn: F)
+    where
+        F: Fn(&T) -> String,
+    {
+        self.items = items;
+        self.recompute_matches(key_fn);
+    }
+
+    fn recompute_matches<F>(&mut self, key_fn: F)
+    where
+        F: Fn(&T) -> String,
+    {
+        if self.filter.is_empty() {
+            self.matches = (0..self.items.len()).collect();
+        } else {
+            let needle = self.filter.to_lowercase();
+            self.matches = self
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| key_fn(item).to_lowercase().contains(&needle))
+                .map(|(index, _)| index)
+                .collect();
+        }
+        let selection = if self.matches.is_empty() {
+            None
+        } else {
+            Some(
+                self.state
+                    .selected()
+                    .unwrap_or(0)
+                    .min(self.matches.len() - 1),
+            )
+        };
+        self.state.select(selection);
+    }
+
+    /// 選択を 1 つ下へ（末尾で停止）。フィルタ未使用なら全件、使用中なら `matches` の範囲。
     pub fn select_next(&mut self) {
-        if self.items.is_empty() {
+        if self.matches.is_empty() {
             return;
         }
         let next = match self.state.selected() {
-            Some(index) if index + 1 < self.items.len() => index + 1,
+            Some(index) if index + 1 < self.matches.len() => index + 1,
             Some(index) => index,
             None => 0,
         };
@@ -584,7 +652,7 @@ impl<T> SelectList<T> {
 
     /// 選択を 1 つ上へ（先頭で停止）。
     pub fn select_prev(&mut self) {
-        if self.items.is_empty() {
+        if self.matches.is_empty() {
             return;
         }
         let prev = match self.state.selected() {
@@ -594,12 +662,101 @@ impl<T> SelectList<T> {
         self.state.select(Some(prev));
     }
 
-    /// 現在選択中の要素。
+    /// 現在選択中の要素（`matches` 上の位置を `items` のインデックスへ変換して引く）。
     pub fn selected(&self) -> Option<&T> {
-        self.state
-            .selected()
-            .and_then(|index| self.items.get(index))
+        let position = self.state.selected()?;
+        let index = *self.matches.get(position)?;
+        self.items.get(index)
     }
+
+    /// 表示順（フィルタ適用後）で要素を辿るイテレータ。`ui` の一覧描画に使う。
+    pub fn visible(&self) -> impl Iterator<Item = &T> + '_ {
+        self.matches.iter().map(move |&index| &self.items[index])
+    }
+}
+
+/// Repositories / PullRequests 画面の一覧ソートモード（`S` キーで巡回）。
+///
+/// 「取得順に戻せる」ことを要件とするため、常に `Fetched` を起点に巡回できる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortMode {
+    /// API から取得した順（updated_on 降順で取得済み）。
+    #[default]
+    Fetched,
+    /// 名前（リポジトリ名 / PR タイトル）昇順。
+    NameAsc,
+    /// 更新日時（`updated_on`）降順。
+    UpdatedDesc,
+    /// 使用頻度（`Config::usage`）降順。
+    ///
+    /// PR には使用頻度の概念が無いため、PullRequests 画面ではこのモードは `Fetched` と
+    /// 同じ（並び替えなしのパススルー）になる。
+    UsageDesc,
+}
+
+impl SortMode {
+    /// 次のソートモードへ巡回する（末尾の次は先頭の `Fetched` に戻る）。
+    pub fn next(self) -> SortMode {
+        match self {
+            SortMode::Fetched => SortMode::NameAsc,
+            SortMode::NameAsc => SortMode::UpdatedDesc,
+            SortMode::UpdatedDesc => SortMode::UsageDesc,
+            SortMode::UsageDesc => SortMode::Fetched,
+        }
+    }
+
+    /// ステータス表示・一覧タイトル用のラベル。
+    pub fn label(self) -> &'static str {
+        match self {
+            SortMode::Fetched => "取得順",
+            SortMode::NameAsc => "名前昇順",
+            SortMode::UpdatedDesc => "更新日時降順",
+            SortMode::UsageDesc => "使用頻度降順",
+        }
+    }
+}
+
+/// 直近開いた PR（ジャンプパレットの候補に使う）。
+#[derive(Debug, Clone)]
+pub struct RecentPr {
+    pub workspace: String,
+    /// `workspace/repo` 形式（`App::selected_repo` と同じ形式）。
+    pub repo_full_name: String,
+    pub pr: PullRequest,
+}
+
+/// ジャンプパレットの候補が実行する遷移。
+#[derive(Debug, Clone)]
+pub enum JumpAction {
+    /// 画面だけを切り替える（保持済みデータをそのまま使う）。
+    Screen(Screen),
+    /// 指定ワークスペースへ入る（未取得ならリポジトリ取得を発行）。
+    Workspace(String),
+    /// 指定リポジトリへ入る（PR 一覧取得を発行）。
+    Repository(Box<Repository>),
+    /// 直近開いた PR の詳細へ直接ジャンプする。
+    RecentPr(Box<RecentPr>),
+}
+
+/// ジャンプパレットの 1 候補。
+#[derive(Debug, Clone)]
+pub struct JumpEntry {
+    /// 一覧に表示するラベル。
+    pub label: String,
+    /// 検索対象文字列（`label` より緩く、複数の呼び名を含められる）。
+    pub search_key: String,
+    pub action: JumpAction,
+}
+
+/// ジャンプパレット（`Ctrl+K`）の状態。保持済みデータへの一気ジャンプ・画面ジャンプに使う。
+#[derive(Debug)]
+pub struct JumpPaletteState {
+    pub entries: SelectList<JumpEntry>,
+}
+
+/// `JumpEntry` の検索キー抽出（`SelectList::set_filter`/`reorder` に渡す）。
+fn jump_entry_key(entry: &JumpEntry) -> String {
+    entry.search_key.clone()
 }
 
 /// アプリ全体の状態。
@@ -615,11 +772,19 @@ pub struct App {
     pub onboarding: OnboardingState,
     pub workspaces: SelectList<Workspace>,
     pub repositories: SelectList<Repository>,
+    /// Repositories 一覧の現在のソートモード（`S` キーで巡回）。
+    pub repositories_sort: SortMode,
+    /// Repositories の取得順スナップショット（`SortMode::Fetched` に戻すための元データ）。
+    pub repositories_fetch_order: Vec<Repository>,
     pub selected_workspace: Option<String>,
     pub selected_repo: Option<String>,
     /// 選択リポジトリの既定ブランチ名（`mainbranch.name`）。Source ルートに使う。
     pub repo_main_branch: Option<String>,
     pub pull_requests: SelectList<PullRequest>,
+    /// PullRequests 一覧の現在のソートモード（`S` キーで巡回）。
+    pub pull_requests_sort: SortMode,
+    /// PullRequests の取得順スナップショット（`SortMode::Fetched` に戻すための元データ）。
+    pub pull_requests_fetch_order: Vec<PullRequest>,
     pub pr_state_filter: PrStateFilter,
     pub current_pr: Option<PullRequest>,
     pub diffstat: SelectList<DiffStatEntry>,
@@ -657,6 +822,13 @@ pub struct App {
     pub open_file_mimetype: Option<String>,
     pub status: Status,
     pub show_help: bool,
+    /// Workspaces/Repositories/PullRequests でのインクリメンタル検索の編集中フラグ
+    /// （`/` で開始、対象のリストは `screen` から決まる）。
+    pub search_editing: bool,
+    /// ジャンプパレット（`Ctrl+K`）の状態。開いている間は最優先でキー入力を奪う。
+    pub jump_palette: Option<JumpPaletteState>,
+    /// 直近開いた PR（新しい順）。ジャンプパレットの候補に使う。
+    pub recent_prs: Vec<RecentPr>,
 }
 
 /// PR 詳細本文の固定ヘッダ行数（`ui::render_pr_meta_body` が積む先頭 4 行:
@@ -695,10 +867,14 @@ impl App {
             onboarding,
             workspaces: SelectList::default(),
             repositories: SelectList::default(),
+            repositories_sort: SortMode::default(),
+            repositories_fetch_order: Vec::new(),
             selected_workspace: None,
             selected_repo: None,
             repo_main_branch: None,
             pull_requests: SelectList::default(),
+            pull_requests_sort: SortMode::default(),
+            pull_requests_fetch_order: Vec::new(),
             pr_state_filter: PrStateFilter::Open,
             current_pr: None,
             diffstat: SelectList::default(),
@@ -727,6 +903,9 @@ impl App {
             open_file_mimetype: None,
             status: Status::Idle,
             show_help: false,
+            search_editing: false,
+            jump_palette: None,
+            recent_prs: Vec::new(),
         }
     }
 
@@ -764,6 +943,9 @@ impl App {
                 // 取得中に別ワークスペースへ切り替えていた場合は破棄。
                 if self.selected_workspace.as_deref() == Some(workspace.as_str()) {
                     self.status = Status::Idle;
+                    // 新しい取得結果を「取得順」の起点として保持し、ソートモードもリセットする。
+                    self.repositories_fetch_order = repos.clone();
+                    self.repositories_sort = SortMode::Fetched;
                     self.repositories.set_items(repos);
                 }
                 Command::None
@@ -777,6 +959,8 @@ impl App {
                     && self.pr_state_filter == filter
                 {
                     self.status = Status::Idle;
+                    self.pull_requests_fetch_order = prs.clone();
+                    self.pull_requests_sort = SortMode::Fetched;
                     self.pull_requests.set_items(prs);
                 }
                 Command::None
@@ -1022,13 +1206,33 @@ impl App {
         Command::LoadWorkspaces { client }
     }
 
-    /// キー入力の処理。グローバルキー（Ctrl+C / Ctrl+T / ヘルプ / モーダル）を先に捌く。
+    /// キー入力の処理。グローバルキー（Ctrl+C / Ctrl+T / ジャンプパレット / ヘルプ / モーダル）
+    /// を先に捌く。
     fn on_key(&mut self, key: KeyEvent) -> Command {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Command::Quit;
         }
         if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return self.cycle_theme();
+        }
+
+        // ジャンプパレット（`Ctrl+K`）: 開いている間は最優先で入力を奪う。
+        if self.jump_palette.is_some() {
+            return self.on_key_jump_palette(key);
+        }
+        // 開くトリガーは show_help と同格（他のモーダル/検索編集中/Onboarding では無効）。
+        // Onboarding だけは対象外: `Ctrl+K` は emacs 風の「行末まで削除」で既に使用中で、
+        // 認証前は保持済みデータも無くジャンプ先が無いため衝突を避ける。
+        if key.code == KeyCode::Char('k')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.screen != Screen::Onboarding
+            && !self.show_help
+            && !self.search_editing
+            && self.comment_editor.is_none()
+            && self.merge_modal.is_none()
+            && self.confirm_modal.is_none()
+        {
+            return self.open_jump_palette();
         }
 
         if self.show_help {
@@ -1046,6 +1250,9 @@ impl App {
         }
         if self.confirm_modal.is_some() {
             return self.on_key_confirm_modal(key);
+        }
+        if self.search_editing {
+            return self.on_key_search_editing(key);
         }
 
         match self.screen {
@@ -1201,6 +1408,10 @@ impl App {
                 self.show_help = true;
                 Command::None
             }
+            KeyCode::Char('/') => {
+                self.search_editing = true;
+                Command::None
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.workspaces.select_next();
                 Command::None
@@ -1214,17 +1425,24 @@ impl App {
         }
     }
 
-    /// ワークスペース決定時: 既定ワークスペースを保存し、リポジトリ取得を開始。
+    /// ワークスペース決定時: 選択中のワークスペースへ入る。
     fn enter_workspace(&mut self) -> Command {
         let Some(workspace) = self.workspaces.selected() else {
             return Command::None;
         };
         let slug = workspace.slug.clone();
+        self.jump_to_workspace(slug)
+    }
 
+    /// 指定ワークスペースへ入る（既定ワークスペースの保存・使用頻度カウント・リポジトリ取得の
+    /// 開始まで行う）。一覧での選択決定（[`App::enter_workspace`]）とジャンプパレットの
+    /// 双方から呼ぶ共通経路。
+    fn jump_to_workspace(&mut self, slug: String) -> Command {
         self.selected_workspace = Some(slug.clone());
         self.config.default_workspace = Some(slug.clone());
+        self.bump_usage(slug.clone());
         if let Err(error) = self.config.save() {
-            tracing::warn!(%error, "既定ワークスペースの保存に失敗しました");
+            tracing::warn!(%error, "既定ワークスペース/使用頻度の保存に失敗しました");
         }
 
         self.repositories.set_items(Vec::new());
@@ -1243,6 +1461,11 @@ impl App {
         }
     }
 
+    /// `config.usage` のカウンタを 1 増やす（保存は呼び出し側の責務）。
+    fn bump_usage(&mut self, key: String) {
+        *self.config.usage.entry(key).or_insert(0) += 1;
+    }
+
     fn on_key_repositories(&mut self, key: KeyEvent) -> Command {
         match key.code {
             KeyCode::Char('q') => Command::Quit,
@@ -1250,6 +1473,11 @@ impl App {
                 self.show_help = true;
                 Command::None
             }
+            KeyCode::Char('/') => {
+                self.search_editing = true;
+                Command::None
+            }
+            KeyCode::Char('S') => self.cycle_repositories_sort(),
             KeyCode::Esc => {
                 self.screen = Screen::Workspaces;
                 self.status = Status::Idle;
@@ -1267,8 +1495,7 @@ impl App {
                 let Some(repo) = self.repositories.selected().cloned() else {
                     return Command::None;
                 };
-                self.select_repo(&repo);
-                self.open_pull_requests()
+                self.enter_repository(repo)
             }
             KeyCode::Char('p') => {
                 let Some(repo) = self.repositories.selected().cloned() else {
@@ -1296,10 +1523,21 @@ impl App {
         }
     }
 
-    /// 選択リポジトリを確定する（`ws/repo` と既定ブランチを保持）。
+    /// 選択リポジトリを確定する（`ws/repo` と既定ブランチを保持し、使用頻度を加算する）。
     fn select_repo(&mut self, repo: &Repository) {
         self.selected_repo = Some(repo.full_name.clone());
         self.repo_main_branch = repo.main_branch_name().map(str::to_string);
+        self.bump_usage(repo.full_name.clone());
+        if let Err(error) = self.config.save() {
+            tracing::warn!(%error, "使用頻度の保存に失敗しました");
+        }
+    }
+
+    /// リポジトリを選択して PR 一覧へ入る。一覧での決定（Enter）とジャンプパレットの
+    /// 双方から呼ぶ共通経路。
+    fn enter_repository(&mut self, repo: Repository) -> Command {
+        self.select_repo(&repo);
+        self.open_pull_requests()
     }
 
     /// Source ルートに使う既定ブランチ名（未取得なら `main` にフォールバック）。
@@ -1307,6 +1545,37 @@ impl App {
         self.repo_main_branch
             .clone()
             .unwrap_or_else(|| "main".to_string())
+    }
+
+    /// Repositories 一覧のソートモードを次へ巡回し、適用する。
+    fn cycle_repositories_sort(&mut self) -> Command {
+        self.repositories_sort = self.repositories_sort.next();
+        self.apply_repositories_sort();
+        self.status = Status::Success(format!("並び替え: {}", self.repositories_sort.label()));
+        Command::None
+    }
+
+    /// `repositories_fetch_order`（取得順スナップショット）から現在のソートモードで
+    /// 並び替え、フィルタを保ったまま `repositories` へ反映する。
+    fn apply_repositories_sort(&mut self) {
+        let mut items = self.repositories_fetch_order.clone();
+        match self.repositories_sort {
+            SortMode::Fetched => {}
+            SortMode::NameAsc => {
+                items.sort_by_key(|repo| repo.name.to_lowercase());
+            }
+            SortMode::UpdatedDesc => items.sort_by(|a, b| {
+                cmp_updated_on_desc(a.updated_on.as_deref(), b.updated_on.as_deref())
+            }),
+            SortMode::UsageDesc => {
+                let usage = self.config.usage.clone();
+                items.sort_by(|a, b| {
+                    usage_of(&usage, &b.full_name).cmp(&usage_of(&usage, &a.full_name))
+                });
+            }
+        }
+        self.repositories
+            .reorder(items, |repo| format!("{} {}", repo.full_name, repo.name));
     }
 
     /// PR 一覧画面へ遷移し、OPEN の一覧取得を開始する。
@@ -1343,6 +1612,11 @@ impl App {
                 self.show_help = true;
                 Command::None
             }
+            KeyCode::Char('/') => {
+                self.search_editing = true;
+                Command::None
+            }
+            KeyCode::Char('S') => self.cycle_pull_requests_sort(),
             KeyCode::Esc => {
                 self.screen = Screen::Repositories;
                 self.status = Status::Idle;
@@ -1376,6 +1650,32 @@ impl App {
         self.pr_state_filter = filter;
         self.pull_requests.set_items(Vec::new());
         self.reload_pull_requests()
+    }
+
+    /// PullRequests 一覧のソートモードを次へ巡回し、適用する。
+    fn cycle_pull_requests_sort(&mut self) -> Command {
+        self.pull_requests_sort = self.pull_requests_sort.next();
+        self.apply_pull_requests_sort();
+        self.status = Status::Success(format!("並び替え: {}", self.pull_requests_sort.label()));
+        Command::None
+    }
+
+    /// `pull_requests_fetch_order` から現在のソートモードで並び替え、フィルタを保ったまま
+    /// `pull_requests` へ反映する。PR には使用頻度の概念が無いため `UsageDesc` は
+    /// `Fetched` と同じ（並び替えなし）になる。
+    fn apply_pull_requests_sort(&mut self) {
+        let mut items = self.pull_requests_fetch_order.clone();
+        match self.pull_requests_sort {
+            SortMode::Fetched | SortMode::UsageDesc => {}
+            SortMode::NameAsc => {
+                items.sort_by_key(|pr| pr.title_str().to_lowercase());
+            }
+            SortMode::UpdatedDesc => items.sort_by(|a, b| {
+                cmp_updated_on_desc(a.updated_on.as_deref(), b.updated_on.as_deref())
+            }),
+        }
+        self.pull_requests
+            .reorder(items, |pr| format!("{} #{}", pr.title_str(), pr.id));
     }
 
     /// PR 詳細本文の表示行数（ヘッダ 4 行 + 本文行数。本文が無い場合はプレースホルダの 1 行）。
@@ -1412,18 +1712,50 @@ impl App {
         let Some(pr) = self.pull_requests.selected().cloned() else {
             return Command::None;
         };
+        let Some((client, workspace, repo)) = self.review_context() else {
+            self.status = Status::Error("認証クライアントが未初期化です".to_string());
+            return Command::None;
+        };
+        self.open_pr_detail_with(client, workspace, repo, pr)
+    }
+
+    /// 他のワークスペース/リポジトリの PR へ直接ジャンプする（ジャンプパレット用）。
+    /// `selected_workspace`/`selected_repo` を明示的に切り替えてから通常の詳細取得経路
+    /// （[`App::open_pr_detail_with`]）に合流する。
+    fn jump_to_pr(
+        &mut self,
+        workspace: String,
+        repo_full_name: String,
+        pr: PullRequest,
+    ) -> Command {
+        self.selected_workspace = Some(workspace);
+        self.selected_repo = Some(repo_full_name);
+        let Some((client, workspace, repo)) = self.review_context() else {
+            self.status = Status::Error("認証クライアントが未初期化です".to_string());
+            return Command::None;
+        };
+        self.open_pr_detail_with(client, workspace, repo, pr)
+    }
+
+    /// PR 詳細画面へ遷移し、詳細/diffstat/コメントの取得を発行する共通経路。
+    /// 一覧での決定（[`App::open_pr_detail`]）とジャンプパレット（[`App::jump_to_pr`]）の
+    /// 双方から呼ぶ。
+    fn open_pr_detail_with(
+        &mut self,
+        client: BitbucketClient,
+        workspace: String,
+        repo: String,
+        pr: PullRequest,
+    ) -> Command {
         let id = pr.id;
-        self.current_pr = Some(pr);
+        self.current_pr = Some(pr.clone());
         self.diffstat.set_items(Vec::new());
         self.comments = Vec::new();
         self.diff = None;
         self.detail_scroll = 0;
         self.screen = Screen::PullRequestDetail;
+        self.record_recent_pr(pr);
 
-        let Some((client, workspace, repo)) = self.review_context() else {
-            self.status = Status::Error("認証クライアントが未初期化です".to_string());
-            return Command::None;
-        };
         self.status = Status::Loading(format!("PR #{id} を取得中…"));
         Command::Batch(vec![
             Command::LoadPrDetail {
@@ -1445,6 +1777,31 @@ impl App {
                 id,
             },
         ])
+    }
+
+    /// 「直近開いた PR」リストへ記録する（先頭に追加・同一 PR の重複は除去・上限 20 件）。
+    /// ジャンプパレットの候補に使う。`selected_workspace`/`selected_repo` が未確定なら
+    /// 何もしない（レビュー系操作ができない状態と同じ扱い）。
+    fn record_recent_pr(&mut self, pr: PullRequest) {
+        let Some(workspace) = self.selected_workspace.clone() else {
+            return;
+        };
+        let Some(repo_full_name) = self.selected_repo.clone() else {
+            return;
+        };
+        let id = pr.id;
+        self.recent_prs
+            .retain(|recent| !(recent.repo_full_name == repo_full_name && recent.pr.id == id));
+        self.recent_prs.insert(
+            0,
+            RecentPr {
+                workspace,
+                repo_full_name,
+                pr,
+            },
+        );
+        const MAX_RECENT_PRS: usize = 20;
+        self.recent_prs.truncate(MAX_RECENT_PRS);
     }
 
     fn on_key_pull_request_detail(&mut self, key: KeyEvent) -> Command {
@@ -2593,6 +2950,222 @@ impl App {
             self.repo_slug()?,
         ))
     }
+
+    // ---- インクリメンタル検索（`/`） ----
+
+    /// 現在の画面がインクリメンタル検索に対応するリストを持つ場合、そのフィルタ文字列を返す。
+    fn current_filter_text(&self) -> Option<String> {
+        match self.screen {
+            Screen::Workspaces => Some(self.workspaces.filter.clone()),
+            Screen::Repositories => Some(self.repositories.filter.clone()),
+            Screen::PullRequests => Some(self.pull_requests.filter.clone()),
+            _ => None,
+        }
+    }
+
+    /// 現在の画面のリストへフィルタ文字列を適用する（検索対象文字列は型ごとに決める）。
+    fn set_current_list_filter(&mut self, filter: String) {
+        match self.screen {
+            Screen::Workspaces => {
+                self.workspaces.set_filter(filter, |workspace: &Workspace| {
+                    format!("{} {}", workspace.display_name(), workspace.slug)
+                });
+            }
+            Screen::Repositories => {
+                self.repositories.set_filter(filter, |repo: &Repository| {
+                    format!("{} {}", repo.full_name, repo.name)
+                });
+            }
+            Screen::PullRequests => {
+                self.pull_requests.set_filter(filter, |pr: &PullRequest| {
+                    format!("{} #{}", pr.title_str(), pr.id)
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn on_key_search_editing(&mut self, key: KeyEvent) -> Command {
+        match key.code {
+            KeyCode::Esc => {
+                self.search_editing = false;
+                self.set_current_list_filter(String::new());
+                Command::None
+            }
+            KeyCode::Enter => {
+                // フィルタは維持したまま、通常のリスト操作へ戻る。
+                self.search_editing = false;
+                Command::None
+            }
+            KeyCode::Backspace => {
+                if let Some(mut filter) = self.current_filter_text() {
+                    filter.pop();
+                    self.set_current_list_filter(filter);
+                }
+                Command::None
+            }
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let Some(mut filter) = self.current_filter_text() {
+                    filter.push(ch);
+                    self.set_current_list_filter(filter);
+                }
+                Command::None
+            }
+            _ => Command::None,
+        }
+    }
+
+    // ---- ジャンプパレット（`Ctrl+K`） ----
+
+    /// ジャンプパレットを開く（保持済みデータからの候補一覧を組み立てる）。
+    fn open_jump_palette(&mut self) -> Command {
+        let mut entries = SelectList::default();
+        entries.set_items(self.build_jump_entries());
+        self.jump_palette = Some(JumpPaletteState { entries });
+        Command::None
+    }
+
+    /// ジャンプパレットの候補を、保持済みデータ（ワークスペース/リポジトリ/直近開いた PR）と
+    /// 画面ジャンプから組み立てる。ワークスペース/リポジトリは使用頻度（`config.usage`）降順、
+    /// PR は開いた順（新しい順）で並べる。
+    fn build_jump_entries(&self) -> Vec<JumpEntry> {
+        let mut entries = Vec::new();
+
+        entries.push(JumpEntry {
+            label: "ワークスペース一覧へ".to_string(),
+            search_key: "workspaces ワークスペース一覧".to_string(),
+            action: JumpAction::Screen(Screen::Workspaces),
+        });
+        if self.selected_workspace.is_some() {
+            entries.push(JumpEntry {
+                label: "リポジトリ一覧へ（現在のワークスペース）".to_string(),
+                search_key: "repositories リポジトリ一覧".to_string(),
+                action: JumpAction::Screen(Screen::Repositories),
+            });
+        }
+        if self.selected_repo.is_some() {
+            entries.push(JumpEntry {
+                label: "PR 一覧へ（現在のリポジトリ）".to_string(),
+                search_key: "pull requests PR プルリクエスト一覧".to_string(),
+                action: JumpAction::Screen(Screen::PullRequests),
+            });
+        }
+
+        let mut workspaces = self.workspaces.items.clone();
+        workspaces.sort_by(|a, b| {
+            usage_of(&self.config.usage, &b.slug).cmp(&usage_of(&self.config.usage, &a.slug))
+        });
+        for workspace in workspaces {
+            entries.push(JumpEntry {
+                label: format!("WS: {} ({})", workspace.display_name(), workspace.slug),
+                search_key: format!("{} {}", workspace.display_name(), workspace.slug),
+                action: JumpAction::Workspace(workspace.slug.clone()),
+            });
+        }
+
+        let mut repos = self.repositories.items.clone();
+        repos.sort_by(|a, b| {
+            usage_of(&self.config.usage, &b.full_name)
+                .cmp(&usage_of(&self.config.usage, &a.full_name))
+        });
+        for repo in repos {
+            entries.push(JumpEntry {
+                label: format!("Repo: {}", repo.full_name),
+                search_key: format!("{} {}", repo.full_name, repo.name),
+                action: JumpAction::Repository(Box::new(repo)),
+            });
+        }
+
+        for recent in &self.recent_prs {
+            entries.push(JumpEntry {
+                label: format!(
+                    "PR #{} {} ({})",
+                    recent.pr.id,
+                    recent.pr.title_str(),
+                    recent.repo_full_name
+                ),
+                search_key: format!(
+                    "{} #{} {}",
+                    recent.pr.title_str(),
+                    recent.pr.id,
+                    recent.repo_full_name
+                ),
+                action: JumpAction::RecentPr(Box::new(recent.clone())),
+            });
+        }
+
+        entries
+    }
+
+    fn on_key_jump_palette(&mut self, key: KeyEvent) -> Command {
+        match key.code {
+            KeyCode::Esc => {
+                self.jump_palette = None;
+                Command::None
+            }
+            KeyCode::Down => {
+                if let Some(palette) = self.jump_palette.as_mut() {
+                    palette.entries.select_next();
+                }
+                Command::None
+            }
+            KeyCode::Up => {
+                if let Some(palette) = self.jump_palette.as_mut() {
+                    palette.entries.select_prev();
+                }
+                Command::None
+            }
+            KeyCode::Backspace => {
+                if let Some(palette) = self.jump_palette.as_mut() {
+                    let mut filter = palette.entries.filter.clone();
+                    filter.pop();
+                    palette.entries.set_filter(filter, jump_entry_key);
+                }
+                Command::None
+            }
+            KeyCode::Enter => self.confirm_jump_palette(),
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let Some(palette) = self.jump_palette.as_mut() {
+                    let mut filter = palette.entries.filter.clone();
+                    filter.push(ch);
+                    palette.entries.set_filter(filter, jump_entry_key);
+                }
+                Command::None
+            }
+            _ => Command::None,
+        }
+    }
+
+    /// 選択中の候補で遷移を実行する。
+    fn confirm_jump_palette(&mut self) -> Command {
+        let Some(palette) = self.jump_palette.as_ref() else {
+            return Command::None;
+        };
+        let Some(entry) = palette.entries.selected().cloned() else {
+            return Command::None;
+        };
+        self.jump_palette = None;
+        match entry.action {
+            JumpAction::Screen(screen) => {
+                self.screen = screen;
+                Command::None
+            }
+            JumpAction::Workspace(slug) => self.jump_to_workspace(slug),
+            JumpAction::Repository(repo) => self.enter_repository(*repo),
+            JumpAction::RecentPr(recent) => {
+                let recent = *recent;
+                self.jump_to_pr(recent.workspace, recent.repo_full_name, recent.pr)
+            }
+        }
+    }
 }
 
 /// participant のユーザーが自分かどうかをベストエフォートで判定する。
@@ -2635,6 +3208,22 @@ fn sort_src_entries(entries: &mut [SrcEntry]) {
 /// hash 文字列の短縮形（先頭 8 文字）。
 fn short_hash_str(hash: &str) -> String {
     hash.chars().take(8).collect()
+}
+
+/// `config.usage` からキーの使用回数を引く（未登録なら 0）。
+fn usage_of(usage: &HashMap<String, u32>, key: &str) -> u32 {
+    usage.get(key).copied().unwrap_or(0)
+}
+
+/// ISO8601 の `updated_on` 文字列同士を降順比較する（`None` は常に末尾）。
+/// ISO8601 は辞書式順序がそのまま時系列順になるため、文字列比較のみで求められる。
+fn cmp_updated_on_desc(a: Option<&str>, b: Option<&str>) -> Ordering {
+    match (a, b) {
+        (Some(x), Some(y)) => y.cmp(x),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
 }
 
 #[cfg(test)]
@@ -3943,5 +4532,468 @@ mod tests {
         assert_eq!(entries[1].name(), "z_dir");
         assert_eq!(entries[2].name(), "a.rs");
         assert_eq!(entries[3].name(), "b.rs");
+    }
+
+    // ---- SelectList 検索（#1） ----
+
+    #[test]
+    fn select_list_filter_narrows_matches_case_insensitively() {
+        let mut list: SelectList<&str> = SelectList::default();
+        list.set_items(vec!["Alpha", "Beta", "Gamma"]);
+        list.set_filter("PH".to_string(), |s: &&str| s.to_string());
+        assert_eq!(list.matches, vec![0]);
+        assert_eq!(list.selected(), Some(&"Alpha"));
+    }
+
+    #[test]
+    fn select_list_empty_filter_restores_full_set() {
+        let mut list: SelectList<&str> = SelectList::default();
+        list.set_items(vec!["a", "b", "c"]);
+        list.set_filter("b".to_string(), |s: &&str| s.to_string());
+        assert_eq!(list.matches, vec![1]);
+        list.set_filter(String::new(), |s: &&str| s.to_string());
+        assert_eq!(list.matches, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn select_list_selection_clamps_to_matches_range() {
+        let mut list: SelectList<&str> = SelectList::default();
+        list.set_items(vec!["a1", "a2", "b1", "a3"]);
+        list.state.select(Some(3)); // "a3" を選択中。
+        list.set_filter("a".to_string(), |s: &&str| s.to_string());
+        // matches = [0, 1, 3]（a1, a2, a3）。選択位置はこの範囲にクランプされる。
+        assert_eq!(list.matches, vec![0, 1, 3]);
+        assert!(
+            list.state
+                .selected()
+                .is_some_and(|pos| pos < list.matches.len())
+        );
+    }
+
+    #[test]
+    fn select_list_select_next_prev_operate_within_matches() {
+        let mut list: SelectList<&str> = SelectList::default();
+        list.set_items(vec!["a1", "b1", "a2", "b2"]);
+        list.set_filter("a".to_string(), |s: &&str| s.to_string());
+        assert_eq!(list.matches, vec![0, 2]);
+        assert_eq!(list.selected(), Some(&"a1"));
+        list.select_next();
+        assert_eq!(list.selected(), Some(&"a2"));
+        // 末尾で停止する（"b1"/"b2" はフィルタ対象外なので飛ばされない）。
+        list.select_next();
+        assert_eq!(list.selected(), Some(&"a2"));
+    }
+
+    #[test]
+    fn select_list_set_items_clears_filter() {
+        let mut list: SelectList<&str> = SelectList::default();
+        list.set_items(vec!["a", "b"]);
+        list.set_filter("a".to_string(), |s: &&str| s.to_string());
+        assert_eq!(list.matches, vec![0]);
+        list.set_items(vec!["x", "y", "z"]);
+        assert!(list.filter.is_empty());
+        assert_eq!(list.matches, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn select_list_set_items_keep_selection_preserves_identity_matches_for_unfiltered_screens() {
+        // pipelines/branches/commits/source 等、検索を使わない画面の既存挙動を保証する回帰テスト。
+        let mut list: SelectList<i32> = SelectList::default();
+        list.set_items(vec![1, 2, 3]);
+        list.state.select(Some(2));
+        list.set_items_keep_selection(vec![10, 20]);
+        assert_eq!(list.matches, vec![0, 1]);
+        assert_eq!(list.state.selected(), Some(1)); // 3 件→2 件でクランプ。
+        assert_eq!(list.selected(), Some(&20));
+    }
+
+    // ---- インクリメンタル検索（App 統合・#1） ----
+
+    #[test]
+    fn slash_key_enters_search_editing_and_filters_pull_requests_by_typing() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.pull_requests
+            .set_items(vec![make_pr(1, "OPEN"), make_pr(2, "OPEN")]);
+
+        app.update(Msg::Key(key(KeyCode::Char('/'))));
+        assert!(app.search_editing);
+
+        for ch in "PR 2".chars() {
+            app.update(Msg::Key(key(KeyCode::Char(ch))));
+        }
+        assert_eq!(app.pull_requests.matches.len(), 1);
+        assert_eq!(app.pull_requests.selected().map(|pr| pr.id), Some(2));
+
+        app.update(Msg::Key(key(KeyCode::Enter)));
+        assert!(!app.search_editing);
+        assert_eq!(app.pull_requests.filter, "PR 2");
+        // Enter 確定後もフィルタは維持される。
+        assert_eq!(app.pull_requests.matches.len(), 1);
+    }
+
+    #[test]
+    fn esc_during_search_clears_filter_and_restores_full_list() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        app.repositories.set_items(vec![
+            make_repo("acme/foo", None),
+            make_repo("acme/bar", None),
+        ]);
+
+        app.update(Msg::Key(key(KeyCode::Char('/'))));
+        app.update(Msg::Key(key(KeyCode::Char('f'))));
+        assert_eq!(app.repositories.matches.len(), 1);
+
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        assert!(!app.search_editing);
+        assert!(app.repositories.filter.is_empty());
+        assert_eq!(app.repositories.matches.len(), 2);
+    }
+
+    #[test]
+    fn backspace_during_search_removes_last_filter_char() {
+        let mut app = review_app();
+        app.screen = Screen::Workspaces;
+        app.workspaces.set_items(vec![
+            Workspace {
+                slug: "acme".to_string(),
+                name: None,
+                uuid: None,
+            },
+            Workspace {
+                slug: "other".to_string(),
+                name: None,
+                uuid: None,
+            },
+        ]);
+        app.update(Msg::Key(key(KeyCode::Char('/'))));
+        app.update(Msg::Key(key(KeyCode::Char('a'))));
+        app.update(Msg::Key(key(KeyCode::Char('c'))));
+        assert_eq!(app.workspaces.filter, "ac");
+        app.update(Msg::Key(key(KeyCode::Backspace)));
+        assert_eq!(app.workspaces.filter, "a");
+    }
+
+    // ---- ソート（#1） ----
+
+    #[test]
+    fn cycle_repositories_sort_reorders_and_returns_to_fetched() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        app.update(Msg::RepositoriesLoaded {
+            workspace: "acme".to_string(),
+            repos: vec![make_repo("acme/zeta", None), make_repo("acme/alpha", None)],
+        });
+        assert_eq!(app.repositories_sort, SortMode::Fetched);
+        assert_eq!(app.repositories.items[0].name, "zeta");
+
+        app.update(Msg::Key(key(KeyCode::Char('S'))));
+        assert_eq!(app.repositories_sort, SortMode::NameAsc);
+        assert_eq!(app.repositories.items[0].name, "alpha");
+
+        app.update(Msg::Key(key(KeyCode::Char('S')))); // UpdatedDesc
+        app.update(Msg::Key(key(KeyCode::Char('S')))); // UsageDesc
+        app.update(Msg::Key(key(KeyCode::Char('S')))); // 取得順(Fetched)に戻る
+        assert_eq!(app.repositories_sort, SortMode::Fetched);
+        assert_eq!(app.repositories.items[0].name, "zeta");
+    }
+
+    #[test]
+    fn cycle_pull_requests_sort_orders_by_title() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.update(Msg::PullRequestsLoaded {
+            repo: "widget".to_string(),
+            filter: PrStateFilter::Open,
+            prs: vec![make_pr(9, "OPEN"), make_pr(2, "OPEN")],
+        });
+        // タイトルは "PR {id}" なので文字列としては "PR 2" < "PR 9"。
+        app.update(Msg::Key(key(KeyCode::Char('S'))));
+        assert_eq!(app.pull_requests_sort, SortMode::NameAsc);
+        assert_eq!(app.pull_requests.items[0].id, 2);
+    }
+
+    #[test]
+    fn select_repo_increments_usage_and_usage_desc_sort_reflects_it() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        app.update(Msg::RepositoriesLoaded {
+            workspace: "acme".to_string(),
+            repos: vec![make_repo("acme/foo", None), make_repo("acme/bar", None)],
+        });
+
+        // "bar" を 2 回選択して使用回数を稼ぐ。
+        app.repositories.state.select(Some(1));
+        app.update(Msg::Key(key(KeyCode::Enter)));
+        app.screen = Screen::Repositories;
+        app.repositories.state.select(Some(1));
+        app.update(Msg::Key(key(KeyCode::Enter)));
+
+        assert_eq!(app.config.usage.get("acme/bar").copied(), Some(2));
+
+        app.screen = Screen::Repositories;
+        app.update(Msg::Key(key(KeyCode::Char('S')))); // NameAsc
+        app.update(Msg::Key(key(KeyCode::Char('S')))); // UpdatedDesc
+        app.update(Msg::Key(key(KeyCode::Char('S')))); // UsageDesc
+        assert_eq!(app.repositories_sort, SortMode::UsageDesc);
+        assert_eq!(app.repositories.items[0].full_name, "acme/bar");
+    }
+
+    #[test]
+    fn pull_requests_usage_desc_sort_is_a_passthrough_of_fetched_order() {
+        // PR には使用頻度の概念が無いため、UsageDesc は取得順のパススルーになる（設計判断）。
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.update(Msg::PullRequestsLoaded {
+            repo: "widget".to_string(),
+            filter: PrStateFilter::Open,
+            prs: vec![make_pr(9, "OPEN"), make_pr(2, "OPEN")],
+        });
+        app.update(Msg::Key(key(KeyCode::Char('S')))); // NameAsc
+        app.update(Msg::Key(key(KeyCode::Char('S')))); // UpdatedDesc
+        app.update(Msg::Key(key(KeyCode::Char('S')))); // UsageDesc
+        assert_eq!(app.pull_requests_sort, SortMode::UsageDesc);
+        assert_eq!(app.pull_requests.items[0].id, 9);
+        assert_eq!(app.pull_requests.items[1].id, 2);
+    }
+
+    // ---- ジャンプパレット（#2） ----
+
+    #[test]
+    fn ctrl_k_opens_jump_palette_from_any_authenticated_screen() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        let cmd = app.update(Msg::Key(ctrl(KeyCode::Char('k'))));
+        assert!(matches!(cmd, Command::None));
+        assert!(app.jump_palette.is_some());
+    }
+
+    #[test]
+    fn ctrl_k_does_not_open_on_onboarding_screen() {
+        let mut app = app();
+        assert_eq!(app.screen, Screen::Onboarding);
+        app.update(Msg::Key(ctrl(KeyCode::Char('k'))));
+        assert!(app.jump_palette.is_none());
+    }
+
+    #[test]
+    fn ctrl_k_does_not_open_while_another_modal_or_search_is_active() {
+        let mut comment_editor_app = review_app();
+        comment_editor_app.screen = Screen::PullRequestDetail;
+        comment_editor_app.comment_editor = Some(CommentEditor::default());
+        comment_editor_app.update(Msg::Key(ctrl(KeyCode::Char('k'))));
+        assert!(comment_editor_app.jump_palette.is_none());
+
+        let mut search_app = review_app();
+        search_app.screen = Screen::PullRequests;
+        search_app.update(Msg::Key(key(KeyCode::Char('/'))));
+        search_app.update(Msg::Key(ctrl(KeyCode::Char('k'))));
+        assert!(search_app.jump_palette.is_none());
+        assert!(search_app.search_editing);
+    }
+
+    #[test]
+    fn jump_palette_esc_closes_without_navigating() {
+        let mut app = review_app();
+        app.screen = Screen::Workspaces;
+        app.update(Msg::Key(ctrl(KeyCode::Char('k'))));
+        assert!(app.jump_palette.is_some());
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        assert!(app.jump_palette.is_none());
+        assert_eq!(app.screen, Screen::Workspaces);
+    }
+
+    #[test]
+    fn jump_palette_typing_narrows_candidates() {
+        let mut app = review_app();
+        app.workspaces.set_items(vec![
+            Workspace {
+                slug: "acme".to_string(),
+                name: Some("Acme".to_string()),
+                uuid: None,
+            },
+            Workspace {
+                slug: "other".to_string(),
+                name: None,
+                uuid: None,
+            },
+        ]);
+        app.screen = Screen::Workspaces;
+        app.update(Msg::Key(ctrl(KeyCode::Char('k'))));
+        for ch in "other".chars() {
+            app.update(Msg::Key(key(KeyCode::Char(ch))));
+        }
+        let palette = app.jump_palette.as_ref().expect("palette open");
+        assert!(!palette.entries.matches.is_empty());
+        assert!(
+            palette
+                .entries
+                .visible()
+                .all(|entry| entry.label.to_lowercase().contains("other"))
+        );
+    }
+
+    #[test]
+    fn jump_palette_backspace_widens_candidates_again() {
+        let mut app = review_app();
+        app.screen = Screen::Workspaces;
+        app.update(Msg::Key(ctrl(KeyCode::Char('k'))));
+        app.update(Msg::Key(key(KeyCode::Char('z'))));
+        app.update(Msg::Key(key(KeyCode::Char('z'))));
+        let narrowed = app
+            .jump_palette
+            .as_ref()
+            .expect("open")
+            .entries
+            .matches
+            .len();
+        app.update(Msg::Key(key(KeyCode::Backspace)));
+        app.update(Msg::Key(key(KeyCode::Backspace)));
+        let widened = app
+            .jump_palette
+            .as_ref()
+            .expect("open")
+            .entries
+            .matches
+            .len();
+        assert!(widened >= narrowed);
+    }
+
+    #[test]
+    fn jump_palette_screen_entries_depend_on_navigation_state() {
+        let mut app = app();
+        app.client = Some(client());
+        app.screen = Screen::Workspaces;
+        app.update(Msg::Key(ctrl(KeyCode::Char('k'))));
+        let palette = app.jump_palette.as_ref().expect("open");
+        assert!(
+            !palette
+                .entries
+                .items
+                .iter()
+                .any(|entry| matches!(entry.action, JumpAction::Screen(Screen::Repositories)))
+        );
+        app.update(Msg::Key(key(KeyCode::Esc)));
+
+        app.selected_workspace = Some("acme".to_string());
+        app.selected_repo = Some("acme/widget".to_string());
+        app.update(Msg::Key(ctrl(KeyCode::Char('k'))));
+        let palette = app.jump_palette.as_ref().expect("open");
+        assert!(
+            palette
+                .entries
+                .items
+                .iter()
+                .any(|entry| matches!(entry.action, JumpAction::Screen(Screen::Repositories)))
+        );
+        assert!(
+            palette
+                .entries
+                .items
+                .iter()
+                .any(|entry| matches!(entry.action, JumpAction::Screen(Screen::PullRequests)))
+        );
+    }
+
+    #[test]
+    fn jump_palette_enter_on_screen_entry_switches_screen_only() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.update(Msg::Key(ctrl(KeyCode::Char('k'))));
+        // 先頭候補は常に「ワークスペース一覧へ」。
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+        assert!(app.jump_palette.is_none());
+        assert_eq!(app.screen, Screen::Workspaces);
+        assert!(matches!(cmd, Command::None));
+    }
+
+    #[test]
+    fn jump_palette_enter_on_workspace_entry_calls_jump_to_workspace() {
+        let mut app = app();
+        app.client = Some(client());
+        app.workspaces.set_items(vec![Workspace {
+            slug: "acme".to_string(),
+            name: None,
+            uuid: None,
+        }]);
+        app.screen = Screen::Workspaces;
+        app.update(Msg::Key(ctrl(KeyCode::Char('k'))));
+        for ch in "acme".chars() {
+            app.update(Msg::Key(key(KeyCode::Char(ch))));
+        }
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+        assert!(app.jump_palette.is_none());
+        assert_eq!(app.selected_workspace.as_deref(), Some("acme"));
+        assert_eq!(app.screen, Screen::Repositories);
+        match cmd {
+            Command::LoadRepositories { workspace, .. } => assert_eq!(workspace, "acme"),
+            other => panic!("expected LoadRepositories, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jump_palette_enter_on_repository_entry_calls_enter_repository() {
+        let mut app = review_app();
+        app.repositories
+            .set_items(vec![make_repo("acme/widget", None)]);
+        app.screen = Screen::Repositories;
+        app.update(Msg::Key(ctrl(KeyCode::Char('k'))));
+        for ch in "widget".chars() {
+            app.update(Msg::Key(key(KeyCode::Char(ch))));
+        }
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+        assert!(app.jump_palette.is_none());
+        assert_eq!(app.selected_repo.as_deref(), Some("acme/widget"));
+        assert_eq!(app.screen, Screen::PullRequests);
+        match cmd {
+            Command::LoadPullRequests { repo, .. } => assert_eq!(repo, "widget"),
+            other => panic!("expected LoadPullRequests, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opening_pr_detail_records_recent_pr() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.pull_requests.set_items(vec![make_pr(42, "OPEN")]);
+        app.update(Msg::Key(key(KeyCode::Enter)));
+        assert_eq!(app.recent_prs.len(), 1);
+        assert_eq!(app.recent_prs[0].pr.id, 42);
+        assert_eq!(app.recent_prs[0].repo_full_name, "acme/widget");
+    }
+
+    #[test]
+    fn jump_palette_enter_on_recent_pr_jumps_across_repositories() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.pull_requests.set_items(vec![make_pr(42, "OPEN")]);
+        app.update(Msg::Key(key(KeyCode::Enter)));
+        assert_eq!(app.screen, Screen::PullRequestDetail);
+
+        // 別のリポジトリへ移動したとみなす（PR #42 は元のリポジトリのまま）。
+        app.selected_repo = Some("acme/other".to_string());
+        app.current_pr = None;
+        app.screen = Screen::Repositories;
+
+        app.update(Msg::Key(ctrl(KeyCode::Char('k'))));
+        for ch in "42".chars() {
+            app.update(Msg::Key(key(KeyCode::Char(ch))));
+        }
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+
+        assert!(app.jump_palette.is_none());
+        assert_eq!(app.screen, Screen::PullRequestDetail);
+        assert_eq!(app.selected_repo.as_deref(), Some("acme/widget"));
+        assert_eq!(app.current_pr.as_ref().map(|pr| pr.id), Some(42));
+        match cmd {
+            Command::Batch(cmds) => {
+                assert_eq!(cmds.len(), 3);
+                assert!(matches!(cmds[0], Command::LoadPrDetail { id: 42, .. }));
+                assert!(matches!(cmds[1], Command::LoadDiffStat { id: 42, .. }));
+                assert!(matches!(cmds[2], Command::LoadComments { id: 42, .. }));
+            }
+            other => panic!("expected Batch, got {other:?}"),
+        }
     }
 }
