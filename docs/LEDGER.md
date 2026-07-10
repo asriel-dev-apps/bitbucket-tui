@@ -63,10 +63,8 @@
 - App Password は 2026-06-09〜07-27 ブラウンアウト、**2026-07-28 完全廃止**。新規は API token 一択。
 - ページングは `{ values, next, page, size, pagelen }` 形式。`next` URL を追跡。
 - ツールチェーン: `cargo 1.96.1` / edition 2024。cargo は PATH 外。**`rustup run stable cargo <sub>` は `cargo vendor`/`build` で `rustc` を見失い失敗する**。必ず toolchain bin を PATH 前置して直接呼ぶ: `export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"` → `cargo <sub> --offline`。
-- **vendored offline**: 全依存を `cargo vendor vendor` 済み、`.cargo/config.toml`(vendored-sources)配置。`cargo build/clippy/test/run --offline` が green。`vendor/`・`.cargo/config.toml` は `.gitignore`(再生成は `cargo vendor`)。**依存は凍結: `cargo add`/`update`/`vendor` はネットワーク不可**(feature 追加が要るときはメインが再 vendor する)。crates.io へはこのセッション/Codex とも到達不可。
-- codex CLI: `/opt/homebrew/bin/codex` に存在。
-- **Codex は git ワークスペース単位で書込み権限を持つ**。非git ディレクトリは隣接 git リポジトリ(muster等)の書込みルートにフォールバックし失敗する。→ プロジェクトを `git init` し、タスクは `codex-companion.mjs task --cwd <proj> --write` で起動する。`bitbucket-tui` は git 初期化済み。
-- **ネットワーク制約 → vendored で解決済み**: Codex サンドボックスも通常 Bash も crates.io 到達不可。`cargo vendor vendor` で全依存を vendor 化し、`.cargo/config.toml`(vendored-sources) を配置。以降 `cargo build/clippy/test --offline` が green。`vendor/` と `.cargo/config.toml` は `.gitignore` 済み(再生成は `cargo vendor`)。
+- **vendored offline**: 全依存を `cargo vendor vendor` 済み、`.cargo/config.toml`(vendored-sources)配置。`cargo build/clippy/test/run --offline` が green。`vendor/`・`.cargo/config.toml` は `.gitignore`(再生成は `cargo vendor`)。**依存は凍結: `cargo add`/`update`/`vendor` はネットワーク不可**(feature 追加が要るときは再 vendor が必要)。
+- **ネットワーク制約 → vendored で解決済み**: ビルド環境から crates.io へ到達できない。`cargo vendor vendor` で全依存を vendor 化し、`.cargo/config.toml`(vendored-sources) を配置。以降 `cargo build/clippy/test --offline` が green。`vendor/` と `.cargo/config.toml` は `.gitignore` 済み(再生成は `cargo vendor`)。
 - **cargo 呼び出し(重要)**: `rustup run stable cargo <sub>` は `cargo vendor` 等で `rustc` を見つけられず失敗する。**ツールチェーン bin を PATH 前置**して直接呼ぶこと: `export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"` → `cargo <sub> --offline`。
 - **crossterm はバージョン競合注意**: ratatui 0.29 は crossterm 0.28 を要求。直接依存も **0.28** に統一済み(0.29 だとバックエンド型不一致)。コード内では `ratatui::crossterm` 再エクスポートを使うこと。
 - 依存確定版(Cargo.lock): ratatui 0.29 / crossterm 0.28.1 / tokio 1.52 / reqwest 0.12.28(rustls-tls,json) / serde 1.0.228 / serde_json 1.0.150 / keyring 3.6.3 / directories 6.0 / toml 1.1 / anyhow 1.0 / thiserror 2.0 / tracing 0.1 / tracing-subscriber 0.3 / clap 4.6 / base64 0.22。**依存は凍結。`cargo add`/`update`/`vendor` はネットワーク不可のため実行禁止**。
