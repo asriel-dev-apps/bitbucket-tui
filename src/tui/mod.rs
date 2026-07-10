@@ -5,6 +5,7 @@ pub mod diff;
 pub mod event;
 pub mod logview;
 pub mod onboarding;
+pub mod theme;
 pub mod ui;
 
 use std::io::{self, Stdout};

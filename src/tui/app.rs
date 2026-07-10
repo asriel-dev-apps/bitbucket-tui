@@ -16,6 +16,7 @@ use crate::config::Config;
 use crate::tui::diff::{ParsedDiff, parse as parse_diff};
 use crate::tui::logview::LogView;
 use crate::tui::onboarding::{Field, OnboardingState, TextInput};
+use crate::tui::theme::{Theme, ThemeName};
 
 /// 画面種別。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -606,6 +607,10 @@ pub struct App {
     pub screen: Screen,
     pub config: Config,
     pub client: Option<BitbucketClient>,
+    /// 現在の配色テーマ（`ThemeName` から導出。`Ctrl+T` で巡回）。
+    pub theme: Theme,
+    /// 現在のテーマ名（`config.theme` の永続化・巡回の起点に使う）。
+    pub theme_name: ThemeName,
     pub me: Me,
     pub onboarding: OnboardingState,
     pub workspaces: SelectList<Workspace>,
@@ -674,10 +679,18 @@ impl App {
             display_name: config.display_name.clone(),
             ..Me::default()
         };
+        let theme_name = config
+            .theme
+            .as_deref()
+            .map(ThemeName::from_config_str)
+            .unwrap_or_default();
+        let theme = theme_name.theme();
         Self {
             screen: Screen::Onboarding,
             config,
             client,
+            theme,
+            theme_name,
             me,
             onboarding,
             workspaces: SelectList::default(),
@@ -1009,10 +1022,13 @@ impl App {
         Command::LoadWorkspaces { client }
     }
 
-    /// キー入力の処理。グローバルキー（Ctrl+C / ヘルプ / モーダル）を先に捌く。
+    /// キー入力の処理。グローバルキー（Ctrl+C / Ctrl+T / ヘルプ / モーダル）を先に捌く。
     fn on_key(&mut self, key: KeyEvent) -> Command {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Command::Quit;
+        }
+        if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return self.cycle_theme();
         }
 
         if self.show_help {
@@ -1048,6 +1064,25 @@ impl App {
             Screen::Source => self.on_key_source(key),
             Screen::FileView => self.on_key_file_view(key),
         }
+    }
+
+    /// テーマを次へ巡回する（`Ctrl+T`）。`config.toml` へ永続化し、Diff の着色済み行
+    /// キャッシュ（[`DiffState::rendered_lines`]）を無効化して次回描画で新テーマ色を
+    /// 再構築させる（無効化しないと旧テーマの色のまま表示され続ける）。
+    fn cycle_theme(&mut self) -> Command {
+        self.theme_name = self.theme_name.next();
+        self.theme = self.theme_name.theme();
+
+        if let Some(diff) = self.diff.as_mut() {
+            diff.rendered_lines = None;
+        }
+
+        self.config.theme = Some(self.theme_name.as_str().to_string());
+        if let Err(error) = self.config.save() {
+            // 設定保存の失敗は致命ではない（他の config 保存箇所と同じ方針）。
+            tracing::warn!(%error, "テーマ設定の保存に失敗しました");
+        }
+        Command::None
     }
 
     fn on_key_onboarding(&mut self, key: KeyEvent) -> Command {
@@ -2711,6 +2746,49 @@ mod tests {
             app.update(Msg::Key(ctrl(KeyCode::Char('c')))),
             Command::Quit
         ));
+    }
+
+    #[test]
+    fn ctrl_t_cycles_theme_and_persists_name() {
+        let mut app = app();
+        assert_eq!(app.theme_name, ThemeName::CatppuccinMocha);
+        app.update(Msg::Key(ctrl(KeyCode::Char('t'))));
+        assert_eq!(app.theme_name, ThemeName::CatppuccinMocha.next());
+        assert_eq!(app.theme, app.theme_name.theme());
+        assert_eq!(app.config.theme.as_deref(), Some(app.theme_name.as_str()));
+    }
+
+    #[test]
+    fn ctrl_t_cycles_theme_globally_even_while_help_is_shown() {
+        let mut app = app();
+        app.show_help = true;
+        app.update(Msg::Key(ctrl(KeyCode::Char('t'))));
+        assert_eq!(app.theme_name, ThemeName::CatppuccinMocha.next());
+        // グローバルキーとして扱うため、ヘルプの開閉状態には影響しない。
+        assert!(app.show_help);
+    }
+
+    #[test]
+    fn ctrl_t_invalidates_diff_rendered_line_cache() {
+        let mut app = app();
+        app.diff = Some(DiffState {
+            parsed: parse_diff(" context\n"),
+            scroll: 0,
+            viewport: 0,
+            title: "#1".to_string(),
+            rendered_lines: Some(Vec::new()),
+        });
+
+        app.update(Msg::Key(ctrl(KeyCode::Char('t'))));
+
+        assert!(
+            app.diff
+                .as_ref()
+                .expect("diff は保持されたまま")
+                .rendered_lines
+                .is_none(),
+            "テーマ切替後は着色済み行キャッシュを無効化するべき"
+        );
     }
 
     #[test]

@@ -21,6 +21,10 @@ pub struct Config {
     /// 既定のワークスペース slug。任意。
     #[serde(default)]
     pub default_workspace: Option<String>,
+    /// 選択中のテーマ名（[`crate::tui::theme::ThemeName::as_str`] の値）。任意。
+    /// 未設定/未知の値は既定テーマ（Catppuccin Mocha）にフォールバックする。
+    #[serde(default)]
+    pub theme: Option<String>,
 }
 
 /// このアプリの `ProjectDirs` を返す。

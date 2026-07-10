@@ -1,10 +1,8 @@
-//! ユニファイド diff のパースと着色。
+//! ユニファイド diff のパース（行種別の分類のみ）。
 //!
-//! syntect 等の追加クレートを使わず、行頭の記号で種別を判定して手動着色する
-//! （`+`=緑 / `-`=赤 / `@@`=シアン / ファイルヘッダ=黄 / メタ=淡色 / それ以外=既定）。
-//! ratatui への変換は `ui` 側が [`DiffLineKind::color`] を使って行う。
-
-use ratatui::style::Color;
+//! syntect 等の追加クレートを使わず、行頭の記号で種別を判定する。**色の決定は行わない**
+//! （`Color` への変換・テーマ適用は `ui` 側の責務。`tui::app::DiffState` の「状態層は
+//! `Color::` を含まない」という分離を保つため、本モジュールも `ratatui::style` に依存しない）。
 
 /// diff の 1 行の種別。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,18 +41,6 @@ impl DiffLineKind {
             DiffLineKind::Meta
         } else {
             DiffLineKind::Context
-        }
-    }
-
-    /// 種別に対応する前景色。`Context` は既定色（`Reset`）。
-    pub fn color(self) -> Color {
-        match self {
-            DiffLineKind::FileHeader => Color::Yellow,
-            DiffLineKind::Hunk => Color::Cyan,
-            DiffLineKind::Added => Color::Green,
-            DiffLineKind::Removed => Color::Red,
-            DiffLineKind::Meta => Color::DarkGray,
-            DiffLineKind::Context => Color::Reset,
         }
     }
 }
@@ -158,15 +144,6 @@ mod tests {
             DiffLineKind::classify("\\ No newline at end of file"),
             DiffLineKind::Meta
         );
-    }
-
-    #[test]
-    fn colors_map_to_expected() {
-        assert_eq!(DiffLineKind::Added.color(), Color::Green);
-        assert_eq!(DiffLineKind::Removed.color(), Color::Red);
-        assert_eq!(DiffLineKind::Hunk.color(), Color::Cyan);
-        assert_eq!(DiffLineKind::FileHeader.color(), Color::Yellow);
-        assert_eq!(DiffLineKind::Context.color(), Color::Reset);
     }
 
     #[test]

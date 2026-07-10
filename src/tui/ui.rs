@@ -3,12 +3,17 @@
 //! レイアウトは「ヘッダ / 本文 / ステータス行 / キーヒント行」の 4 段構成。ヘルプ・merge 確認
 //! モーダル・コメントエディタはオーバーレイ（ポップアップ）で表示する。TUI 実行中に
 //! stdout/stderr へ出さないため、ここでの出力はすべて ratatui のバッファ経由。
+//!
+//! 色は一切ハードコードしない。すべて [`Theme`]（意味役割ベースの配色）経由で決める
+//! （`&App`/`&mut App` を受け取る関数は `app.theme` を、純粋関数は `theme: &Theme` 引数を使う）。
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Clear, HighlightSpacing, List, ListItem, Padding, Paragraph, Wrap,
+};
 
 use crate::api::{
     Branch, Comment, Commit, DiffStatEntry, MergeStrategy, Pipeline, PipelineStatus, PipelineStep,
@@ -19,6 +24,7 @@ use crate::tui::app::{
 };
 use crate::tui::diff::DiffLineKind;
 use crate::tui::onboarding::Field;
+use crate::tui::theme::Theme;
 
 /// API token 発行に関する常時ヒント。
 const TOKEN_HINT: &str = "API token は Atlassian アカウント設定 > Security の「Create API token with scopes」で発行。必要スコープ: read:user:bitbucket, read:workspace:bitbucket, read:repository:bitbucket, read:pullrequest:bitbucket, write:pullrequest:bitbucket, read:pipeline:bitbucket, write:pipeline:bitbucket";
@@ -33,7 +39,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     ])
     .split(frame.area());
 
-    render_header(frame, chunks[0], app.screen);
+    render_header(frame, chunks[0], app.screen, &app.theme);
 
     match app.screen {
         Screen::Onboarding => render_onboarding(frame, chunks[1], app),
@@ -52,21 +58,21 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Screen::FileView => render_file_view(frame, chunks[1], app),
     }
 
-    render_status(frame, chunks[2], &app.status);
-    render_hints(frame, chunks[3], app.screen);
+    render_status(frame, chunks[2], &app.status, &app.theme);
+    render_hints(frame, chunks[3], app.screen, &app.theme);
 
     // オーバーレイ（優先度: コメント/merge/確認モーダル → ヘルプ）。
     if let Some(editor) = &app.comment_editor {
-        render_comment_editor(frame, editor);
+        render_comment_editor(frame, editor, &app.theme);
     }
     if let Some(modal) = &app.merge_modal {
-        render_merge_modal(frame, modal, app.current_pr.as_ref());
+        render_merge_modal(frame, modal, app.current_pr.as_ref(), &app.theme);
     }
     if let Some(modal) = &app.confirm_modal {
-        render_confirm_modal(frame, modal);
+        render_confirm_modal(frame, modal, &app.theme);
     }
     if app.show_help {
-        render_help(frame, app.screen);
+        render_help(frame, app.screen, &app.theme);
     }
 }
 
@@ -89,11 +95,37 @@ fn screen_title(screen: Screen) -> &'static str {
     }
 }
 
-fn render_header(frame: &mut Frame, area: Rect, screen: Screen) {
+/// 角丸枠 + 左右パディングを持つ Block を作る（テーマの `title_style` 込み）。
+///
+/// `border_color` は呼び出し側が意味役割（`theme.border` / `theme.border_focus` /
+/// `theme.danger` 等）から選ぶ。タイトルは常に `theme.accent` で着色する。
+fn rounded_block<'a>(theme: &Theme, border_color: Color) -> Block<'a> {
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(border_color))
+        .title_style(Style::new().fg(theme.accent))
+        .padding(Padding::horizontal(1))
+}
+
+/// 通常ペイン用の Block。複数ペイン画面ではキー操作が向く側（インタラクティブな一覧）を
+/// `focused = true`、付随する静的な表示ペイン（本文・コメント等）を `false` にする。
+/// 単一ペイン画面（一覧のみ・スクロール本文のみ 等）は常に `true` でよい。
+fn themed_block<'a>(theme: &Theme, focused: bool) -> Block<'a> {
+    rounded_block(
+        theme,
+        if focused {
+            theme.border_focus
+        } else {
+            theme.border
+        },
+    )
+}
+
+fn render_header(frame: &mut Frame, area: Rect, screen: Screen, theme: &Theme) {
     let line = Line::from(vec![
         Span::styled(
             " bitbucket-tui ",
-            Style::new().fg(Color::Black).bg(Color::Cyan).bold(),
+            Style::new().fg(theme.bg).bg(theme.accent).bold(),
         ),
         Span::raw(" "),
         Span::styled(
@@ -105,6 +137,7 @@ fn render_header(frame: &mut Frame, area: Rect, screen: Screen) {
 }
 
 fn render_onboarding(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
     let active = app.onboarding.field.0;
 
     // email は実文字、token は文字数ぶんの `•` でマスク。カーソルは各フィールドが保持する。
@@ -125,21 +158,21 @@ fn render_onboarding(frame: &mut Frame, area: Rect, app: &App) {
     );
 
     let mut lines = vec![
-        field_line("Email", email_spans, active == Field::Email),
-        field_line("Token", token_spans, active == Field::Token),
+        field_line("Email", email_spans, active == Field::Email, theme),
+        field_line("Token", token_spans, active == Field::Token, theme),
         Line::raw(""),
     ];
 
     if app.onboarding.validating {
         lines.push(Line::from(Span::styled(
             "検証中… (GET /2.0/user)",
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(theme.warning),
         )));
     }
     if let Some(error) = &app.onboarding.error {
         lines.push(Line::from(Span::styled(
             format!("エラー: {error}"),
-            Style::new().fg(Color::Red).bold(),
+            Style::new().fg(theme.danger).bold(),
         )));
     }
 
@@ -150,22 +183,27 @@ fn render_onboarding(frame: &mut Frame, area: Rect, app: &App) {
         Style::new().dim(),
     )));
 
-    let block = Block::default().borders(Borders::ALL).title(" ようこそ ");
+    let block = themed_block(theme, true).title(" ようこそ ");
     let paragraph = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
-fn field_line<'a>(label: &'a str, value_spans: Vec<Span<'a>>, active: bool) -> Line<'a> {
+fn field_line<'a>(
+    label: &'a str,
+    value_spans: Vec<Span<'a>>,
+    active: bool,
+    theme: &Theme,
+) -> Line<'a> {
     let marker = if active { "▶ " } else { "  " };
     let label_style = if active {
-        Style::new().fg(Color::Cyan).bold()
+        Style::new().fg(theme.accent).bold()
     } else {
         Style::new()
     };
     let mut spans = vec![
-        Span::styled(marker, Style::new().fg(Color::Cyan)),
+        Span::styled(marker, Style::new().fg(theme.accent)),
         Span::styled(format!("{label:<6}: "), label_style),
     ];
     spans.extend(value_spans);
@@ -212,12 +250,14 @@ fn input_spans<'a>(
 }
 
 fn render_workspaces(frame: &mut Frame, area: Rect, app: &mut App) {
+    let theme = app.theme;
     if app.workspaces.items.is_empty() {
         render_placeholder(
             frame,
             area,
             &app.status,
             "参加しているワークスペースがありません",
+            &theme,
         );
         return;
     }
@@ -233,13 +273,14 @@ fn render_workspaces(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
     let title = format!(" ワークスペース ({}) ", app.workspaces.items.len());
-    let list = list_widget(items, title);
+    let list = list_widget(&theme, items, title);
     frame.render_stateful_widget(list, area, &mut app.workspaces.state);
 }
 
 fn render_repositories(frame: &mut Frame, area: Rect, app: &mut App) {
+    let theme = app.theme;
     if app.repositories.items.is_empty() {
-        render_placeholder(frame, area, &app.status, "リポジトリがありません");
+        render_placeholder(frame, area, &app.status, "リポジトリがありません", &theme);
         return;
     }
     let items: Vec<ListItem> = app
@@ -249,9 +290,9 @@ fn render_repositories(frame: &mut Frame, area: Rect, app: &mut App) {
         .map(|repo| {
             let visibility = if repo.is_private { "private" } else { "public" };
             let visibility_style = if repo.is_private {
-                Style::new().fg(Color::Magenta)
+                Style::new().fg(theme.accent)
             } else {
-                Style::new().fg(Color::Green)
+                Style::new().fg(theme.success)
             };
             let updated = repo
                 .updated_on
@@ -267,11 +308,12 @@ fn render_repositories(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
     let title = format!(" リポジトリ ({}) ", app.repositories.items.len());
-    let list = list_widget(items, title);
+    let list = list_widget(&theme, items, title);
     frame.render_stateful_widget(list, area, &mut app.repositories.state);
 }
 
 fn render_pull_requests(frame: &mut Frame, area: Rect, app: &mut App) {
+    let theme = app.theme;
     let filter = app.pr_state_filter.label();
     if app.pull_requests.items.is_empty() {
         render_placeholder(
@@ -279,6 +321,7 @@ fn render_pull_requests(frame: &mut Frame, area: Rect, app: &mut App) {
             area,
             &app.status,
             &format!("{filter} の PR がありません"),
+            &theme,
         );
         return;
     }
@@ -286,14 +329,14 @@ fn render_pull_requests(frame: &mut Frame, area: Rect, app: &mut App) {
         .pull_requests
         .items
         .iter()
-        .map(|pr| ListItem::new(pull_request_row(pr)))
+        .map(|pr| ListItem::new(pull_request_row(pr, &theme)))
         .collect();
     let title = format!(" PR [{}] ({}) ", filter, app.pull_requests.items.len());
-    let list = list_widget(items, title);
+    let list = list_widget(&theme, items, title);
     frame.render_stateful_widget(list, area, &mut app.pull_requests.state);
 }
 
-fn pull_request_row(pr: &PullRequest) -> Line<'static> {
+fn pull_request_row(pr: &PullRequest, theme: &Theme) -> Line<'static> {
     let title: String = pr.title_str().chars().take(48).collect();
     let updated = pr
         .updated_on
@@ -301,36 +344,39 @@ fn pull_request_row(pr: &PullRequest) -> Line<'static> {
         .map(|value| value.chars().take(10).collect::<String>())
         .unwrap_or_default();
     Line::from(vec![
-        Span::styled(format!("#{:<5}", pr.id), Style::new().fg(Color::Yellow)),
+        Span::styled(format!("#{:<5}", pr.id), Style::new().fg(theme.warning)),
         Span::styled(
             format!("{:<9}", pr.state_str()),
-            state_style(pr.state_str()),
+            state_style(pr.state_str(), theme),
         ),
         Span::raw(title),
         Span::styled(
             format!("  {}", pr.author_name()),
-            Style::new().fg(Color::Blue),
+            Style::new().fg(theme.info),
         ),
         Span::styled(format!("  {updated}"), Style::new().dim()),
         Span::styled(
             format!("  ✔{}/{}", pr.approved_count(), pr.reviewer_count()),
-            Style::new().fg(Color::Green),
+            Style::new().fg(theme.success),
         ),
     ])
 }
 
-fn state_style(state: &str) -> Style {
+/// PR の `state` に対応する前景色。OPEN=成功 / MERGED=強調 / DECLINED=危険 /
+/// SUPERSEDED・不明=補助色。
+fn state_style(state: &str, theme: &Theme) -> Style {
     let color = match state {
-        "OPEN" => Color::Green,
-        "MERGED" => Color::Magenta,
-        "DECLINED" => Color::Red,
-        "SUPERSEDED" => Color::DarkGray,
-        _ => Color::Gray,
+        "OPEN" => theme.success,
+        "MERGED" => theme.accent,
+        "DECLINED" => theme.danger,
+        "SUPERSEDED" => theme.muted,
+        _ => theme.muted,
     };
     Style::new().fg(color)
 }
 
 fn render_pull_request_detail(frame: &mut Frame, area: Rect, app: &mut App) {
+    let theme = app.theme;
     let rows =
         Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).split(area);
 
@@ -340,22 +386,28 @@ fn render_pull_request_detail(frame: &mut Frame, area: Rect, app: &mut App) {
     app.clamp_detail_scroll();
 
     match app.current_pr.as_ref() {
-        Some(pr) => render_pr_meta_body(frame, rows[0], pr, app.detail_scroll),
-        None => render_placeholder(frame, rows[0], &app.status, "PR を選択してください"),
+        Some(pr) => render_pr_meta_body(frame, rows[0], pr, app.detail_scroll, &theme),
+        None => render_placeholder(frame, rows[0], &app.status, "PR を選択してください", &theme),
     }
 
     let bottom =
         Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(rows[1]);
-    render_diffstat_list(frame, bottom[0], &mut app.diffstat);
-    render_comments(frame, bottom[1], &app.comments);
+    render_diffstat_list(frame, bottom[0], &mut app.diffstat, &theme);
+    render_comments(frame, bottom[1], &app.comments, &theme);
 }
 
-fn render_pr_meta_body(frame: &mut Frame, area: Rect, pr: &PullRequest, scroll: u16) {
+fn render_pr_meta_body(
+    frame: &mut Frame,
+    area: Rect,
+    pr: &PullRequest,
+    scroll: u16,
+    theme: &Theme,
+) {
     let mut lines = vec![
         Line::from(vec![
             Span::styled(
                 format!("#{} ", pr.id),
-                Style::new().fg(Color::Yellow).bold(),
+                Style::new().fg(theme.warning).bold(),
             ),
             Span::styled(
                 pr.title_str().to_string(),
@@ -365,11 +417,11 @@ fn render_pr_meta_body(frame: &mut Frame, area: Rect, pr: &PullRequest, scroll: 
         Line::from(vec![
             Span::styled(
                 format!("{:<9}", pr.state_str()),
-                state_style(pr.state_str()),
+                state_style(pr.state_str(), theme),
             ),
             Span::styled(
                 format!("{} → {}", pr.source_branch(), pr.destination_branch()),
-                Style::new().fg(Color::Cyan),
+                Style::new().fg(theme.info),
             ),
         ]),
         Line::from(vec![
@@ -398,18 +450,23 @@ fn render_pr_meta_body(frame: &mut Frame, area: Rect, pr: &PullRequest, scroll: 
         None => lines.push(Line::from(Span::styled("（本文なし）", Style::new().dim()))),
     }
 
+    // 複数ペイン画面: 本文は静的な表示ペインなので非フォーカス（下の変更ファイル一覧が
+    // インタラクティブな主ペイン）。
     let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" 概要 "))
+        .block(themed_block(theme, false).title(" 概要 "))
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     frame.render_widget(paragraph, area);
 }
 
-fn render_diffstat_list(frame: &mut Frame, area: Rect, diffstat: &mut SelectList<DiffStatEntry>) {
+fn render_diffstat_list(
+    frame: &mut Frame,
+    area: Rect,
+    diffstat: &mut SelectList<DiffStatEntry>,
+    theme: &Theme,
+) {
     if diffstat.items.is_empty() {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" 変更ファイル ");
+        let block = themed_block(theme, true).title(" 変更ファイル ");
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "（差分情報なし）",
@@ -426,7 +483,7 @@ fn render_diffstat_list(frame: &mut Frame, area: Rect, diffstat: &mut SelectList
         .map(|entry| {
             let status = entry.status_str();
             ListItem::new(Line::from(vec![
-                Span::styled(format!("{status:<9}"), diffstat_status_style(status)),
+                Span::styled(format!("{status:<9}"), diffstat_status_style(status, theme)),
                 Span::raw(entry.path().to_string()),
                 Span::styled(
                     format!(
@@ -440,24 +497,26 @@ fn render_diffstat_list(frame: &mut Frame, area: Rect, diffstat: &mut SelectList
         })
         .collect();
     let title = format!(" 変更ファイル ({}) ", diffstat.items.len());
-    let list = list_widget(items, title);
+    let list = list_widget(theme, items, title);
     frame.render_stateful_widget(list, area, &mut diffstat.state);
 }
 
-fn diffstat_status_style(status: &str) -> Style {
+/// diffstat の `status` に対応する前景色。
+fn diffstat_status_style(status: &str, theme: &Theme) -> Style {
     let color = match status {
-        "added" => Color::Green,
-        "removed" => Color::Red,
-        "renamed" => Color::Yellow,
-        "modified" => Color::Cyan,
-        _ => Color::Gray,
+        "added" => theme.success,
+        "removed" => theme.danger,
+        "renamed" => theme.warning,
+        "modified" => theme.info,
+        _ => theme.muted,
     };
     Style::new().fg(color)
 }
 
-fn render_comments(frame: &mut Frame, area: Rect, comments: &[Comment]) {
+fn render_comments(frame: &mut Frame, area: Rect, comments: &[Comment], theme: &Theme) {
     let title = format!(" コメント ({}) ", comments.len());
-    let block = Block::default().borders(Borders::ALL).title(title);
+    // 静的な表示ペイン（スクロール等の操作を持たない）なので非フォーカス。
+    let block = themed_block(theme, false).title(title);
     if comments.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -473,7 +532,7 @@ fn render_comments(frame: &mut Frame, area: Rect, comments: &[Comment]) {
     for comment in comments {
         let mut header = vec![Span::styled(
             comment.author_name().to_string(),
-            Style::new().fg(Color::Cyan).bold(),
+            Style::new().fg(theme.accent).bold(),
         )];
         if let Some(created) = comment.created_on.as_deref() {
             header.push(Span::styled(
@@ -484,7 +543,7 @@ fn render_comments(frame: &mut Frame, area: Rect, comments: &[Comment]) {
         if let Some(anchor) = comment_inline_anchor(comment) {
             header.push(Span::styled(
                 format!(" @ {anchor}"),
-                Style::new().fg(Color::Yellow),
+                Style::new().fg(theme.warning),
             ));
         }
         lines.push(Line::from(header));
@@ -512,12 +571,13 @@ fn comment_inline_anchor(comment: &Comment) -> Option<String> {
 }
 
 fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
+    let theme = app.theme;
     if app.diff.as_ref().is_none_or(|diff| diff.parsed.is_empty()) {
-        render_placeholder(frame, area, &app.status, "差分がありません");
+        render_placeholder(frame, area, &app.status, "差分がありません", &theme);
         return;
     }
     let Some(diff) = app.diff.as_mut() else {
-        render_placeholder(frame, area, &app.status, "差分がありません");
+        render_placeholder(frame, area, &app.status, "差分がありません", &theme);
         return;
     };
     // 枠線ぶんを差し引いたビューポート高さを保持（スクロール上限計算に使う）。
@@ -528,7 +588,7 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
         diff.scroll = max_scroll;
     }
 
-    render_diff_body(frame, area, diff);
+    render_diff_body(frame, area, diff, &theme);
 }
 
 /// 差分の可視範囲 `[start, end)` を計算する。
@@ -541,16 +601,22 @@ fn diff_visible_range(scroll: usize, viewport: usize, len: usize) -> (usize, usi
     (start, end)
 }
 
-fn render_diff_body(frame: &mut Frame, area: Rect, diff: &mut DiffState) {
-    // 着色済み行は diff ロード時（新しい `DiffState`）ごとに一度だけ構築し、以降は使い回す。
-    // 毎フレーム全行を `Span::styled` で作り直すと diff が大きいほど描画コストが線形に増える。
+fn render_diff_body(frame: &mut Frame, area: Rect, diff: &mut DiffState, theme: &Theme) {
+    // 着色済み行は diff ロード時（新しい `DiffState`）ごと・テーマ切替ごとに一度だけ構築し、
+    // 以降は使い回す。毎フレーム全行を `Span::styled` で作り直すと diff が大きいほど描画
+    // コストが線形に増える（テーマ切替時のキャッシュ無効化は `App::cycle_theme` が行う）。
     let total = diff.parsed.len();
     let title = format!(" diff {} ({total} 行) ", diff.title);
     let lines = diff.rendered_lines.get_or_insert_with(|| {
         diff.parsed
             .lines
             .iter()
-            .map(|line| Line::from(Span::styled(line.text.clone(), diff_line_style(line.kind))))
+            .map(|line| {
+                Line::from(Span::styled(
+                    line.text.clone(),
+                    diff_line_style(theme, line.kind),
+                ))
+            })
             .collect()
     });
 
@@ -559,13 +625,27 @@ fn render_diff_body(frame: &mut Frame, area: Rect, diff: &mut DiffState) {
     let (start, end) = diff_visible_range(diff.scroll, diff.viewport, lines.len());
     let visible: Vec<Line> = lines[start..end].to_vec();
 
-    let paragraph =
-        Paragraph::new(visible).block(Block::default().borders(Borders::ALL).title(title));
+    let paragraph = Paragraph::new(visible).block(themed_block(theme, true).title(title));
     frame.render_widget(paragraph, area);
 }
 
-fn diff_line_style(kind: DiffLineKind) -> Style {
-    let base = Style::new().fg(kind.color());
+/// diff の行種別に対応する前景色（テーマの意味役割へマッピング）。
+///
+/// `+`=成功色 / `-`=危険色 / `@@`=補足色 / ファイルヘッダ=警告色 / メタ=補助色 /
+/// 文脈行=通常前景色。
+fn diff_line_color(theme: &Theme, kind: DiffLineKind) -> Color {
+    match kind {
+        DiffLineKind::FileHeader => theme.warning,
+        DiffLineKind::Hunk => theme.info,
+        DiffLineKind::Added => theme.success,
+        DiffLineKind::Removed => theme.danger,
+        DiffLineKind::Meta => theme.muted,
+        DiffLineKind::Context => theme.fg,
+    }
+}
+
+fn diff_line_style(theme: &Theme, kind: DiffLineKind) -> Style {
+    let base = Style::new().fg(diff_line_color(theme, kind));
     match kind {
         DiffLineKind::FileHeader => base.bold(),
         DiffLineKind::Meta => base.add_modifier(Modifier::DIM),
@@ -574,47 +654,48 @@ fn diff_line_style(kind: DiffLineKind) -> Style {
 }
 
 /// パイプライン/ステップ状態に対応する前景色。
-fn pipeline_status_color(status: PipelineStatus) -> Color {
+fn pipeline_status_color(status: PipelineStatus, theme: &Theme) -> Color {
     match status {
-        // 成功=緑 / 失敗・エラー=赤 / 進行中=黄 / 停止・中止=グレー / 保留=既定色。
-        PipelineStatus::Successful => Color::Green,
-        PipelineStatus::Failed => Color::Red,
-        PipelineStatus::InProgress => Color::Yellow,
-        PipelineStatus::Stopped => Color::DarkGray,
-        PipelineStatus::Pending => Color::Reset,
-        PipelineStatus::Unknown => Color::Gray,
+        // 成功=成功色 / 失敗・エラー=危険色 / 進行中=警告色 / 停止・中止=補助色 / 保留=通常前景色。
+        PipelineStatus::Successful => theme.success,
+        PipelineStatus::Failed => theme.danger,
+        PipelineStatus::InProgress => theme.warning,
+        PipelineStatus::Stopped => theme.muted,
+        PipelineStatus::Pending => theme.fg,
+        PipelineStatus::Unknown => theme.muted,
     }
 }
 
 /// 状態バッジ（アイコン + `state`/`result` 名）の色付き Span。
-fn pipeline_status_span(status: PipelineStatus, label: String) -> Span<'static> {
+fn pipeline_status_span(status: PipelineStatus, label: String, theme: &Theme) -> Span<'static> {
     Span::styled(
         format!("{} {label}", status.icon()),
-        Style::new().fg(pipeline_status_color(status)),
+        Style::new().fg(pipeline_status_color(status, theme)),
     )
 }
 
 fn render_pipelines(frame: &mut Frame, area: Rect, app: &mut App) {
+    let theme = app.theme;
     let auto = if app.auto_refresh { "on" } else { "off" };
     if app.pipelines.items.is_empty() {
-        render_placeholder(frame, area, &app.status, "パイプラインがありません");
+        render_placeholder(frame, area, &app.status, "パイプラインがありません", &theme);
         return;
     }
     let items: Vec<ListItem> = app
         .pipelines
         .items
         .iter()
-        .map(|pipeline| ListItem::new(pipeline_row(pipeline)))
+        .map(|pipeline| ListItem::new(pipeline_row(pipeline, &theme)))
         .collect();
     let title = format!(
         " パイプライン ({}) [auto:{auto}] ",
         app.pipelines.items.len()
     );
-    let list = list_widget(items, title);
+    let list = list_widget(&theme, items, title);
     frame.render_stateful_widget(list, area, &mut app.pipelines.state);
 }
 
-fn pipeline_row(pipeline: &Pipeline) -> Line<'static> {
+fn pipeline_row(pipeline: &Pipeline, theme: &Theme) -> Line<'static> {
     let status = pipeline.status();
     let state_label = match pipeline.result_name() {
         Some(result) => format!("{}/{result}", pipeline.state_name()),
@@ -628,16 +709,16 @@ fn pipeline_row(pipeline: &Pipeline) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!("{:<7}", pipeline.build_label()),
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(theme.warning),
         ),
-        pipeline_status_span(status, format!("{state_label:<20}")),
+        pipeline_status_span(status, format!("{state_label:<20}"), theme),
         Span::styled(
             format!("  {}", pipeline.target_ref()),
-            Style::new().fg(Color::Cyan),
+            Style::new().fg(theme.info),
         ),
         Span::styled(
             format!("  {}", pipeline.trigger_name()),
-            Style::new().fg(Color::Blue),
+            Style::new().fg(theme.info),
         ),
         Span::styled(format!("  {created}"), Style::new().dim()),
         Span::styled(
@@ -648,22 +729,30 @@ fn pipeline_row(pipeline: &Pipeline) -> Line<'static> {
 }
 
 fn render_pipeline_detail(frame: &mut Frame, area: Rect, app: &mut App) {
+    let theme = app.theme;
     let rows =
         Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)]).split(area);
 
     match app.current_pipeline.as_ref() {
-        Some(pipeline) => render_pipeline_meta(frame, rows[0], pipeline, app.auto_refresh),
+        Some(pipeline) => render_pipeline_meta(frame, rows[0], pipeline, app.auto_refresh, &theme),
         None => render_placeholder(
             frame,
             rows[0],
             &app.status,
             "パイプラインを選択してください",
+            &theme,
         ),
     }
-    render_steps_list(frame, rows[1], &mut app.pipeline_steps);
+    render_steps_list(frame, rows[1], &mut app.pipeline_steps, &theme);
 }
 
-fn render_pipeline_meta(frame: &mut Frame, area: Rect, pipeline: &Pipeline, auto_refresh: bool) {
+fn render_pipeline_meta(
+    frame: &mut Frame,
+    area: Rect,
+    pipeline: &Pipeline,
+    auto_refresh: bool,
+    theme: &Theme,
+) {
     let status = pipeline.status();
     let state_label = match pipeline.result_name() {
         Some(result) => format!("{} / {result}", pipeline.state_name()),
@@ -674,15 +763,15 @@ fn render_pipeline_meta(frame: &mut Frame, area: Rect, pipeline: &Pipeline, auto
         Line::from(vec![
             Span::styled(
                 format!("{} ", pipeline.build_label()),
-                Style::new().fg(Color::Yellow).bold(),
+                Style::new().fg(theme.warning).bold(),
             ),
-            pipeline_status_span(status, state_label),
+            pipeline_status_span(status, state_label, theme),
         ]),
         Line::from(vec![
             Span::styled("target: ", Style::new().dim()),
             Span::styled(
                 pipeline.target_ref().to_string(),
-                Style::new().fg(Color::Cyan),
+                Style::new().fg(theme.info),
             ),
             Span::styled("   trigger: ", Style::new().dim()),
             Span::raw(pipeline.trigger_name().to_string()),
@@ -716,15 +805,21 @@ fn render_pipeline_meta(frame: &mut Frame, area: Rect, pipeline: &Pipeline, auto
             Style::new().dim(),
         )),
     ];
+    // 複数ペイン画面: 概要は静的な表示ペインなので非フォーカス（下のステップ一覧が主ペイン）。
     let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" 概要 "))
+        .block(themed_block(theme, false).title(" 概要 "))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
-fn render_steps_list(frame: &mut Frame, area: Rect, steps: &mut SelectList<PipelineStep>) {
+fn render_steps_list(
+    frame: &mut Frame,
+    area: Rect,
+    steps: &mut SelectList<PipelineStep>,
+    theme: &Theme,
+) {
     if steps.items.is_empty() {
-        let block = Block::default().borders(Borders::ALL).title(" ステップ ");
+        let block = themed_block(theme, true).title(" ステップ ");
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "（ステップなし）",
@@ -746,20 +841,21 @@ fn render_steps_list(frame: &mut Frame, area: Rect, steps: &mut SelectList<Pipel
                 .and_then(|state| state.name.as_deref())
                 .unwrap_or("?");
             ListItem::new(Line::from(vec![
-                pipeline_status_span(status, format!("{state_label:<12}")),
+                pipeline_status_span(status, format!("{state_label:<12}"), theme),
                 Span::raw(step.name_str().to_string()),
                 Span::styled(format!("  {}", step.duration_label()), Style::new().dim()),
             ]))
         })
         .collect();
     let title = format!(" ステップ ({}) ", steps.items.len());
-    let list = list_widget(items, title);
+    let list = list_widget(theme, items, title);
     frame.render_stateful_widget(list, area, &mut steps.state);
 }
 
 fn render_step_log(frame: &mut Frame, area: Rect, app: &mut App) {
+    let theme = app.theme;
     let Some(log) = app.step_log.as_mut() else {
-        render_placeholder(frame, area, &app.status, "ログを取得しています…");
+        render_placeholder(frame, area, &app.status, "ログを取得しています…", &theme);
         return;
     };
     // 枠線ぶんを差し引いたビューポート高さを保持（スクロール上限計算に使う）。
@@ -783,7 +879,7 @@ fn render_step_log(frame: &mut Frame, area: Rect, app: &mut App) {
     };
     let title = format!(" ログ {} ({count_label}) ", log.title);
     let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(themed_block(&theme, true).title(title))
         .scroll((log.scroll.min(u16::MAX as usize) as u16, 0));
     frame.render_widget(paragraph, area);
 }
@@ -791,29 +887,30 @@ fn render_step_log(frame: &mut Frame, area: Rect, app: &mut App) {
 // ---- リポジトリブラウズ（M3） ----
 
 fn render_branches(frame: &mut Frame, area: Rect, app: &mut App) {
+    let theme = app.theme;
     if app.branches.items.is_empty() {
-        render_placeholder(frame, area, &app.status, "ブランチがありません");
+        render_placeholder(frame, area, &app.status, "ブランチがありません", &theme);
         return;
     }
     let items: Vec<ListItem> = app
         .branches
         .items
         .iter()
-        .map(|branch| ListItem::new(branch_row(branch)))
+        .map(|branch| ListItem::new(branch_row(branch, &theme)))
         .collect();
     let title = format!(" ブランチ ({}) ", app.branches.items.len());
-    let list = list_widget(items, title);
+    let list = list_widget(&theme, items, title);
     frame.render_stateful_widget(list, area, &mut app.branches.state);
 }
 
-fn branch_row(branch: &Branch) -> Line<'static> {
+fn branch_row(branch: &Branch, theme: &Theme) -> Line<'static> {
     let name: String = branch.name_str().chars().take(30).collect();
     let summary: String = branch.target_summary().chars().take(50).collect();
     Line::from(vec![
-        Span::styled(format!("{name:<30}"), Style::new().fg(Color::Green)),
+        Span::styled(format!("{name:<30}"), Style::new().fg(theme.success)),
         Span::styled(
             format!("  {}", branch.target_short_hash()),
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(theme.warning),
         ),
         Span::styled(
             format!("  {}", short_datetime(branch.target_date())),
@@ -824,47 +921,61 @@ fn branch_row(branch: &Branch) -> Line<'static> {
 }
 
 fn render_commits(frame: &mut Frame, area: Rect, app: &mut App) {
+    let theme = app.theme;
     if app.commits.items.is_empty() {
-        render_placeholder(frame, area, &app.status, "コミットがありません");
+        render_placeholder(frame, area, &app.status, "コミットがありません", &theme);
         return;
     }
     let items: Vec<ListItem> = app
         .commits
         .items
         .iter()
-        .map(|commit| ListItem::new(commit_row(commit)))
+        .map(|commit| ListItem::new(commit_row(commit, &theme)))
         .collect();
     let revision = app.commits_revision.as_deref().unwrap_or("既定ブランチ");
     let title = format!(" コミット [{revision}] ({}) ", app.commits.items.len());
-    let list = list_widget(items, title);
+    let list = list_widget(&theme, items, title);
     frame.render_stateful_widget(list, area, &mut app.commits.state);
 }
 
-fn commit_row(commit: &Commit) -> Line<'static> {
+fn commit_row(commit: &Commit, theme: &Theme) -> Line<'static> {
     let author: String = commit.author_name().chars().take(16).collect();
     let summary: String = commit.summary().chars().take(50).collect();
     Line::from(vec![
         Span::styled(
             format!("{:<8}", commit.short_hash()),
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(theme.warning),
         ),
         Span::styled(
             format!("  {}", short_datetime(commit.date_str())),
             Style::new().dim(),
         ),
-        Span::styled(format!("  {author:<16}"), Style::new().fg(Color::Blue)),
+        Span::styled(format!("  {author:<16}"), Style::new().fg(theme.info)),
         Span::raw(format!("  {summary}")),
     ])
 }
 
 fn render_commit_detail(frame: &mut Frame, area: Rect, app: &mut App) {
+    let theme = app.theme;
     match app.current_commit.as_ref() {
-        Some(commit) => render_commit_meta_body(frame, area, commit, app.commit_scroll),
-        None => render_placeholder(frame, area, &app.status, "コミットを選択してください"),
+        Some(commit) => render_commit_meta_body(frame, area, commit, app.commit_scroll, &theme),
+        None => render_placeholder(
+            frame,
+            area,
+            &app.status,
+            "コミットを選択してください",
+            &theme,
+        ),
     }
 }
 
-fn render_commit_meta_body(frame: &mut Frame, area: Rect, commit: &Commit, scroll: u16) {
+fn render_commit_meta_body(
+    frame: &mut Frame,
+    area: Rect,
+    commit: &Commit,
+    scroll: u16,
+    theme: &Theme,
+) {
     let parents = commit.parent_short_hashes();
     let parents_label = if parents.is_empty() {
         "（なし）".to_string()
@@ -876,7 +987,7 @@ fn render_commit_meta_body(frame: &mut Frame, area: Rect, commit: &Commit, scrol
             Span::styled("commit ", Style::new().dim()),
             Span::styled(
                 commit.hash_str().to_string(),
-                Style::new().fg(Color::Yellow).bold(),
+                Style::new().fg(theme.warning).bold(),
             ),
         ]),
         Line::from(vec![
@@ -887,7 +998,7 @@ fn render_commit_meta_body(frame: &mut Frame, area: Rect, commit: &Commit, scrol
         ]),
         Line::from(vec![
             Span::styled("parents: ", Style::new().dim()),
-            Span::styled(parents_label, Style::new().fg(Color::Cyan)),
+            Span::styled(parents_label, Style::new().fg(theme.info)),
         ]),
         Line::raw(""),
     ];
@@ -903,15 +1014,16 @@ fn render_commit_meta_body(frame: &mut Frame, area: Rect, commit: &Commit, scrol
         }
     }
     let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" コミット "))
+        .block(themed_block(theme, true).title(" コミット "))
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     frame.render_widget(paragraph, area);
 }
 
 fn render_source(frame: &mut Frame, area: Rect, app: &mut App) {
+    let theme = app.theme;
     let Some(source) = app.source.as_mut() else {
-        render_placeholder(frame, area, &app.status, "ソースがありません");
+        render_placeholder(frame, area, &app.status, "ソースがありません", &theme);
         return;
     };
     let title = format!(
@@ -920,7 +1032,7 @@ fn render_source(frame: &mut Frame, area: Rect, app: &mut App) {
         source.entries.items.len()
     );
     if source.entries.items.is_empty() {
-        let block = Block::default().borders(Borders::ALL).title(title);
+        let block = themed_block(&theme, true).title(title);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "（空のディレクトリ）",
@@ -935,17 +1047,17 @@ fn render_source(frame: &mut Frame, area: Rect, app: &mut App) {
         .entries
         .items
         .iter()
-        .map(|entry| ListItem::new(src_entry_row(entry)))
+        .map(|entry| ListItem::new(src_entry_row(entry, &theme)))
         .collect();
-    let list = list_widget(items, title);
+    let list = list_widget(&theme, items, title);
     frame.render_stateful_widget(list, area, &mut source.entries.state);
 }
 
-fn src_entry_row(entry: &SrcEntry) -> Line<'static> {
+fn src_entry_row(entry: &SrcEntry, theme: &Theme) -> Line<'static> {
     if entry.is_dir() {
         Line::from(Span::styled(
             format!("{}/", entry.name()),
-            Style::new().fg(Color::Cyan).bold(),
+            Style::new().fg(theme.info).bold(),
         ))
     } else {
         let size = entry.size.map(human_size).unwrap_or_default();
@@ -970,8 +1082,15 @@ fn human_size(bytes: u64) -> String {
 }
 
 fn render_file_view(frame: &mut Frame, area: Rect, app: &mut App) {
+    let theme = app.theme;
     let Some(view) = app.file_view.as_mut() else {
-        render_placeholder(frame, area, &app.status, "ファイルを取得しています…");
+        render_placeholder(
+            frame,
+            area,
+            &app.status,
+            "ファイルを取得しています…",
+            &theme,
+        );
         return;
     };
     // 枠線ぶんを差し引いたビューポート高さを保持（スクロール上限計算に使う）。
@@ -995,7 +1114,7 @@ fn render_file_view(frame: &mut Frame, area: Rect, app: &mut App) {
     };
     let title = format!(" file {} ({count_label}) ", view.title);
     let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(themed_block(&theme, true).title(title))
         .scroll((view.scroll.min(u16::MAX as usize) as u16, 0));
     frame.render_widget(paragraph, area);
 }
@@ -1006,26 +1125,26 @@ fn short_datetime(value: &str) -> String {
     truncated.replacen('T', " ", 1)
 }
 
-fn render_confirm_modal(frame: &mut Frame, modal: &ConfirmModal) {
+fn render_confirm_modal(frame: &mut Frame, modal: &ConfirmModal, theme: &Theme) {
     let area = centered_rect(60, 40, frame.area());
     frame.render_widget(Clear, area);
 
     let mut lines = vec![
         Line::from(Span::styled(
             modal.action.description(),
-            Style::new().fg(Color::Red).bold(),
+            Style::new().fg(theme.danger).bold(),
         )),
         Line::raw(""),
         Line::from(vec![
             Span::styled("対象: ", Style::new().dim()),
-            Span::styled(modal.build_label.clone(), Style::new().fg(Color::Yellow)),
+            Span::styled(modal.build_label.clone(), Style::new().fg(theme.warning)),
         ]),
         Line::raw(""),
     ];
     if modal.submitting {
         lines.push(Line::from(Span::styled(
             "実行中…",
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(theme.warning),
         )));
     }
     lines.push(Line::from(Span::styled(
@@ -1033,94 +1152,195 @@ fn render_confirm_modal(frame: &mut Frame, modal: &ConfirmModal) {
         Style::new().dim(),
     )));
 
-    let block = Block::default()
-        .borders(Borders::ALL)
+    // 破壊的操作の確認モーダルなので枠線は危険色。
+    let block = rounded_block(theme, theme.danger)
         .title(format!(" {} ", modal.action.title()))
-        .border_style(Style::new().fg(Color::Red))
-        .style(Style::new().bg(Color::Black));
+        .style(Style::new().bg(theme.bg));
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_placeholder(frame: &mut Frame, area: Rect, status: &Status, empty_text: &str) {
+fn render_placeholder(
+    frame: &mut Frame,
+    area: Rect,
+    status: &Status,
+    empty_text: &str,
+    theme: &Theme,
+) {
     let text = if matches!(status, Status::Loading(_)) {
         "読み込み中…"
     } else {
         empty_text
     };
-    let block = Block::default().borders(Borders::ALL);
+    let block = themed_block(theme, false);
     let paragraph = Paragraph::new(Line::from(Span::styled(text, Style::new().dim())))
         .block(block)
         .alignment(Alignment::Center);
     frame.render_widget(paragraph, area);
 }
 
-fn list_widget<'a>(items: Vec<ListItem<'a>>, title: String) -> List<'a> {
+/// インタラクティブな一覧（矢印キーで選択が動く画面の主ペイン）用の `List`。
+///
+/// 常にフォーカス色の枠線を使う（一覧が表示される画面では、それが常に主たる操作対象のため）。
+fn list_widget<'a>(theme: &Theme, items: Vec<ListItem<'a>>, title: String) -> List<'a> {
     List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(themed_block(theme, true).title(title))
         .highlight_style(
             Style::new()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+                .bg(theme.selection_bg)
+                .fg(theme.selection_fg)
+                .bold(),
         )
-        .highlight_symbol("▶ ")
+        .highlight_symbol("▌ ")
+        .highlight_spacing(HighlightSpacing::Always)
 }
 
-fn render_status(frame: &mut Frame, area: Rect, status: &Status) {
+fn render_status(frame: &mut Frame, area: Rect, status: &Status, theme: &Theme) {
     let line = match status {
         Status::Idle => Line::raw(""),
         Status::Loading(message) => Line::from(Span::styled(
             format!(" ⏳ {message}"),
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(theme.warning),
         )),
         Status::Success(message) => Line::from(Span::styled(
             format!(" ✔ {message}"),
-            Style::new().fg(Color::Green).bold(),
+            Style::new().fg(theme.success).bold(),
         )),
         Status::Error(message) => Line::from(Span::styled(
             format!(" ✖ {message}"),
-            Style::new().fg(Color::Red).bold(),
+            Style::new().fg(theme.danger).bold(),
         )),
     };
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn render_hints(frame: &mut Frame, area: Rect, screen: Screen) {
-    let hint = match screen {
-        Screen::Onboarding => "Tab/↑↓: フィールド切替   Enter: 次へ/検証   Ctrl+C: 終了",
-        Screen::Workspaces => "↑↓ / j k: 移動   Enter: 開く   ?: ヘルプ   q: 終了",
-        Screen::Repositories => {
-            "↑↓/jk: 移動  Enter: PR  p: パイプライン  b: ブランチ  s: ソース  Esc: 戻る  q: 終了"
-        }
-        Screen::PullRequests => {
-            "↑↓/jk: 移動  Enter: 詳細  o/m/d/a: 状態  r: 再読込  P: パイプライン  b/s: ブラウズ  Esc: 戻る"
-        }
-        Screen::PullRequestDetail => {
-            "d: Diff  c: コメント  a: 承認  x: 変更要求  M: マージ  ↑↓: ファイル  Esc: 戻る"
-        }
-        Screen::Diff => "↑↓/jk PgUp/PgDn g/G: スクロール  n/N: ファイル  Esc: 戻る  q: 終了",
-        Screen::Pipelines => {
-            "↑↓/jk: 移動  Enter: 詳細  r: 再読込  a: 自動更新  S: 停止  R: 再実行  Esc: 戻る"
-        }
-        Screen::PipelineDetail => {
-            "↑↓/jk: ステップ  Enter: ログ  r: 再読込  a: 自動更新  S: 停止  R: 再実行  Esc: 戻る"
-        }
-        Screen::StepLog => "↑↓/jk PgUp/PgDn g/G: スクロール  r: 再取得  Esc: 戻る  q: 終了",
-        Screen::Branches => {
-            "↑↓/jk: 移動  Enter: コミット履歴  s: ソース  r: 再読込  Esc: 戻る  q: 終了"
-        }
-        Screen::Commits => "↑↓/jk: 移動  Enter: 詳細  r: 再読込  Esc: 戻る  q: 終了",
-        Screen::CommitDetail => "d: Diff  ↑↓/jk PgUp/PgDn: スクロール  Esc: 戻る  q: 終了",
-        Screen::Source => "↑↓/jk: 移動  Enter: 開く  Backspace/Esc: 親へ  r: 再読込  q: 終了",
-        Screen::FileView => "↑↓/jk PgUp/PgDn g/G: スクロール  Esc: 戻る  q: 終了",
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(hint, Style::new().dim()))),
-        area,
-    );
+/// 画面ごとのキーヒント（`(key, 説明)` の並び）。フッターとヘルプ双方の元データにはしない
+/// （ヘルプは操作範囲が広く独立して管理する方が読みやすいため）。フッターは要点のみ。
+fn hint_entries(screen: Screen) -> &'static [(&'static str, &'static str)] {
+    match screen {
+        Screen::Onboarding => &[
+            ("Tab/↑↓", "フィールド切替"),
+            ("Enter", "次へ/検証"),
+            ("Ctrl+C", "終了"),
+        ],
+        Screen::Workspaces => &[
+            ("↑↓/jk", "移動"),
+            ("Enter", "開く"),
+            ("?", "ヘルプ"),
+            ("q", "終了"),
+        ],
+        Screen::Repositories => &[
+            ("↑↓/jk", "移動"),
+            ("Enter", "PR"),
+            ("p", "パイプライン"),
+            ("b", "ブランチ"),
+            ("s", "ソース"),
+            ("Esc", "戻る"),
+            ("q", "終了"),
+        ],
+        Screen::PullRequests => &[
+            ("↑↓/jk", "移動"),
+            ("Enter", "詳細"),
+            ("o/m/d/a", "状態"),
+            ("r", "再読込"),
+            ("P", "パイプライン"),
+            ("b/s", "ブラウズ"),
+            ("Esc", "戻る"),
+        ],
+        Screen::PullRequestDetail => &[
+            ("d", "Diff"),
+            ("c", "コメント"),
+            ("a", "承認"),
+            ("x", "変更要求"),
+            ("M", "マージ"),
+            ("↑↓", "ファイル"),
+            ("Esc", "戻る"),
+        ],
+        Screen::Diff => &[
+            ("↑↓/jk", "スクロール"),
+            ("PgUp/PgDn", "1画面"),
+            ("g/G", "先頭/末尾"),
+            ("n/N", "ファイル境界"),
+            ("Esc", "戻る"),
+            ("q", "終了"),
+        ],
+        Screen::Pipelines => &[
+            ("↑↓/jk", "移動"),
+            ("Enter", "詳細"),
+            ("r", "再読込"),
+            ("a", "自動更新"),
+            ("S", "停止"),
+            ("R", "再実行"),
+            ("Esc", "戻る"),
+        ],
+        Screen::PipelineDetail => &[
+            ("↑↓/jk", "ステップ"),
+            ("Enter", "ログ"),
+            ("r", "再読込"),
+            ("a", "自動更新"),
+            ("S", "停止"),
+            ("R", "再実行"),
+            ("Esc", "戻る"),
+        ],
+        Screen::StepLog => &[
+            ("↑↓/jk", "スクロール"),
+            ("PgUp/PgDn", "1画面"),
+            ("g/G", "先頭/末尾"),
+            ("r", "再取得"),
+            ("Esc", "戻る"),
+            ("q", "終了"),
+        ],
+        Screen::Branches => &[
+            ("↑↓/jk", "移動"),
+            ("Enter", "コミット履歴"),
+            ("s", "ソース"),
+            ("r", "再読込"),
+            ("Esc", "戻る"),
+            ("q", "終了"),
+        ],
+        Screen::Commits => &[
+            ("↑↓/jk", "移動"),
+            ("Enter", "詳細"),
+            ("r", "再読込"),
+            ("Esc", "戻る"),
+            ("q", "終了"),
+        ],
+        Screen::CommitDetail => &[
+            ("d", "Diff"),
+            ("↑↓/jk/PgUp/PgDn", "スクロール"),
+            ("Esc", "戻る"),
+            ("q", "終了"),
+        ],
+        Screen::Source => &[
+            ("↑↓/jk", "移動"),
+            ("Enter", "開く"),
+            ("Backspace/Esc", "親へ"),
+            ("r", "再読込"),
+            ("q", "終了"),
+        ],
+        Screen::FileView => &[
+            ("↑↓/jk", "スクロール"),
+            ("PgUp/PgDn", "1画面"),
+            ("g/G", "先頭/末尾"),
+            ("Esc", "戻る"),
+            ("q", "終了"),
+        ],
+    }
 }
 
-fn render_comment_editor(frame: &mut Frame, editor: &CommentEditor) {
+fn render_hints(frame: &mut Frame, area: Rect, screen: Screen, theme: &Theme) {
+    let mut spans = Vec::new();
+    for (index, (key, description)) in hint_entries(screen).iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(*key, Style::new().fg(theme.accent)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(*description, Style::new().fg(theme.muted)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn render_comment_editor(frame: &mut Frame, editor: &CommentEditor, theme: &Theme) {
     let area = centered_rect(70, 50, frame.area());
     frame.render_widget(Clear, area);
 
@@ -1140,7 +1360,7 @@ fn render_comment_editor(frame: &mut Frame, editor: &CommentEditor) {
     if editor.submitting {
         lines.push(Line::from(Span::styled(
             "送信中…",
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(theme.warning),
         )));
     }
     lines.push(Line::from(Span::styled(
@@ -1148,10 +1368,10 @@ fn render_comment_editor(frame: &mut Frame, editor: &CommentEditor) {
         Style::new().dim(),
     )));
 
-    let block = Block::default()
-        .borders(Borders::ALL)
+    // 非破壊的な入力オーバーレイなのでフォーカス色の枠線。
+    let block = rounded_block(theme, theme.border_focus)
         .title(" コメントを書く ")
-        .style(Style::new().bg(Color::Black));
+        .style(Style::new().bg(theme.bg));
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
@@ -1160,7 +1380,12 @@ fn render_comment_editor(frame: &mut Frame, editor: &CommentEditor) {
     );
 }
 
-fn render_merge_modal(frame: &mut Frame, modal: &MergeModal, pr: Option<&PullRequest>) {
+fn render_merge_modal(
+    frame: &mut Frame,
+    modal: &MergeModal,
+    pr: Option<&PullRequest>,
+    theme: &Theme,
+) {
     let area = centered_rect(60, 55, frame.area());
     frame.render_widget(Clear, area);
 
@@ -1171,7 +1396,7 @@ fn render_merge_modal(frame: &mut Frame, modal: &MergeModal, pr: Option<&PullReq
     let mut lines = vec![
         Line::from(Span::styled(
             "破壊的操作: この PR をマージします。",
-            Style::new().fg(Color::Red).bold(),
+            Style::new().fg(theme.danger).bold(),
         )),
         Line::raw(""),
         Line::from(Span::styled("マージ戦略:", Style::new().bold())),
@@ -1180,12 +1405,12 @@ fn render_merge_modal(frame: &mut Frame, modal: &MergeModal, pr: Option<&PullReq
         let selected = index == modal.strategy % MergeStrategy::ALL.len();
         let marker = if selected { "▶ " } else { "  " };
         let style = if selected {
-            Style::new().fg(Color::Cyan).bold()
+            Style::new().fg(theme.accent).bold()
         } else {
             Style::new()
         };
         lines.push(Line::from(vec![
-            Span::styled(marker, Style::new().fg(Color::Cyan)),
+            Span::styled(marker, Style::new().fg(theme.accent)),
             Span::styled(strategy.label(), style),
         ]));
     }
@@ -1202,7 +1427,7 @@ fn render_merge_modal(frame: &mut Frame, modal: &MergeModal, pr: Option<&PullReq
     if modal.submitting {
         lines.push(Line::from(Span::styled(
             "マージ中…",
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(theme.warning),
         )));
     }
     lines.push(Line::from(Span::styled(
@@ -1210,22 +1435,21 @@ fn render_merge_modal(frame: &mut Frame, modal: &MergeModal, pr: Option<&PullReq
         Style::new().dim(),
     )));
 
-    let block = Block::default()
-        .borders(Borders::ALL)
+    // 破壊的操作の確認モーダルなので枠線は危険色。
+    let block = rounded_block(theme, theme.danger)
         .title(title)
-        .border_style(Style::new().fg(Color::Red))
-        .style(Style::new().bg(Color::Black));
+        .style(Style::new().bg(theme.bg));
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_help(frame: &mut Frame, screen: Screen) {
+fn render_help(frame: &mut Frame, screen: Screen, theme: &Theme) {
     let area = centered_rect(64, 70, frame.area());
     frame.render_widget(Clear, area);
 
     let mut lines = vec![
         Line::from(Span::styled(
             "キーバインド（共通）",
-            Style::new().fg(Color::Cyan).bold(),
+            Style::new().fg(theme.accent).bold(),
         )),
         Line::raw(""),
         Line::raw("↑ / k, ↓ / j   上下へ移動"),
@@ -1233,6 +1457,7 @@ fn render_help(frame: &mut Frame, screen: Screen) {
         Line::raw("Esc            戻る"),
         Line::raw("?              このヘルプ"),
         Line::raw("q              終了"),
+        Line::raw("Ctrl+T         テーマ切替"),
         Line::raw("Ctrl+C         強制終了"),
     ];
 
@@ -1313,7 +1538,7 @@ fn render_help(frame: &mut Frame, screen: Screen) {
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             format!("{} 画面", screen_title(screen)),
-            Style::new().fg(Color::Cyan).bold(),
+            Style::new().fg(theme.accent).bold(),
         )));
         lines.push(Line::raw(""));
         for key in screen_keys {
@@ -1327,10 +1552,9 @@ fn render_help(frame: &mut Frame, screen: Screen) {
         Style::new().dim(),
     )));
 
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = rounded_block(theme, theme.border_focus)
         .title(" ヘルプ ")
-        .style(Style::new().bg(Color::Black));
+        .style(Style::new().bg(theme.bg));
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
@@ -1363,6 +1587,7 @@ mod tests {
     use ratatui::buffer::Buffer;
 
     use crate::tui::diff::parse as parse_diff;
+    use crate::tui::theme::ThemeName;
 
     /// `line_count` 行のダミー diff（すべて文脈行）から `DiffState` を作る。
     fn make_diff_state(line_count: usize) -> DiffState {
@@ -1424,13 +1649,14 @@ mod tests {
         let mut diff = make_diff_state(300);
         diff.viewport = 15;
         diff.scroll = 0;
+        let theme = Theme::default();
 
         let backend = TestBackend::new(40, 17);
         let mut terminal = Terminal::new(backend).expect("terminal builds");
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_diff_body(frame, area, &mut diff);
+                render_diff_body(frame, area, &mut diff, &theme);
             })
             .expect("first draw succeeds");
 
@@ -1446,7 +1672,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_diff_body(frame, area, &mut diff);
+                render_diff_body(frame, area, &mut diff, &theme);
             })
             .expect("second draw succeeds");
         let second_ptr = diff
@@ -1465,6 +1691,7 @@ mod tests {
         let mut diff = make_diff_state(50);
         diff.viewport = 5;
         diff.scroll = 3;
+        let theme = Theme::default();
 
         // 幅十分・高さ = 可視 5 行 + 上下ボーダー。
         let backend = TestBackend::new(30, 7);
@@ -1472,7 +1699,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_diff_body(frame, area, &mut diff);
+                render_diff_body(frame, area, &mut diff, &theme);
             })
             .expect("draw succeeds");
 
@@ -1490,13 +1717,14 @@ mod tests {
         let mut diff = make_diff_state(3);
         diff.viewport = 100;
         diff.scroll = 0;
+        let theme = Theme::default();
 
         let backend = TestBackend::new(30, 102);
         let mut terminal = Terminal::new(backend).expect("terminal builds");
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_diff_body(frame, area, &mut diff);
+                render_diff_body(frame, area, &mut diff, &theme);
             })
             .expect("draw succeeds");
 
@@ -1506,27 +1734,143 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_status_colors_map_to_spec() {
-        // 成功=緑 / 失敗・エラー=赤 / 進行中=黄 / 停止・中止=グレー / 保留=既定色。
-        assert_eq!(
-            pipeline_status_color(PipelineStatus::Successful),
-            Color::Green
+    fn render_diff_body_rebuilds_cache_with_new_theme_colors_after_invalidation() {
+        // `App::cycle_theme` は `rendered_lines = None` にしてから再描画する契約になっている。
+        // ここでは「キャッシュが None のときは新しい theme 引数で作り直される」ことだけを保証する
+        // （色そのものの比較は diff_line_color のテストで行う）。
+        let mut diff = make_diff_state(5);
+        diff.viewport = 5;
+        let catppuccin = Theme::default();
+
+        let backend = TestBackend::new(30, 7);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_diff_body(frame, area, &mut diff, &catppuccin);
+            })
+            .expect("first draw succeeds");
+        assert!(diff.rendered_lines.is_some());
+
+        // テーマ切替相当（`App::cycle_theme` がやること）。
+        diff.rendered_lines = None;
+        let nord = ThemeName::Nord.theme();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_diff_body(frame, area, &mut diff, &nord);
+            })
+            .expect("second draw succeeds");
+        assert!(
+            diff.rendered_lines.is_some(),
+            "無効化後はキャッシュが再構築されるべき"
         );
-        assert_eq!(pipeline_status_color(PipelineStatus::Failed), Color::Red);
+    }
+
+    #[test]
+    fn pipeline_status_colors_map_to_theme_roles() {
+        let theme = Theme::default();
+        // 成功=成功色 / 失敗・エラー=危険色 / 進行中=警告色 / 停止・中止=補助色 / 保留=通常前景色。
         assert_eq!(
-            pipeline_status_color(PipelineStatus::InProgress),
-            Color::Yellow
+            pipeline_status_color(PipelineStatus::Successful, &theme),
+            theme.success
         );
         assert_eq!(
-            pipeline_status_color(PipelineStatus::Stopped),
-            Color::DarkGray
+            pipeline_status_color(PipelineStatus::Failed, &theme),
+            theme.danger
         );
-        assert_eq!(pipeline_status_color(PipelineStatus::Pending), Color::Reset);
+        assert_eq!(
+            pipeline_status_color(PipelineStatus::InProgress, &theme),
+            theme.warning
+        );
+        assert_eq!(
+            pipeline_status_color(PipelineStatus::Stopped, &theme),
+            theme.muted
+        );
+        assert_eq!(
+            pipeline_status_color(PipelineStatus::Pending, &theme),
+            theme.fg
+        );
+        assert_eq!(
+            pipeline_status_color(PipelineStatus::Unknown, &theme),
+            theme.muted
+        );
+    }
+
+    #[test]
+    fn diff_line_colors_map_to_theme_roles() {
+        let theme = Theme::default();
+        assert_eq!(diff_line_color(&theme, DiffLineKind::Added), theme.success);
+        assert_eq!(diff_line_color(&theme, DiffLineKind::Removed), theme.danger);
+        assert_eq!(diff_line_color(&theme, DiffLineKind::Hunk), theme.info);
+        assert_eq!(
+            diff_line_color(&theme, DiffLineKind::FileHeader),
+            theme.warning
+        );
+        assert_eq!(diff_line_color(&theme, DiffLineKind::Meta), theme.muted);
+        assert_eq!(diff_line_color(&theme, DiffLineKind::Context), theme.fg);
+    }
+
+    #[test]
+    fn state_style_maps_pr_states_to_theme_roles() {
+        let theme = Theme::default();
+        assert_eq!(state_style("OPEN", &theme).fg, Some(theme.success));
+        assert_eq!(state_style("MERGED", &theme).fg, Some(theme.accent));
+        assert_eq!(state_style("DECLINED", &theme).fg, Some(theme.danger));
+        assert_eq!(state_style("SUPERSEDED", &theme).fg, Some(theme.muted));
+        assert_eq!(state_style("UNKNOWN", &theme).fg, Some(theme.muted));
+    }
+
+    #[test]
+    fn diffstat_status_style_maps_to_theme_roles() {
+        let theme = Theme::default();
+        assert_eq!(
+            diffstat_status_style("added", &theme).fg,
+            Some(theme.success)
+        );
+        assert_eq!(
+            diffstat_status_style("removed", &theme).fg,
+            Some(theme.danger)
+        );
+        assert_eq!(
+            diffstat_status_style("renamed", &theme).fg,
+            Some(theme.warning)
+        );
+        assert_eq!(
+            diffstat_status_style("modified", &theme).fg,
+            Some(theme.info)
+        );
+        assert_eq!(diffstat_status_style("other", &theme).fg, Some(theme.muted));
     }
 
     #[test]
     fn short_datetime_formats_iso8601() {
         assert_eq!(short_datetime("2026-07-10T12:34:56Z"), "2026-07-10 12:34");
         assert_eq!(short_datetime("2026-07-10"), "2026-07-10");
+    }
+
+    #[test]
+    fn hint_entries_are_non_empty_for_every_screen() {
+        for screen in [
+            Screen::Onboarding,
+            Screen::Workspaces,
+            Screen::Repositories,
+            Screen::PullRequests,
+            Screen::PullRequestDetail,
+            Screen::Diff,
+            Screen::Pipelines,
+            Screen::PipelineDetail,
+            Screen::StepLog,
+            Screen::Branches,
+            Screen::Commits,
+            Screen::CommitDetail,
+            Screen::Source,
+            Screen::FileView,
+        ] {
+            assert!(
+                !hint_entries(screen).is_empty(),
+                "{screen:?} のヒントが空です"
+            );
+        }
     }
 }
