@@ -410,8 +410,12 @@ pub enum Msg {
     },
     /// stop / re-run の成功。
     PipelineActionDone { action: PipelineAction },
-    /// ブランチ一覧の取得完了。
-    BranchesLoaded { repo: String, branches: Vec<Branch> },
+    /// ブランチ一覧（1 ページ分）の取得完了。
+    BranchesLoaded {
+        repo: String,
+        branches: Vec<Branch>,
+        page_info: PageInfo,
+    },
     /// コミット履歴の取得完了。
     CommitsLoaded {
         revision: Option<String>,
@@ -564,11 +568,12 @@ pub enum Command {
         repo: String,
         target: Box<PipelineTarget>,
     },
-    /// ブランチ一覧を取得する。
+    /// ブランチ一覧の指定ページを取得する（1 ページ = [`crate::api::client::PAGE_SIZE`] 件）。
     LoadBranches {
         client: BitbucketClient,
         workspace: String,
         repo: String,
+        page: u32,
     },
     /// コミット履歴を取得する（`revision` 省略時は既定ブランチ）。
     LoadCommits {
@@ -1016,6 +1021,12 @@ pub struct App {
     /// Source を開いた場合（Branches 画面の `s`）は更新しない（最初に入って来た画面を保つ）。
     pub browse_return: Screen,
     pub branches: SelectList<Branch>,
+    /// Branches 一覧のページ状態。`[`/`]` でページ間移動、`g` でページ番号ジャンプ。
+    pub branches_page_info: PageInfo,
+    /// ブランチ一覧の再訪キャッシュ（キー = (repo slug, ページ番号)）。
+    /// [`App::load_branches_page`] が再訪時に即表示するために使い、`Msg::BranchesLoaded`
+    /// 受信のたびに最新化する（stale-while-revalidate）。
+    pub branches_cache: RevisitCache<(String, u32), (Vec<Branch>, PageInfo)>,
     pub commits: SelectList<Commit>,
     /// Commits 画面が表示中の revision（ブランチ名/ハッシュ、既定は `None`）。
     pub commits_revision: Option<String>,
@@ -1123,6 +1134,8 @@ impl App {
             diff_return: Screen::PullRequestDetail,
             browse_return: Screen::Repositories,
             branches: SelectList::default(),
+            branches_page_info: PageInfo::default(),
+            branches_cache: RevisitCache::default(),
             commits: SelectList::default(),
             commits_revision: None,
             current_commit: None,
@@ -1382,10 +1395,26 @@ impl App {
                     }
                 }
             }
-            Msg::BranchesLoaded { repo, branches } => {
-                if self.repo_slug().as_deref() == Some(repo.as_str()) {
+            Msg::BranchesLoaded {
+                repo,
+                branches,
+                page_info,
+            } => {
+                // 表示中かどうかに関わらずキャッシュは最新化する（裏で他 repo/ページへ
+                // 切り替えていても、その結果は次回再訪時に活かす）。
+                self.branches_cache.insert(
+                    (repo.clone(), page_info.page),
+                    (branches.clone(), page_info),
+                );
+                // 取得中に別 repo/ページへ切り替えていた場合は画面反映のみ破棄。
+                if self.repo_slug().as_deref() == Some(repo.as_str())
+                    && self.branches_page_info.page == page_info.page
+                {
                     self.clear_loading();
-                    self.branches.set_items(branches);
+                    // 同一文脈への再検証: 選択位置は識別子（ブランチ名）で追従する。
+                    self.branches
+                        .set_items_keep_selection_by(branches, |branch| branch.name.clone());
+                    self.branches_page_info = page_info;
                 }
                 Command::None
             }
@@ -2094,13 +2123,14 @@ impl App {
         self.workspaces_page_info = page_info;
     }
 
-    /// 現在の画面がページング対象（Workspaces/Repositories/PullRequests）なら、その
+    /// 現在の画面がページング対象（Workspaces/Repositories/PullRequests/Branches）なら、その
     /// ページ状態を返す。それ以外の画面では `None`（ページ移動キーは何もしない）。
     fn page_info(&self) -> Option<PageInfo> {
         match self.screen {
             Screen::Workspaces => Some(self.workspaces_page_info),
             Screen::Repositories => Some(self.repositories_page_info),
             Screen::PullRequests => Some(self.pull_requests_page_info),
+            Screen::Branches => Some(self.branches_page_info),
             _ => None,
         }
     }
@@ -2111,6 +2141,7 @@ impl App {
             Screen::Workspaces => self.load_workspaces_page(page),
             Screen::Repositories => self.load_repositories_page(page),
             Screen::PullRequests => self.load_pull_requests_page(page),
+            Screen::Branches => self.load_branches_page(page),
             _ => Command::None,
         }
     }
@@ -3134,25 +3165,62 @@ impl App {
 
     // ---- リポジトリブラウズ（M3） ----
 
-    /// Branches 一覧画面へ遷移し、取得を開始する。
+    /// Branches 一覧画面へ遷移し、1 ページ目の取得を開始する。
     fn open_branches(&mut self) -> Command {
         self.screen = Screen::Branches;
-        self.branches.set_items(Vec::new());
-        self.reload_branches()
+        self.load_branches_page(1)
     }
 
-    /// ブランチ一覧を取得する。
-    fn reload_branches(&mut self) -> Command {
+    /// ブランチ一覧の指定ページを読み込む。
+    ///
+    /// キャッシュ（[`App::branches_cache`]、キー = (repo slug, ページ番号)）があれば即座に
+    /// 一覧を表示しつつ、裏で `Command::LoadBranches` を発行して最新化する
+    /// （stale-while-revalidate）。キャッシュが無ければ一覧をクリアして Loading 表示を出す。
+    /// [`App::open_branches`]（新規入場は 1 ページ目から）・`[`/`]`/`g`（ページ移動）・
+    /// `r`（手動リロード、現在ページを再取得）の共通経路。
+    fn load_branches_page(&mut self, page: u32) -> Command {
         let Some((client, workspace, repo)) = self.review_context() else {
             self.status = Status::Error("認証クライアントが未初期化です".to_string());
             return Command::None;
         };
-        self.status = Status::Loading("ブランチ一覧を取得中…".to_string());
+
+        let cache_key = (repo.clone(), page);
+        match self.branches_cache.get(&cache_key).cloned() {
+            Some((cached, info)) => {
+                self.apply_branches(cached, info);
+                self.status = Status::Idle;
+            }
+            None => {
+                self.branches.set_items(Vec::new());
+                self.branches_page_info = PageInfo {
+                    page,
+                    total_pages: None,
+                    has_next: false,
+                };
+                self.status = Status::Loading(format!("ブランチ一覧を取得中…（{page} ページ目）"));
+            }
+        }
+
         Command::LoadBranches {
             client,
             workspace,
             repo,
+            page,
         }
+    }
+
+    /// 現在ページでブランチ一覧を再取得する（`r` キー）。
+    fn reload_branches(&mut self) -> Command {
+        self.load_branches_page(self.branches_page_info.page)
+    }
+
+    /// 取得結果を `branches` へ反映する（ページ状態の更新を含む）。新規ナビゲーション
+    /// （リポジトリ変更・ページ変更）はここで選択を先頭にリセットする（キャッシュヒットに
+    /// よる即時表示（[`App::load_branches_page`]）専用。バックグラウンド再検証結果は
+    /// `Msg::BranchesLoaded` 側で選択を保持したまま部分更新する）。
+    fn apply_branches(&mut self, branches: Vec<Branch>, page_info: PageInfo) {
+        self.branches.set_items(branches);
+        self.branches_page_info = page_info;
     }
 
     fn on_key_branches(&mut self, key: KeyEvent) -> Command {
@@ -3183,6 +3251,9 @@ impl App {
                 self.branches.select_prev_by(10);
                 Command::None
             }
+            KeyCode::Char('[') => self.prev_page(),
+            KeyCode::Char(']') => self.next_page(),
+            KeyCode::Char('g') => self.open_page_jump(),
             KeyCode::Char('r') => self.reload_branches(),
             KeyCode::Char('s') => match self.selected_branch_name() {
                 Some(name) => self.open_source_root(name),
@@ -5170,6 +5241,7 @@ diff --git a/two.txt b/two.txt\n\
                 make_branch("main", "aaaaaaaa1111"),
                 make_branch("dev", "bbbbbbbb2222"),
             ],
+            page_info: single_page(),
         });
         assert_eq!(app.branches.items.len(), 2);
         assert_eq!(app.branches.state.selected(), Some(0));
@@ -5182,6 +5254,7 @@ diff --git a/two.txt b/two.txt\n\
         app.update(Msg::BranchesLoaded {
             repo: "other".to_string(),
             branches: vec![make_branch("main", "aaaa")],
+            page_info: single_page(),
         });
         assert!(app.branches.items.is_empty());
     }
@@ -6989,6 +7062,168 @@ diff --git a/two.txt b/two.txt\n\
         match cmd {
             Command::LoadPullRequests { page, .. } => assert_eq!(page, 2),
             other => panic!("expected LoadPullRequests, got {other:?}"),
+        }
+    }
+
+    // ---- Branches のサーバサイド・ページネーション ----
+
+    #[test]
+    fn branches_next_page_dispatches_load_branches_with_incremented_page() {
+        let mut app = review_app();
+        app.screen = Screen::Branches;
+        app.branches_page_info = page_info(1, Some(3), true);
+        let cmd = app.update(Msg::Key(key(KeyCode::Char(']'))));
+        match cmd {
+            Command::LoadBranches { page, .. } => assert_eq!(page, 2),
+            other => panic!("expected LoadBranches, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn branches_prev_page_does_nothing_on_first_page() {
+        let mut app = review_app();
+        app.screen = Screen::Branches;
+        app.branches_page_info = page_info(1, Some(3), true);
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('['))));
+        assert!(matches!(cmd, Command::None));
+    }
+
+    #[test]
+    fn branches_page_jump_navigates_clamped_to_total_pages() {
+        let mut app = review_app();
+        app.screen = Screen::Branches;
+        app.branches_page_info = page_info(1, Some(3), true);
+        app.update(Msg::Key(key(KeyCode::Char('g'))));
+        for ch in "99".chars() {
+            app.update(Msg::Key(key(KeyCode::Char(ch))));
+        }
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+        assert!(app.page_jump.is_none());
+        match cmd {
+            // 総ページ数(3)でクランプされる。
+            Command::LoadBranches { page, .. } => assert_eq!(page, 3),
+            other => panic!("expected LoadBranches, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn branches_loaded_ignored_when_page_does_not_match_current_request() {
+        let mut app = review_app();
+        app.screen = Screen::Branches;
+        app.branches_page_info = page_info(2, None, false);
+        app.update(Msg::BranchesLoaded {
+            repo: "widget".to_string(),
+            branches: vec![make_branch("stale", "aaaa")],
+            page_info: page_info(1, None, true),
+        });
+        assert!(app.branches.items.is_empty());
+    }
+
+    #[test]
+    fn branches_cache_is_keyed_by_page_and_does_not_leak_across_pages() {
+        let mut app = review_app();
+        app.screen = Screen::Branches;
+        app.update(Msg::BranchesLoaded {
+            repo: "widget".to_string(),
+            branches: vec![make_branch("main", "aaaa1111")],
+            page_info: page_info(1, Some(2), true),
+        });
+
+        // 2 ページ目へ移動: 未キャッシュなので一覧クリア + Loading。
+        let cmd = app.update(Msg::Key(key(KeyCode::Char(']'))));
+        assert!(app.branches.items.is_empty());
+        assert!(matches!(app.status, Status::Loading(_)));
+        assert!(matches!(cmd, Command::LoadBranches { .. }));
+
+        app.update(Msg::BranchesLoaded {
+            repo: "widget".to_string(),
+            branches: vec![make_branch("dev", "bbbb2222")],
+            page_info: page_info(2, Some(2), false),
+        });
+        assert_eq!(app.branches.items[0].name_str(), "dev");
+
+        // 1 ページ目へ戻る: キャッシュ命中で即座に表示（Loading にならない）。
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('['))));
+        assert_eq!(app.branches.items[0].name_str(), "main");
+        assert_eq!(app.status, Status::Idle);
+        assert!(matches!(cmd, Command::LoadBranches { .. }));
+    }
+
+    #[test]
+    fn branches_revalidation_in_same_context_keeps_selection_by_name() {
+        let mut app = review_app();
+        app.screen = Screen::Branches;
+        app.update(Msg::BranchesLoaded {
+            repo: "widget".to_string(),
+            branches: vec![
+                make_branch("main", "aaaa1111"),
+                make_branch("dev", "bbbb2222"),
+            ],
+            page_info: single_page(),
+        });
+        app.branches.state.select(Some(1)); // "dev" を選択中。
+
+        // 同一文脈（同じ repo/ページ）の再検証: 順序が変わっても "dev" への選択を維持する。
+        app.update(Msg::BranchesLoaded {
+            repo: "widget".to_string(),
+            branches: vec![
+                make_branch("dev", "bbbb2222"),
+                make_branch("main", "aaaa1111"),
+            ],
+            page_info: single_page(),
+        });
+        assert_eq!(
+            app.branches.selected().map(|branch| branch.name_str()),
+            Some("dev")
+        );
+    }
+
+    #[test]
+    fn branches_new_navigation_resets_selection_to_top() {
+        let mut app = review_app();
+        app.screen = Screen::Branches;
+        app.branches_page_info = page_info(1, Some(2), true);
+        app.branches.set_items(vec![
+            make_branch("main", "aaaa1111"),
+            make_branch("dev", "bbbb2222"),
+        ]);
+        app.branches.state.select(Some(1));
+
+        // 新規ナビゲーション（ページ変更）: 選択は先頭にリセットされる。
+        app.update(Msg::Key(key(KeyCode::Char(']'))));
+        app.update(Msg::BranchesLoaded {
+            repo: "widget".to_string(),
+            branches: vec![make_branch("feature/x", "cccc3333")],
+            page_info: page_info(2, Some(2), false),
+        });
+        assert_eq!(app.branches.state.selected(), Some(0));
+    }
+
+    #[test]
+    fn opening_branches_from_repositories_starts_at_page_one() {
+        let mut app = review_app();
+        app.selected_repo = None;
+        app.screen = Screen::Repositories;
+        app.repositories
+            .set_items(vec![make_repo("acme/widget", Some("main"))]);
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('b'))));
+        assert_eq!(app.screen, Screen::Branches);
+        match cmd {
+            Command::LoadBranches { page, .. } => assert_eq!(page, 1),
+            other => panic!("expected LoadBranches, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reloading_branches_reuses_current_page_not_page_one() {
+        let mut app = review_app();
+        app.screen = Screen::Branches;
+        app.branches_page_info = page_info(2, Some(5), true);
+
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('r'))));
+        match cmd {
+            Command::LoadBranches { page, .. } => assert_eq!(page, 2),
+            other => panic!("expected LoadBranches, got {other:?}"),
         }
     }
 }

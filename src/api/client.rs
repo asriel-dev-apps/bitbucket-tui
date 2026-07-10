@@ -24,10 +24,11 @@ const BASE_URL: &str = "https://api.bitbucket.org/2.0";
 /// ページング追跡の安全上限。これを超える `next` は打ち切り、ログに残す。
 const MAX_PAGES: usize = 20;
 
-/// workspaces / repositories / pull_requests のサーバサイド・ページネーション 1 ページあたりの件数。
+/// workspaces / repositories / pull_requests / branches のサーバサイド・ページネーション
+/// 1 ページあたりの件数。
 ///
 /// 従来の `get_paged`（`next` を最大 [`MAX_PAGES`] ページ直列取得して集約）は、全ページ揃うまで
-/// 一覧が表示されず初回取得が遅くなるため、この 3 画面は 1 ページ（20 件）のみを取得して
+/// 一覧が表示されず初回取得が遅くなるため、この 4 画面は 1 ページ（20 件）のみを取得して
 /// 即座に表示し、ページャ UI（`tui::app`）でページ間を移動する方式に変更した。
 pub const PAGE_SIZE: u32 = 20;
 
@@ -327,15 +328,26 @@ impl BitbucketClient {
             .await
     }
 
-    /// ブランチ一覧を最終コミット日時降順で取得する。
-    pub async fn list_branches(
+    /// ブランチ一覧の指定ページを、最終コミット日時降順で取得する
+    /// （`pagelen` 固定 [`PAGE_SIZE`]）。
+    ///
+    /// workspaces/repositories/pull_requests と同じサーバサイド・ページネーションで、
+    /// ページを跨いでも順序が安定するよう `sort=-target.date` を明示する（Bitbucket の
+    /// 既定順に依存しない）。
+    pub async fn get_branches_page(
         &self,
         workspace: &str,
         repo: &str,
-    ) -> Result<Vec<Branch>, ApiError> {
+        page: u32,
+    ) -> Result<Page<Branch>, ApiError> {
         let path = format!("/repositories/{workspace}/{repo}/refs/branches");
-        self.get_paged(&path, &[("sort", "-target.date"), ("pagelen", "50")])
-            .await
+        let query = branches_query();
+        let paginated: Paginated<Branch> = self.fetch_single_page(&path, &query, page).await?;
+        let info = PageInfo::from_paginated(&paginated, page, PAGE_SIZE);
+        Ok(Page {
+            values: paginated.values,
+            info,
+        })
     }
 
     /// コミット履歴を取得する。
@@ -594,6 +606,13 @@ fn pull_requests_query<'a>(states: &'a [&'a str], sort: ListSort) -> Vec<(&'a st
     query
 }
 
+/// ブランチ一覧取得の追加クエリ（最終コミット日時降順で固定）。ページを跨いでも順序が
+/// 安定するよう明示する。ネットワークを介さずに検証できるよう純粋関数として切り出している
+/// （[`repositories_query`] と同じ狙い）。
+fn branches_query() -> [(&'static str, &'static str); 1] {
+    [("sort", "-target.date")]
+}
+
 /// 単一ページ取得のクエリを組み立てる。`extra` の後ろに `page`/`pagelen`（固定 [`PAGE_SIZE`]）
 /// を追加する。ネットワークを介さずに検証できるよう、実際のリクエスト送信
 /// （[`BitbucketClient::fetch_single_page`]）から切り出した純粋関数にしている。
@@ -833,6 +852,24 @@ mod tests {
         assert_eq!(
             pull_requests_query(&[], ListSort::LeastRecentlyUpdated),
             vec![("sort", "updated_on")]
+        );
+    }
+
+    #[test]
+    fn branches_query_sorts_by_target_date_descending() {
+        assert_eq!(branches_query(), [("sort", "-target.date")]);
+    }
+
+    #[test]
+    fn page_query_for_branches_includes_sort_page_and_fixed_pagelen() {
+        let query = page_query(&branches_query(), 2);
+        assert_eq!(
+            query,
+            vec![
+                ("sort".to_string(), "-target.date".to_string()),
+                ("page".to_string(), "2".to_string()),
+                ("pagelen".to_string(), "20".to_string()),
+            ]
         );
     }
 
