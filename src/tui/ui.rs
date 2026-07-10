@@ -16,8 +16,8 @@ use ratatui::widgets::{
 };
 
 use crate::api::{
-    Branch, Comment, Commit, DiffStatEntry, MergeStrategy, PageInfo, Pipeline, PipelineStatus,
-    PipelineStep, PullRequest, SrcEntry,
+    Branch, Comment, CommentSide, Commit, DiffStatEntry, MergeStrategy, PageInfo, Pipeline,
+    PipelineStatus, PipelineStep, PullRequest, SrcEntry,
 };
 use crate::tui::app::{
     App, CommentEditor, ConfirmModal, DiffFocus, DiffState, JumpPaletteState, MergeModal,
@@ -1003,7 +1003,8 @@ fn render_diff_body(frame: &mut Frame, area: Rect, diff: &mut DiffState, theme: 
     // 以降は使い回す。毎フレーム全行を `Span::styled` で作り直すと diff が大きいほど描画
     // コストが線形に増える（テーマ切替時のキャッシュ無効化は `App::cycle_theme` が行う）。
     let total = diff.parsed.len();
-    let title = format!(" diff {} ({total} 行) ", diff.title);
+    let position = diff_cursor_position_label(diff);
+    let title = format!(" diff {} ({total} 行){position} ", diff.title);
     let lines = diff.rendered_lines.get_or_insert_with(|| {
         diff.parsed
             .lines
@@ -1020,11 +1021,53 @@ fn render_diff_body(frame: &mut Frame, area: Rect, diff: &mut DiffState, theme: 
     // per-frame のコストを O(viewport) に抑えるため、可視範囲だけを切り出して渡す
     // （`.scroll()` はここでは使わない。全行を Paragraph に渡すのを避けるのが目的）。
     let (start, end) = diff_visible_range(diff.scroll, diff.viewport, lines.len());
-    let visible: Vec<Line> = lines[start..end].to_vec();
+    let mut visible: Vec<Line> = lines[start..end].to_vec();
+
+    // 現在行ハイライトはキャッシュ（`lines`）には焼き込まず、viewport にスライスした複製
+    // （`visible`）の該当行だけをここで上書きする。これにより `rendered_lines` は書き換わらず
+    // Phase1 のキャッシュ再利用（1 度だけ構築・以後使い回し）が保たれる。
+    if diff.cursor >= start
+        && diff.cursor < end
+        && let Some(line) = visible.get_mut(diff.cursor - start)
+    {
+        *line = highlighted_diff_line(line, theme);
+    }
 
     let focused = diff.focus == DiffFocus::Body;
     let paragraph = Paragraph::new(visible).block(themed_block(theme, focused).title(title));
     frame.render_widget(paragraph, area);
+}
+
+/// 現在行を選択色（`theme.selection_bg`/`selection_fg`）で上書きした複製の `Line` を返す。
+/// 元の `Line`（キャッシュ由来）は変更しない。
+fn highlighted_diff_line(line: &Line, theme: &Theme) -> Line<'static> {
+    let style = Style::new().bg(theme.selection_bg).fg(theme.selection_fg);
+    let spans: Vec<Span<'static>> = line
+        .spans
+        .iter()
+        .map(|span| Span::styled(span.content.to_string(), style))
+        .collect();
+    Line::from(spans)
+}
+
+/// 現在行（`diff.cursor`）の位置表示（` パス:行番号 (新/旧)`）をタイトルへ差し込む断片。
+///
+/// コメント不可（メタ/ヘッダ/ハンク行）の場合はファイルパスのみ、ファイル境界すら
+/// 判定できない場合（空 diff 等）は空文字を返す。先頭に区切り用の半角スペースを含む。
+fn diff_cursor_position_label(diff: &DiffState) -> String {
+    let Some(path) = diff.parsed.file_for_line(diff.cursor) else {
+        return String::new();
+    };
+    match diff.parsed.comment_anchor(diff.cursor) {
+        Some(anchor) => {
+            let side = match anchor.side {
+                CommentSide::To => "新",
+                CommentSide::From => "旧",
+            };
+            format!(" {path}:{} ({side})", anchor.line)
+        }
+        None => format!(" {path}"),
+    }
 }
 
 /// diff の行種別に対応する前景色（テーマの意味役割へマッピング）。
@@ -1720,11 +1763,12 @@ fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
         ],
         Screen::Diff => vec![
             ("Tab", "一覧/本文"),
-            ("↑↓/jk", "選択/スクロール"),
+            ("↑↓/jk", "選択/現在行移動"),
             ("Shift+J/K", "10行"),
             ("n/N", "ファイル境界"),
             ("PgUp/PgDn", "1画面"),
             ("g/G", "先頭/末尾"),
+            ("c", "行にコメント(PR差分のみ)"),
             ("Esc", "戻る"),
         ],
         Screen::Pipelines => vec![
@@ -1846,9 +1890,14 @@ fn render_comment_editor(frame: &mut Frame, editor: &CommentEditor, theme: &Them
         Style::new().dim(),
     )));
 
-    // 非破壊的な入力オーバーレイなのでフォーカス色の枠線。
+    // インラインコメントは対象アンカー（`path:line`）をタイトルに出す（一般コメントと
+    // 見分けが付くように）。非破壊的な入力オーバーレイなのでフォーカス色の枠線。
+    let title = match &editor.inline {
+        Some(anchor) => format!(" {}:{} にコメント ", anchor.path, anchor.line),
+        None => " コメントを書く ".to_string(),
+    };
     let block = rounded_block(theme, theme.border_focus)
-        .title(" コメントを書く ")
+        .title(title)
         .style(Style::new().bg(theme.bg));
     frame.render_widget(
         Paragraph::new(lines)
@@ -1986,11 +2035,13 @@ fn render_help(frame: &mut Frame, screen: Screen, theme: &Theme) {
         ],
         Screen::Diff => &[
             "Tab            ファイル一覧 / 本文フォーカス切替",
-            "↑↓ / j k       (一覧) ファイル選択  /  (本文) 1 行スクロール",
-            "Shift+J / K    本文 10 行スクロール",
-            "PgUp/PgDn / f/b 1 画面スクロール（本文）",
-            "g / Home, G / End 先頭 / 末尾（本文）",
-            "n / N          次 / 前のファイル境界（フォーカス問わず）",
+            "↑↓ / j k       (一覧) ファイル選択  /  (本文) 現在行を 1 行移動",
+            "Shift+J / K    現在行を 10 行移動",
+            "PgUp/PgDn / f/b 現在行を 1 画面ぶん移動",
+            "g / Home, G / End 現在行を先頭 / 末尾へ",
+            "n / N          次 / 前のファイル境界へ（現在行もその先頭へ、フォーカス問わず）",
+            "c              現在行にインラインコメント投稿（PR 差分のみ。Ctrl+S 送信 / Esc 取消）",
+            "               コミット差分では投稿できません",
         ],
         Screen::Repositories => &[
             "Enter          プルリクエスト一覧を開く",
@@ -2192,6 +2243,7 @@ mod tests {
             title: "#1".to_string(),
             rendered_lines: None,
             file_index: 0,
+            cursor: 0,
             focus: DiffFocus::Body,
         }
     }
@@ -2218,6 +2270,7 @@ mod tests {
             title: "#1".to_string(),
             rendered_lines: None,
             file_index: 0,
+            cursor: 0,
             focus: DiffFocus::Body,
         }
     }
@@ -2383,6 +2436,106 @@ mod tests {
             diff.rendered_lines.is_some(),
             "無効化後はキャッシュが再構築されるべき"
         );
+    }
+
+    #[test]
+    fn render_diff_body_highlights_current_cursor_row_with_selection_colors() {
+        let mut diff = make_diff_state(5);
+        diff.viewport = 5;
+        diff.cursor = 2;
+        let theme = Theme::default();
+
+        let backend = TestBackend::new(30, 7);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_diff_body(frame, area, &mut diff, &theme);
+            })
+            .expect("draw succeeds");
+
+        let buffer = terminal.backend().buffer();
+        // 枠線(1) 分を差し引いた本文の先頭セル。cursor=2 行目はコンテンツの 3 行目
+        // （y = 1(境界) + cursor）。
+        let cursor_cell = buffer.cell((2, 1 + 2)).expect("cursor row cell exists");
+        assert_eq!(cursor_cell.fg, theme.selection_fg);
+        assert_eq!(cursor_cell.bg, theme.selection_bg);
+
+        // 他の行（先頭の文脈行）はハイライトされない。
+        let other_cell = buffer.cell((2, 1)).expect("other row cell exists");
+        assert_ne!(other_cell.bg, theme.selection_bg);
+    }
+
+    #[test]
+    fn render_diff_body_highlight_does_not_invalidate_rendered_lines_cache() {
+        // Phase1 のキャッシュ（`rendered_lines`）は現在行ハイライトを挟んでも再構築されない
+        // べき（ハイライトは viewport スライスの複製にのみ適用する契約）。
+        let mut diff = make_diff_state(50);
+        diff.viewport = 10;
+        diff.cursor = 0;
+        let theme = Theme::default();
+
+        let backend = TestBackend::new(30, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_diff_body(frame, area, &mut diff, &theme);
+            })
+            .expect("first draw succeeds");
+        let first_ptr = diff
+            .rendered_lines
+            .as_ref()
+            .expect("cache built on first render")
+            .as_ptr();
+
+        diff.cursor = 5;
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_diff_body(frame, area, &mut diff, &theme);
+            })
+            .expect("second draw succeeds");
+        let second_ptr = diff
+            .rendered_lines
+            .as_ref()
+            .expect("cache still present")
+            .as_ptr();
+
+        assert_eq!(
+            first_ptr, second_ptr,
+            "現在行ハイライトを描画してもキャッシュは再構築されないべき"
+        );
+    }
+
+    #[test]
+    fn render_diff_body_shows_cursor_position_label_in_title() {
+        let text =
+            "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,1 +1,1 @@\n-old\n+new\n".to_string();
+        let mut diff = DiffState {
+            parsed: parse_diff(&text),
+            scroll: 0,
+            viewport: 10,
+            title: "#9".to_string(),
+            rendered_lines: None,
+            file_index: 0,
+            cursor: 5, // "+new"（追加行 → 新ファイル側の行番号）
+            focus: DiffFocus::Body,
+        };
+        let theme = Theme::default();
+
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_diff_body(frame, area, &mut diff, &theme);
+            })
+            .expect("draw succeeds");
+
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("x:1"), "position label missing: {content}");
+        assert!(content.contains('新'), "side marker missing: {content}");
     }
 
     /// `diff` を持つ最小構成の `App`（Diff 画面の 2 ペイン描画テスト用）。

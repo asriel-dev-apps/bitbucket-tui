@@ -1,8 +1,14 @@
-//! ユニファイド diff のパース（行種別の分類のみ）。
+//! ユニファイド diff のパース（行種別の分類 + 行番号マッピング）。
 //!
 //! syntect 等の追加クレートを使わず、行頭の記号で種別を判定する。**色の決定は行わない**
 //! （`Color` への変換・テーマ適用は `ui` 側の責務。`tui::app::DiffState` の「状態層は
 //! `Color::` を含まない」という分離を保つため、本モジュールも `ratatui::style` に依存しない）。
+//!
+//! 各行には hunk ヘッダ（`@@ -a,b +c,d @@`）から算出した旧/新ファイルの行番号
+//! （[`DiffLine::old_no`]/[`DiffLine::new_no`]）を付与する。インラインコメント投稿の
+//! アンカー算出（[`ParsedDiff::comment_anchor`]）の土台になる。
+
+use crate::api::models::CommentSide;
 
 /// diff の 1 行の種別。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +71,21 @@ fn is_meta_prefix(line: &str) -> bool {
 pub struct DiffLine {
     pub kind: DiffLineKind,
     pub text: String,
+    /// 旧ファイル側の行番号（文脈行・削除行のみ `Some`。追加行/メタ/ヘッダ/ハンクは `None`）。
+    pub old_no: Option<u32>,
+    /// 新ファイル側の行番号（文脈行・追加行のみ `Some`。削除行/メタ/ヘッダ/ハンクは `None`）。
+    pub new_no: Option<u32>,
+}
+
+/// diff 行 1 行分の「コメント可能アンカー」。
+///
+/// 追加/文脈行は新ファイル側（`to`）、削除行は旧ファイル側（`from`）を指す。
+/// ファイルヘッダ/ハンクヘッダ/メタ行はアンカーを持たない（コメント不可）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentAnchor {
+    pub path: String,
+    pub side: CommentSide,
+    pub line: u32,
 }
 
 /// パース済みの 1 ファイル区分（サイドバー表示・ファイル境界ジャンプ用）。
@@ -105,23 +126,92 @@ impl ParsedDiff {
     pub fn is_empty(&self) -> bool {
         self.lines.is_empty()
     }
+
+    /// 指定行が属するファイルの表示名を返す（`files`/`file_starts` の境界から判定）。
+    ///
+    /// 範囲外や境界未検出（`files` が空）の場合は `None`。
+    pub fn file_for_line(&self, index: usize) -> Option<&str> {
+        self.files
+            .iter()
+            .find(|file| index >= file.start && index < file.end)
+            .map(|file| file.name.as_str())
+    }
+
+    /// 指定行のインラインコメント投稿アンカーを算出する。
+    ///
+    /// 追加/文脈行は新ファイル側（`to`）、削除行は旧ファイル側（`from`）。
+    /// ファイルヘッダ/ハンクヘッダ/メタ行、および行番号が確定できない行（不正な hunk
+    /// ヘッダ等）は `None`（コメント不可）を返す。
+    pub fn comment_anchor(&self, index: usize) -> Option<CommentAnchor> {
+        let line = self.lines.get(index)?;
+        let path = self.file_for_line(index)?.to_string();
+        match line.kind {
+            DiffLineKind::Added | DiffLineKind::Context => Some(CommentAnchor {
+                path,
+                side: CommentSide::To,
+                line: line.new_no?,
+            }),
+            DiffLineKind::Removed => Some(CommentAnchor {
+                path,
+                side: CommentSide::From,
+                line: line.old_no?,
+            }),
+            DiffLineKind::FileHeader | DiffLineKind::Hunk | DiffLineKind::Meta => None,
+        }
+    }
 }
 
 /// ユニファイド diff テキストをパースする。
 ///
 /// `str::lines()` を使うため末尾の余分な空行は生じない（`\n`/`\r\n` 双方に対応）。
+///
+/// 各行の旧/新ファイル行番号は hunk ヘッダ（`@@ -a,b +c,d @@`）から `old_cursor`/
+/// `new_cursor` を初期化し、以降の文脈/追加/削除行ごとにインクリメントして求める
+/// （ハンクヘッダが壊れていて解析できない場合はそのハンク区間の行番号を `None` のままにする。
+/// 誤った番号を捏造してコメント先を誤らせないため）。
 pub fn parse(text: &str) -> ParsedDiff {
     let mut lines = Vec::new();
     let mut file_starts = Vec::new();
+    let mut old_cursor: Option<u32> = None;
+    let mut new_cursor: Option<u32> = None;
 
     for raw in text.lines() {
         let kind = DiffLineKind::classify(raw);
         if kind == DiffLineKind::FileHeader {
             file_starts.push(lines.len());
         }
+
+        let (old_no, new_no) = match kind {
+            DiffLineKind::Hunk => {
+                let starts = parse_hunk_header(raw);
+                old_cursor = starts.map(|(old, _)| old);
+                new_cursor = starts.map(|(_, new)| new);
+                (None, None)
+            }
+            DiffLineKind::Context => {
+                let assigned = (old_cursor, new_cursor);
+                old_cursor = old_cursor.map(|value| value + 1);
+                new_cursor = new_cursor.map(|value| value + 1);
+                assigned
+            }
+            DiffLineKind::Added => {
+                let assigned = (None, new_cursor);
+                new_cursor = new_cursor.map(|value| value + 1);
+                assigned
+            }
+            DiffLineKind::Removed => {
+                let assigned = (old_cursor, None);
+                old_cursor = old_cursor.map(|value| value + 1);
+                assigned
+            }
+            DiffLineKind::FileHeader | DiffLineKind::Meta => (None, None),
+        };
+
         lines.push(DiffLine {
             kind,
             text: raw.to_string(),
+            old_no,
+            new_no,
         });
     }
 
@@ -143,6 +233,28 @@ pub fn parse(text: &str) -> ParsedDiff {
         file_starts,
         files,
     }
+}
+
+/// hunk ヘッダ `@@ -a[,b] +c[,d] @@ ...` から旧/新ファイルの開始行番号 `(a, c)` を取り出す。
+///
+/// `,b`/`,d`（行数）は省略され得る（1 行だけの hunk は `@@ -1 +1 @@` のように書かれる）ため、
+/// 開始行番号のみを見る。パースに失敗した場合（想定外の形式）は `None` を返し、呼び出し側
+/// （`parse`）はそのハンク区間の行番号を捏造せず `None` のままにする。
+fn parse_hunk_header(line: &str) -> Option<(u32, u32)> {
+    let mut parts = line.split_whitespace();
+    parts.next().filter(|token| *token == "@@")?;
+    let old_part = parts.next()?;
+    let new_part = parts.next()?;
+    let old_start = parse_hunk_start(old_part, '-')?;
+    let new_start = parse_hunk_start(new_part, '+')?;
+    Some((old_start, new_start))
+}
+
+/// hunk ヘッダの `-a,b`/`+c,d`（または `-a`/`+c`）トークンから開始行番号のみを取り出す。
+fn parse_hunk_start(token: &str, prefix: char) -> Option<u32> {
+    let stripped = token.strip_prefix(prefix)?;
+    let start = stripped.split(',').next()?;
+    start.parse::<u32>().ok()
 }
 
 /// `file_starts` の各境界からファイル区分（名前・行範囲）を組み立てる。
@@ -347,5 +459,196 @@ rename to new.txt\n";
         let parsed = parse(" just some context\n+added\n-removed\n");
         assert!(parsed.file_starts.is_empty());
         assert!(parsed.files.is_empty());
+    }
+
+    // ---- 行番号マッピング（hunk ヘッダ由来の old_no/new_no） ----
+
+    #[test]
+    fn hunk_assigns_old_and_new_line_numbers_to_context_added_removed() {
+        let text = "diff --git a/x b/x\n\
+--- a/x\n\
++++ b/x\n\
+@@ -10,3 +20,4 @@\n\
+ context a\n\
+-removed b\n\
++added c\n\
++added d\n";
+        let parsed = parse(text);
+
+        // インデックス: 0 diff--git / 1 --- / 2 +++ / 3 @@ / 4 context / 5 removed / 6,7 added。
+        assert_eq!(parsed.lines[4].old_no, Some(10));
+        assert_eq!(parsed.lines[4].new_no, Some(20));
+        assert_eq!(parsed.lines[5].old_no, Some(11));
+        assert_eq!(parsed.lines[5].new_no, None);
+        assert_eq!(parsed.lines[6].old_no, None);
+        assert_eq!(parsed.lines[6].new_no, Some(21));
+        assert_eq!(parsed.lines[7].old_no, None);
+        assert_eq!(parsed.lines[7].new_no, Some(22));
+    }
+
+    #[test]
+    fn multiple_hunks_in_same_file_reset_line_number_cursors() {
+        let text = "diff --git a/x b/x\n\
+--- a/x\n\
++++ b/x\n\
+@@ -1,2 +1,2 @@\n\
+ a\n\
+-b\n\
+@@ -10,1 +9,2 @@\n\
+ c\n\
++d\n";
+        let parsed = parse(text);
+
+        // インデックス: 0 diff--git / 1 --- / 2 +++ / 3 @@(1) / 4 a / 5 -b / 6 @@(2) / 7 c / 8 +d。
+        assert_eq!(parsed.lines[4].old_no, Some(1));
+        assert_eq!(parsed.lines[4].new_no, Some(1));
+        assert_eq!(parsed.lines[5].old_no, Some(2));
+        // 2 つ目のハンクヘッダで old/new カーソルが再設定される（1 つ目の続きにならない）。
+        assert_eq!(parsed.lines[7].old_no, Some(10));
+        assert_eq!(parsed.lines[7].new_no, Some(9));
+        assert_eq!(parsed.lines[8].old_no, None);
+        assert_eq!(parsed.lines[8].new_no, Some(10));
+    }
+
+    #[test]
+    fn multiple_files_each_number_lines_from_their_own_hunk() {
+        let text = "diff --git a/one.txt b/one.txt\n\
+--- a/one.txt\n\
++++ b/one.txt\n\
+@@ -1,1 +1,1 @@\n\
+-old one\n\
++new one\n\
+diff --git a/two.txt b/two.txt\n\
+--- a/two.txt\n\
++++ b/two.txt\n\
+@@ -1,1 +1,1 @@\n\
+-old two\n\
++new two\n";
+        let parsed = parse(text);
+
+        // ファイル境界を跨いでも 2 つ目のファイルの行番号は 1 から始まる（1 つ目の
+        // カーソルが漏れ出さない）。
+        assert_eq!(parsed.lines[4].old_no, Some(1)); // "-old one"
+        assert_eq!(parsed.lines[5].new_no, Some(1)); // "+new one"
+        assert_eq!(parsed.lines[10].old_no, Some(1)); // "-old two"
+        assert_eq!(parsed.lines[11].new_no, Some(1)); // "+new two"
+    }
+
+    #[test]
+    fn renamed_file_without_hunk_has_no_line_numbers() {
+        let text = "diff --git a/old.txt b/new.txt\n\
+similarity index 100%\n\
+rename from old.txt\n\
+rename to new.txt\n";
+        let parsed = parse(text);
+        assert!(
+            parsed
+                .lines
+                .iter()
+                .all(|line| line.old_no.is_none() && line.new_no.is_none())
+        );
+    }
+
+    #[test]
+    fn malformed_hunk_header_leaves_line_numbers_none_without_panicking() {
+        let text = "diff --git a/x b/x\n@@ garbage @@\n context\n-removed\n+added\n";
+        let parsed = parse(text);
+        assert!(
+            parsed
+                .lines
+                .iter()
+                .all(|line| line.old_no.is_none() && line.new_no.is_none())
+        );
+    }
+
+    #[test]
+    fn single_line_hunk_header_without_comma_counts_parses() {
+        // `@@ -1 +1 @@`（1 行だけの hunk はカンマ無しの行数省略形になる）。
+        let text = "diff --git a/x b/x\n@@ -1 +1 @@\n-old\n+new\n";
+        let parsed = parse(text);
+        assert_eq!(parsed.lines[2].old_no, Some(1));
+        assert_eq!(parsed.lines[3].new_no, Some(1));
+    }
+
+    // ---- コメントアンカー算出 ----
+
+    fn sample_diff_for_anchor() -> ParsedDiff {
+        let text = "diff --git a/x b/x\n\
+--- a/x\n\
++++ b/x\n\
+@@ -10,3 +20,4 @@\n\
+ context a\n\
+-removed b\n\
++added c\n\
++added d\n";
+        parse(text)
+    }
+
+    #[test]
+    fn comment_anchor_for_context_line_uses_new_side() {
+        let parsed = sample_diff_for_anchor();
+        let anchor = parsed.comment_anchor(4).expect("context line has anchor");
+        assert_eq!(anchor.path, "x");
+        assert_eq!(anchor.side, CommentSide::To);
+        assert_eq!(anchor.line, 20);
+    }
+
+    #[test]
+    fn comment_anchor_for_removed_line_uses_old_side() {
+        let parsed = sample_diff_for_anchor();
+        let anchor = parsed.comment_anchor(5).expect("removed line has anchor");
+        assert_eq!(anchor.path, "x");
+        assert_eq!(anchor.side, CommentSide::From);
+        assert_eq!(anchor.line, 11);
+    }
+
+    #[test]
+    fn comment_anchor_for_added_line_uses_new_side() {
+        let parsed = sample_diff_for_anchor();
+        let anchor = parsed.comment_anchor(6).expect("added line has anchor");
+        assert_eq!(anchor.path, "x");
+        assert_eq!(anchor.side, CommentSide::To);
+        assert_eq!(anchor.line, 21);
+    }
+
+    #[test]
+    fn comment_anchor_is_none_for_meta_header_and_hunk_lines() {
+        let parsed = sample_diff_for_anchor();
+        assert_eq!(parsed.comment_anchor(0), None); // diff --git（ファイルヘッダ）
+        assert_eq!(parsed.comment_anchor(1), None); // --- a/x（メタ）
+        assert_eq!(parsed.comment_anchor(2), None); // +++ b/x（メタ）
+        assert_eq!(parsed.comment_anchor(3), None); // @@ ...（ハンク）
+    }
+
+    #[test]
+    fn comment_anchor_out_of_range_index_is_none() {
+        let parsed = sample_diff_for_anchor();
+        assert_eq!(parsed.comment_anchor(9999), None);
+    }
+
+    #[test]
+    fn file_for_line_resolves_path_across_multiple_files() {
+        let parsed = multiple_files_diff_for_file_lookup();
+        assert_eq!(parsed.file_for_line(0), Some("one.txt"));
+        assert_eq!(parsed.file_for_line(5), Some("one.txt"));
+        assert_eq!(parsed.file_for_line(6), Some("two.txt"));
+        assert_eq!(parsed.file_for_line(parsed.len() - 1), Some("two.txt"));
+        assert_eq!(parsed.file_for_line(parsed.len()), None);
+    }
+
+    fn multiple_files_diff_for_file_lookup() -> ParsedDiff {
+        let text = "diff --git a/one.txt b/one.txt\n\
+--- a/one.txt\n\
++++ b/one.txt\n\
+@@ -1,1 +1,1 @@\n\
+-old one\n\
++new one\n\
+diff --git a/two.txt b/two.txt\n\
+--- a/two.txt\n\
++++ b/two.txt\n\
+@@ -1,1 +1,1 @@\n\
+-old two\n\
++new two\n";
+        parse(text)
     }
 }

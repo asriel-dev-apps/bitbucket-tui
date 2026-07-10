@@ -13,9 +13,9 @@ use serde::de::DeserializeOwned;
 
 use crate::api::error::{ApiError, classify_error};
 use crate::api::models::{
-    Branch, Comment, Commit, DiffStatEntry, ListSort, MergeParams, PageInfo, Paginated, Pipeline,
-    PipelineStep, PipelineTarget, PullRequest, Repository, SrcEntry, User, Workspace,
-    WorkspaceMembership,
+    Branch, Comment, CommentSide, Commit, DiffStatEntry, InlineTarget, ListSort, MergeParams,
+    PageInfo, Paginated, Pipeline, PipelineStep, PipelineTarget, PullRequest, Repository, SrcEntry,
+    User, Workspace, WorkspaceMembership,
 };
 
 /// API のベース URL（Bitbucket Cloud）。
@@ -231,6 +231,27 @@ impl BitbucketClient {
     ) -> Result<Comment, ApiError> {
         let url = format!("{BASE_URL}/repositories/{workspace}/{repo}/pullrequests/{id}/comments");
         self.send_json(Method::POST, url, &comment_body(raw)).await
+    }
+
+    /// インラインコメントを投稿する（`POST .../comments`、
+    /// body `{"content":{"raw":".."},"inline":{"path":"..","to"|"from":<line>}}`）。
+    ///
+    /// PR 差分の特定行への返信専用。`target.side` が `To` なら新ファイル側（`inline.to`）、
+    /// `From` なら旧ファイル側（`inline.from`）を指定する
+    /// （`tui::diff::ParsedDiff::comment_anchor` の出力をそのまま渡す想定。引数が
+    /// `clippy::too_many_arguments` に触れるため `path`/`side`/`line` を [`InlineTarget`] へ
+    /// まとめている）。
+    pub async fn create_inline_comment(
+        &self,
+        workspace: &str,
+        repo: &str,
+        id: u64,
+        target: &InlineTarget,
+        raw: &str,
+    ) -> Result<Comment, ApiError> {
+        let url = format!("{BASE_URL}/repositories/{workspace}/{repo}/pullrequests/{id}/comments");
+        let body = inline_comment_body(raw, &target.path, target.side, target.line);
+        self.send_json(Method::POST, url, &body).await
     }
 
     /// PR をマージする（`POST .../merge`）。
@@ -646,6 +667,19 @@ fn comment_body(raw: &str) -> serde_json::Value {
     serde_json::json!({ "content": { "raw": raw } })
 }
 
+/// インラインコメント投稿のリクエストボディ
+/// （`{"content":{"raw":".."},"inline":{"path":"..","to"|"from":<line>}}`）を組み立てる。
+///
+/// `side` が `To`（追加/文脈行）なら `inline.to`、`From`（削除行）なら `inline.from` を使う
+/// （両方を同時には送らない。Bitbucket 側の解釈は未検証の仮定として `docs/LEDGER.md` に残す）。
+fn inline_comment_body(raw: &str, path: &str, side: CommentSide, line: u32) -> serde_json::Value {
+    let inline = match side {
+        CommentSide::To => serde_json::json!({ "path": path, "to": line }),
+        CommentSide::From => serde_json::json!({ "path": path, "from": line }),
+    };
+    serde_json::json!({ "content": { "raw": raw }, "inline": inline })
+}
+
 /// URL パスセグメント用の percent-encode。
 ///
 /// unreserved 文字（`A-Z a-z 0-9 - . _ ~`）以外をすべて `%XX` へエンコードする。
@@ -941,6 +975,24 @@ mod tests {
     fn comment_body_wraps_raw_content() {
         let body = comment_body("hello\nworld");
         assert_eq!(body["content"]["raw"], "hello\nworld");
+    }
+
+    #[test]
+    fn inline_comment_body_uses_to_for_added_or_context_side() {
+        let body = inline_comment_body("LGTM", "src/lib.rs", CommentSide::To, 12);
+        assert_eq!(body["content"]["raw"], "LGTM");
+        assert_eq!(body["inline"]["path"], "src/lib.rs");
+        assert_eq!(body["inline"]["to"], 12);
+        assert!(body["inline"]["from"].is_null());
+    }
+
+    #[test]
+    fn inline_comment_body_uses_from_for_removed_side() {
+        let body = inline_comment_body("なぜ削除？", "src/lib.rs", CommentSide::From, 7);
+        assert_eq!(body["content"]["raw"], "なぜ削除？");
+        assert_eq!(body["inline"]["path"], "src/lib.rs");
+        assert_eq!(body["inline"]["from"], 7);
+        assert!(body["inline"]["to"].is_null());
     }
 
     #[test]

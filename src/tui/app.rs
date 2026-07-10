@@ -10,13 +10,13 @@ use ratatui::text::Line;
 use ratatui::widgets::ListState;
 
 use crate::api::{
-    ApiError, BitbucketClient, Branch, Comment, Commit, DiffStatEntry, ListSort, MergeParams,
-    MergeStrategy, PageInfo, Pipeline, PipelineStep, PipelineTarget, PullRequest, Repository,
-    SrcEntry, User, Workspace,
+    ApiError, BitbucketClient, Branch, Comment, CommentSide, Commit, DiffStatEntry, ListSort,
+    MergeParams, MergeStrategy, PageInfo, Pipeline, PipelineStep, PipelineTarget, PullRequest,
+    Repository, SrcEntry, User, Workspace,
 };
 use crate::auth;
 use crate::config::Config;
-use crate::tui::diff::{ParsedDiff, parse as parse_diff};
+use crate::tui::diff::{CommentAnchor, ParsedDiff, parse as parse_diff};
 use crate::tui::logview::LogView;
 use crate::tui::onboarding::{Field, OnboardingState, TextInput};
 use crate::tui::theme::{Theme, ThemeName};
@@ -166,16 +166,31 @@ impl ConfirmModal {
     }
 }
 
-/// 一般コメント投稿の簡易エディタ状態。
+/// コメント投稿の簡易エディタ状態。
+///
+/// `inline` が `Some` なら Diff 画面の特定行への返信（インラインコメント）、`None` なら
+/// PR 全体への一般コメント。編集 UI（`on_key_comment_editor`）はどちらも共通で、投稿時
+/// （`submit_comment`）にどちらの `Command`（`CreateComment`/`CreateInlineComment`）を
+/// 発行するかだけが分岐する。
 #[derive(Debug, Clone, Default)]
 pub struct CommentEditor {
     pub text: String,
     pub submitting: bool,
+    pub inline: Option<CommentAnchor>,
 }
 
 impl CommentEditor {
     fn is_submittable(&self) -> bool {
         !self.text.trim().is_empty()
+    }
+
+    /// インラインコメント用のエディタを作る（対象アンカー付き）。
+    fn inline(anchor: CommentAnchor) -> Self {
+        Self {
+            text: String::new(),
+            submitting: false,
+            inline: Some(anchor),
+        }
     }
 }
 
@@ -192,11 +207,12 @@ pub enum DiffFocus {
     Body,
 }
 
-/// Diff 画面の表示状態（スクロール・ファイル境界ジャンプ・サイドバー選択）。
+/// Diff 画面の表示状態（スクロール・現在行カーソル・ファイル境界ジャンプ・サイドバー選択）。
 #[derive(Debug, Clone, Default)]
 pub struct DiffState {
     pub parsed: ParsedDiff,
-    /// 先頭からのスクロール行数。
+    /// 先頭からのスクロール行数（現在行 `cursor` が常に viewport 内に入るよう
+    /// `ensure_cursor_visible` が自動調整する。直接ユーザ操作で動かすことはもう無い）。
     pub scroll: usize,
     /// 直近描画時のビューポート高さ（スクロール上限計算に使う。`ui` が毎フレーム更新）。
     pub viewport: usize,
@@ -207,6 +223,8 @@ pub struct DiffState {
     /// `parsed` から毎フレーム再構築すると全行ぶんのヒープ確保が走るため、初回描画時に
     /// `ui` 側が一度だけ構築して書き戻す。新しい diff をロードした際は `DiffState` 自体を
     /// 作り直す（`rendered_lines: None` で始まる）ため、別途の無効化ロジックは不要。
+    /// 現在行ハイライトはこのキャッシュに焼き込まず、描画時に viewport 内の該当行だけ
+    /// スタイルを上書きする（`ui::render_diff_body`）。
     pub rendered_lines: Option<Vec<Line<'static>>>,
     /// サイドバーで選択中のファイルインデックス（`parsed.files` へのインデックス）。
     ///
@@ -214,6 +232,9 @@ pub struct DiffState {
     /// ↑↓/jk）の双方から更新され、常に `scroll` と同期する（本文側からジャンプしても
     /// サイドバーの選択が追従し、その逆も成り立つ）。
     pub file_index: usize,
+    /// 現在行（本文フォーカス時の ↑↓/jk/Shift+J/K/PgUp/PgDn/g/G/n/N が動かす「今見ている行」）。
+    /// `comment_anchor`/位置表示（`ファイルパス:行番号`）の基準にもなる。
+    pub cursor: usize,
     /// 画面内フォーカス（ファイル一覧 / 本文）。
     pub focus: DiffFocus,
 }
@@ -223,23 +244,44 @@ impl DiffState {
         self.parsed.len().saturating_sub(self.viewport.max(1))
     }
 
-    fn scroll_down(&mut self, amount: usize) {
-        self.scroll = (self.scroll + amount).min(self.max_scroll());
+    /// 現在行（`cursor`）を `delta` 行分移動する（負値で上、正値で下）。総行数の範囲内に
+    /// クランプし、移動後は viewport 内に収まるよう `scroll` を自動調整する。
+    fn move_cursor(&mut self, delta: i64) {
+        if self.parsed.is_empty() {
+            return;
+        }
+        let max_index = self.parsed.len() - 1;
+        let next = (self.cursor as i64 + delta).clamp(0, max_index as i64);
+        self.cursor = next as usize;
+        self.ensure_cursor_visible();
     }
 
-    fn scroll_up(&mut self, amount: usize) {
-        self.scroll = self.scroll.saturating_sub(amount);
+    /// 現在行を先頭へ（`g`/`Home`）。
+    fn cursor_to_top(&mut self) {
+        self.cursor = 0;
+        self.ensure_cursor_visible();
     }
 
-    fn scroll_to_top(&mut self) {
-        self.scroll = 0;
+    /// 現在行を末尾へ（`G`/`End`）。
+    fn cursor_to_bottom(&mut self) {
+        self.cursor = self.parsed.len().saturating_sub(1);
+        self.ensure_cursor_visible();
     }
 
-    fn scroll_to_bottom(&mut self) {
-        self.scroll = self.max_scroll();
+    /// 現在行が可視範囲 `[scroll, scroll+viewport)` に入るよう `scroll` を最小限だけ動かす
+    /// （現在行より上にはみ出していれば先頭合わせ、下にはみ出していれば末尾合わせ）。
+    fn ensure_cursor_visible(&mut self) {
+        let viewport = self.viewport.max(1);
+        if self.cursor < self.scroll {
+            self.scroll = self.cursor;
+        } else if self.cursor >= self.scroll.saturating_add(viewport) {
+            self.scroll = self.cursor + 1 - viewport;
+        }
+        self.scroll = self.scroll.min(self.max_scroll());
     }
 
-    /// 次のファイル境界へジャンプする（`n`）。サイドバー選択（`file_index`）も同期する。
+    /// 次のファイル境界へジャンプする（`n`）。サイドバー選択（`file_index`）・現在行
+    /// （`cursor`）ともにそのファイルの先頭へ同期する。
     fn next_file(&mut self) {
         if let Some((index, &start)) = self
             .parsed
@@ -248,12 +290,12 @@ impl DiffState {
             .enumerate()
             .find(|&(_, &start)| start > self.scroll)
         {
-            self.scroll = start.min(self.max_scroll());
-            self.file_index = index;
+            self.jump_to_file(index, start);
         }
     }
 
-    /// 前のファイル境界へジャンプする（`N`）。サイドバー選択（`file_index`）も同期する。
+    /// 前のファイル境界へジャンプする（`N`）。サイドバー選択（`file_index`）・現在行
+    /// （`cursor`）ともにそのファイルの先頭へ同期する。
     fn prev_file(&mut self) {
         if let Some((index, &start)) = self
             .parsed
@@ -263,18 +305,23 @@ impl DiffState {
             .rev()
             .find(|&(_, &start)| start < self.scroll)
         {
-            self.scroll = start;
-            self.file_index = index;
+            self.jump_to_file(index, start);
         }
     }
 
-    /// サイドバーで指定インデックスのファイルを選択し、本文の `scroll` を先頭行に合わせる。
-    /// 範囲外は何もしない（パニックしない）。
+    /// サイドバーで指定インデックスのファイルを選択し、本文の `scroll`/現在行 `cursor` を
+    /// 先頭行に合わせる。範囲外は何もしない（パニックしない）。
     fn select_file(&mut self, index: usize) {
-        if let Some(file) = self.parsed.files.get(index) {
-            self.file_index = index;
-            self.scroll = file.start.min(self.max_scroll());
+        if let Some(start) = self.parsed.files.get(index).map(|file| file.start) {
+            self.jump_to_file(index, start);
         }
+    }
+
+    /// `file_index`/`scroll`/`cursor` を指定ファイルの先頭行へまとめて同期する内部ヘルパ。
+    fn jump_to_file(&mut self, index: usize, start: usize) {
+        self.file_index = index;
+        self.scroll = start.min(self.max_scroll());
+        self.cursor = start.min(self.parsed.len().saturating_sub(1));
     }
 
     /// サイドバー選択を 1 つ下へ（末尾で停止）。
@@ -518,6 +565,17 @@ pub enum Command {
         workspace: String,
         repo: String,
         id: u64,
+        raw: String,
+    },
+    /// インラインコメント（Diff 画面の特定行への返信）を投稿する。
+    CreateInlineComment {
+        client: BitbucketClient,
+        workspace: String,
+        repo: String,
+        id: u64,
+        path: String,
+        side: CommentSide,
+        line: u32,
         raw: String,
     },
     /// PR をマージする。
@@ -1302,6 +1360,7 @@ impl App {
                         title: format!("#{id}"),
                         rendered_lines: None,
                         file_index: 0,
+                        cursor: 0,
                         focus: DiffFocus::Body,
                     });
                 }
@@ -1476,6 +1535,7 @@ impl App {
                         title: short_hash_str(&spec),
                         rendered_lines: None,
                         file_index: 0,
+                        cursor: 0,
                         focus: DiffFocus::Body,
                     });
                 }
@@ -2681,7 +2741,8 @@ impl App {
         }
     }
 
-    /// コメントエディタの内容を投稿する。
+    /// コメントエディタの内容を投稿する。`editor.inline` が `Some` ならインラインコメント
+    /// （`Command::CreateInlineComment`）、`None` なら一般コメント（`Command::CreateComment`）。
     fn submit_comment(&mut self) -> Command {
         let Some(editor) = self.comment_editor.as_ref() else {
             return Command::None;
@@ -2690,6 +2751,7 @@ impl App {
             return Command::None;
         }
         let raw = editor.text.trim_end().to_string();
+        let inline = editor.inline.clone();
         let Some(id) = self.current_pr_id() else {
             return Command::None;
         };
@@ -2701,12 +2763,24 @@ impl App {
             editor.submitting = true;
         }
         self.status = Status::Loading("コメントを送信中…".to_string());
-        Command::CreateComment {
-            client,
-            workspace,
-            repo,
-            id,
-            raw,
+        match inline {
+            Some(anchor) => Command::CreateInlineComment {
+                client,
+                workspace,
+                repo,
+                id,
+                path: anchor.path,
+                side: anchor.side,
+                line: anchor.line,
+                raw,
+            },
+            None => Command::CreateComment {
+                client,
+                workspace,
+                repo,
+                id,
+                raw,
+            },
         }
     }
 
@@ -2727,6 +2801,7 @@ impl App {
                 }
                 return Command::None;
             }
+            KeyCode::Char('c') => return self.open_inline_comment_editor(),
             _ => {}
         }
 
@@ -2747,20 +2822,43 @@ impl App {
             return Command::None;
         }
 
-        let page = diff.viewport.max(1);
+        // 本文フォーカス中は「現在行（カーソル）」を動かす（画面のスクロールではなく行選択。
+        // `DiffState::move_cursor` 等が viewport 内に収まるよう `scroll` を自動追従させる）。
+        let page = diff.viewport.max(1) as i64;
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => diff.scroll_down(1),
-            KeyCode::Up | KeyCode::Char('k') => diff.scroll_up(1),
-            KeyCode::Char('J') => diff.scroll_down(10),
-            KeyCode::Char('K') => diff.scroll_up(10),
-            KeyCode::PageDown | KeyCode::Char('f') => diff.scroll_down(page),
-            KeyCode::PageUp | KeyCode::Char('b') => diff.scroll_up(page),
-            KeyCode::Char('g') | KeyCode::Home => diff.scroll_to_top(),
-            KeyCode::Char('G') | KeyCode::End => diff.scroll_to_bottom(),
+            KeyCode::Down | KeyCode::Char('j') => diff.move_cursor(1),
+            KeyCode::Up | KeyCode::Char('k') => diff.move_cursor(-1),
+            KeyCode::Char('J') => diff.move_cursor(10),
+            KeyCode::Char('K') => diff.move_cursor(-10),
+            KeyCode::PageDown | KeyCode::Char('f') => diff.move_cursor(page),
+            KeyCode::PageUp | KeyCode::Char('b') => diff.move_cursor(-page),
+            KeyCode::Char('g') | KeyCode::Home => diff.cursor_to_top(),
+            KeyCode::Char('G') | KeyCode::End => diff.cursor_to_bottom(),
             KeyCode::Char('n') => diff.next_file(),
             KeyCode::Char('N') => diff.prev_file(),
             _ => {}
         }
+        Command::None
+    }
+
+    /// Diff 画面の現在行にインラインコメントエディタを開く（`c`）。
+    ///
+    /// PR 差分（`diff_return == Screen::PullRequestDetail` かつ `current_pr` あり）でのみ有効。
+    /// コミット差分では投稿先の PR が無いため、その旨を `Status` に出して何もしない。
+    /// 現在行がメタ/ヘッダ/ハンク行でコメント不可の場合もエラーを表示するのみ。
+    fn open_inline_comment_editor(&mut self) -> Command {
+        if self.diff_return != Screen::PullRequestDetail || self.current_pr.is_none() {
+            self.status = Status::Error("コミット差分にはコメントできません".to_string());
+            return Command::None;
+        }
+        let Some(diff) = self.diff.as_ref() else {
+            return Command::None;
+        };
+        let Some(anchor) = diff.parsed.comment_anchor(diff.cursor) else {
+            self.status = Status::Error("この行にはコメントできません".to_string());
+            return Command::None;
+        };
+        self.comment_editor = Some(CommentEditor::inline(anchor));
         Command::None
     }
 
@@ -4246,6 +4344,7 @@ mod tests {
             title: "#1".to_string(),
             rendered_lines: Some(Vec::new()),
             file_index: 0,
+            cursor: 0,
             focus: DiffFocus::Body,
         });
 
@@ -4669,15 +4768,225 @@ diff --git a/two.txt b/two.txt\n\
         });
 
         // 本文フォーカスのまま `n` で次ファイルへジャンプしても file_index が同期する。
+        // 現在行（cursor）もそのファイルの先頭へ移動する。
         app.update(Msg::Key(key(KeyCode::Char('n'))));
         let diff = app.diff.as_ref().expect("diff present");
         assert_eq!(diff.file_index, 1);
         assert_eq!(diff.scroll, diff.parsed.files[1].start);
+        assert_eq!(diff.cursor, diff.parsed.files[1].start);
 
         app.update(Msg::Key(key(KeyCode::Char('N'))));
         let diff = app.diff.as_ref().expect("diff present");
         assert_eq!(diff.file_index, 0);
         assert_eq!(diff.scroll, diff.parsed.files[0].start);
+        assert_eq!(diff.cursor, diff.parsed.files[0].start);
+    }
+
+    // ---- 現在行カーソル（Diff 画面） ----
+
+    /// 十分な行数を持つ diff（1 ファイル・全て文脈行）から、指定 viewport の Diff 画面を作る。
+    fn diff_app_with_lines(line_count: usize, viewport: usize) -> App {
+        let mut app = review_app();
+        app.current_pr = Some(make_pr(9, "OPEN"));
+        app.screen = Screen::Diff;
+        let mut text = "diff --git a/x b/x\n--- a/x\n+++ b/x\n".to_string();
+        text.push_str(&format!("@@ -1,{line_count} +1,{line_count} @@\n"));
+        for index in 0..line_count {
+            text.push_str(&format!(" context {index}\n"));
+        }
+        app.update(Msg::DiffLoaded { id: 9, text });
+        if let Some(diff) = app.diff.as_mut() {
+            diff.viewport = viewport;
+        }
+        app
+    }
+
+    #[test]
+    fn diff_cursor_moves_one_line_with_j_k() {
+        let mut app = diff_app_with_lines(20, 10);
+        app.update(Msg::Key(key(KeyCode::Char('j'))));
+        assert_eq!(app.diff.as_ref().expect("diff").cursor, 1);
+        app.update(Msg::Key(key(KeyCode::Up)));
+        assert_eq!(app.diff.as_ref().expect("diff").cursor, 0);
+    }
+
+    #[test]
+    fn diff_cursor_clamps_at_top_and_bottom_boundaries() {
+        let mut app = diff_app_with_lines(5, 10);
+        // 先頭で上へ: 変化しない（パニックもしない）。
+        app.update(Msg::Key(key(KeyCode::Up)));
+        assert_eq!(app.diff.as_ref().expect("diff").cursor, 0);
+
+        let last = app.diff.as_ref().expect("diff").parsed.len() - 1;
+        app.update(Msg::Key(key(KeyCode::Char('G'))));
+        assert_eq!(app.diff.as_ref().expect("diff").cursor, last);
+        // 末尾を超えて下へ連打しても最後の行で止まる。
+        for _ in 0..5 {
+            app.update(Msg::Key(key(KeyCode::Down)));
+        }
+        assert_eq!(app.diff.as_ref().expect("diff").cursor, last);
+    }
+
+    #[test]
+    fn diff_cursor_page_up_down_moves_by_viewport_and_auto_scrolls() {
+        let mut app = diff_app_with_lines(100, 10);
+        app.update(Msg::Key(key(KeyCode::PageDown)));
+        let diff = app.diff.as_ref().expect("diff");
+        assert_eq!(diff.cursor, 10);
+        // 現在行が viewport 内に収まるよう自動スクロールする。
+        assert!(diff.cursor >= diff.scroll && diff.cursor < diff.scroll + diff.viewport);
+
+        app.update(Msg::Key(key(KeyCode::PageUp)));
+        let diff = app.diff.as_ref().expect("diff");
+        assert_eq!(diff.cursor, 0);
+        assert_eq!(diff.scroll, 0);
+    }
+
+    #[test]
+    fn diff_cursor_g_and_shift_g_jump_to_top_and_bottom() {
+        let mut app = diff_app_with_lines(50, 10);
+        app.update(Msg::Key(key(KeyCode::Char('G'))));
+        let diff = app.diff.as_ref().expect("diff");
+        let last = diff.parsed.len() - 1;
+        assert_eq!(diff.cursor, last);
+        assert!(diff.cursor < diff.scroll + diff.viewport);
+
+        app.update(Msg::Key(key(KeyCode::Char('g'))));
+        let diff = app.diff.as_ref().expect("diff");
+        assert_eq!(diff.cursor, 0);
+        assert_eq!(diff.scroll, 0);
+    }
+
+    // ---- インラインコメント（`c`。#Diff-inline-comment） ----
+
+    #[test]
+    fn diff_c_key_is_rejected_for_commit_diff() {
+        let mut app = review_app();
+        app.screen = Screen::Diff;
+        app.diff_return = Screen::CommitDetail;
+        app.current_pr = None;
+        app.diff = Some(DiffState {
+            parsed: parse_diff("diff --git a/x b/x\n@@ -1 +1 @@\n-old\n+new\n"),
+            scroll: 0,
+            viewport: 10,
+            title: "abc1234".to_string(),
+            rendered_lines: None,
+            file_index: 0,
+            cursor: 3, // "+new"（追加行）
+            focus: DiffFocus::Body,
+        });
+
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('c'))));
+        assert!(matches!(cmd, Command::None));
+        assert!(app.comment_editor.is_none());
+        assert!(matches!(app.status, Status::Error(_)));
+    }
+
+    #[test]
+    fn diff_c_key_opens_inline_editor_on_pr_diff_at_addable_line() {
+        let mut app = review_app();
+        app.current_pr = Some(make_pr(9, "OPEN"));
+        app.screen = Screen::Diff;
+        app.diff_return = Screen::PullRequestDetail;
+        app.diff = Some(DiffState {
+            parsed: parse_diff("diff --git a/x b/x\n@@ -1 +1 @@\n-old\n+new\n"),
+            scroll: 0,
+            viewport: 10,
+            title: "#9".to_string(),
+            rendered_lines: None,
+            file_index: 0,
+            cursor: 3, // "+new"（追加行、コメント可能）
+            focus: DiffFocus::Body,
+        });
+
+        app.update(Msg::Key(key(KeyCode::Char('c'))));
+        let editor = app.comment_editor.as_ref().expect("inline editor opens");
+        let anchor = editor.inline.as_ref().expect("anchor present");
+        assert_eq!(anchor.path, "x");
+        assert_eq!(anchor.side, CommentSide::To);
+        assert_eq!(anchor.line, 1);
+    }
+
+    #[test]
+    fn diff_c_key_on_uncommentable_line_shows_error_and_does_not_open_editor() {
+        let mut app = review_app();
+        app.current_pr = Some(make_pr(9, "OPEN"));
+        app.screen = Screen::Diff;
+        app.diff_return = Screen::PullRequestDetail;
+        app.diff = Some(DiffState {
+            parsed: parse_diff("diff --git a/x b/x\n@@ -1 +1 @@\n-old\n+new\n"),
+            scroll: 0,
+            viewport: 10,
+            title: "#9".to_string(),
+            rendered_lines: None,
+            file_index: 0,
+            cursor: 1, // "@@ -1 +1 @@"（ハンクヘッダ、コメント不可）
+            focus: DiffFocus::Body,
+        });
+
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('c'))));
+        assert!(matches!(cmd, Command::None));
+        assert!(app.comment_editor.is_none());
+        assert!(matches!(app.status, Status::Error(_)));
+    }
+
+    #[test]
+    fn diff_inline_comment_submit_dispatches_create_inline_comment_with_anchor() {
+        let mut app = review_app();
+        app.current_pr = Some(make_pr(9, "OPEN"));
+        app.screen = Screen::Diff;
+        app.diff_return = Screen::PullRequestDetail;
+        app.diff = Some(DiffState {
+            parsed: parse_diff("diff --git a/x b/x\n@@ -1 +1 @@\n-old\n+new\n"),
+            scroll: 0,
+            viewport: 10,
+            title: "#9".to_string(),
+            rendered_lines: None,
+            file_index: 0,
+            cursor: 2, // "-old"（削除行）
+            focus: DiffFocus::Body,
+        });
+
+        app.update(Msg::Key(key(KeyCode::Char('c'))));
+        for ch in "なぜ削除？".chars() {
+            app.update(Msg::Key(key(KeyCode::Char(ch))));
+        }
+        let cmd = app.update(Msg::Key(ctrl(KeyCode::Char('s'))));
+        match cmd {
+            Command::CreateInlineComment {
+                id,
+                path,
+                side,
+                line,
+                raw,
+                ..
+            } => {
+                assert_eq!(id, 9);
+                assert_eq!(path, "x");
+                assert_eq!(side, CommentSide::From);
+                assert_eq!(line, 1);
+                assert_eq!(raw, "なぜ削除？");
+            }
+            other => panic!("expected CreateInlineComment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_inline_comment_posted_clears_editor_and_refreshes_comments() {
+        let mut app = review_app();
+        app.current_pr = Some(make_pr(9, "OPEN"));
+        app.screen = Screen::Diff;
+        app.diff_return = Screen::PullRequestDetail;
+        app.comment_editor = Some(CommentEditor::inline(CommentAnchor {
+            path: "x".to_string(),
+            side: CommentSide::To,
+            line: 1,
+        }));
+
+        let cmd = app.update(Msg::CommentPosted { id: 9 });
+        assert!(app.comment_editor.is_none());
+        assert!(matches!(app.status, Status::Success(_)));
+        assert!(matches!(cmd, Command::LoadComments { id: 9, .. }));
     }
 
     #[test]
@@ -6152,7 +6461,7 @@ diff --git a/two.txt b/two.txt\n\
     }
 
     #[test]
-    fn diff_shift_j_k_scroll_body_by_ten() {
+    fn diff_shift_j_k_move_cursor_by_ten_and_auto_scroll() {
         let mut app = review_app();
         app.screen = Screen::Diff;
         let lines = (0..50)
@@ -6167,12 +6476,17 @@ diff --git a/two.txt b/two.txt\n\
             title: "#1".to_string(),
             rendered_lines: None,
             file_index: 0,
+            cursor: 0,
             focus: DiffFocus::Body,
         });
 
+        // 現在行が 10 行分下がり、viewport(5) に収まるよう最小限だけ自動スクロールする
+        // （cursor=10, viewport=5 → scroll は cursor が最終行になる 6 まで進む）。
         app.update(Msg::Key(key(KeyCode::Char('J'))));
-        assert_eq!(app.diff.as_ref().expect("diff").scroll, 10);
+        assert_eq!(app.diff.as_ref().expect("diff").cursor, 10);
+        assert_eq!(app.diff.as_ref().expect("diff").scroll, 6);
         app.update(Msg::Key(key(KeyCode::Char('K'))));
+        assert_eq!(app.diff.as_ref().expect("diff").cursor, 0);
         assert_eq!(app.diff.as_ref().expect("diff").scroll, 0);
     }
 

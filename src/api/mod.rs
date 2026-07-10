@@ -9,7 +9,7 @@ pub mod models;
 pub use client::BitbucketClient;
 pub use error::ApiError;
 pub use models::{
-    Branch, Comment, Commit, DiffStatEntry, ListSort, MergeParams, MergeStrategy, PageInfo,
-    Pipeline, PipelineStatus, PipelineStep, PipelineTarget, PullRequest, Repository, SrcEntry,
-    User, Workspace,
+    Branch, Comment, CommentSide, Commit, DiffStatEntry, InlineTarget, ListSort, MergeParams,
+    MergeStrategy, PageInfo, Pipeline, PipelineStatus, PipelineStep, PipelineTarget, PullRequest,
+    Repository, SrcEntry, User, Workspace,
 };

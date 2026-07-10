@@ -570,6 +570,27 @@ pub struct Inline {
     pub to: Option<u64>,
 }
 
+/// インラインコメント投稿時にアンカーがどちら側のファイル行を指すか。
+///
+/// 追加/文脈行は新ファイル側（`to`）、削除行は旧ファイル側（`from`）を指す
+/// （`tui::diff::ParsedDiff::comment_anchor` が diff 行の種別から判定する）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentSide {
+    /// 新ファイル側の行番号（`inline.to`）。
+    To,
+    /// 旧ファイル側の行番号（`inline.from`）。
+    From,
+}
+
+/// インラインコメント投稿の対象アンカー（`BitbucketClient::create_inline_comment` の引数を
+/// まとめたもの。`clippy::too_many_arguments` 回避も兼ねる）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineTarget {
+    pub path: String,
+    pub side: CommentSide,
+    pub line: u32,
+}
+
 /// 親コメント参照（スレッド判定に使用）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct CommentParent {

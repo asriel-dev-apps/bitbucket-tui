@@ -11,7 +11,7 @@ use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use tokio::sync::mpsc;
 
-use crate::api::BitbucketClient;
+use crate::api::{BitbucketClient, InlineTarget};
 use crate::tui::Tui;
 use crate::tui::app::{App, Command, Msg, PipelineAction};
 use crate::tui::ui;
@@ -300,6 +300,30 @@ fn dispatch(command: Command, api_tx: &mpsc::Sender<Msg>) -> bool {
             let tx = api_tx.clone();
             tokio::spawn(async move {
                 let msg = match client.create_comment(&workspace, &repo, id, &raw).await {
+                    Ok(_comment) => Msg::CommentPosted { id },
+                    Err(error) => Msg::ActionFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
+        Command::CreateInlineComment {
+            client,
+            workspace,
+            repo,
+            id,
+            path,
+            side,
+            line,
+            raw,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let target = InlineTarget { path, side, line };
+                let msg = match client
+                    .create_inline_comment(&workspace, &repo, id, &target, &raw)
+                    .await
+                {
                     Ok(_comment) => Msg::CommentPosted { id },
                     Err(error) => Msg::ActionFailed(error),
                 };

@@ -9,6 +9,7 @@
 - **M2 パイプライン監視**: **実装完了(2026-07-10)**。`cargo build/clippy(--all-targets -D warnings)/fmt --check/test` すべて green(--offline)。ユニット93件 pass(+54→93) + `#[ignore]` 1件。repo から Pipelines 一覧(状態色)→PipelineDetail(ステップ一覧)→StepLog(スクロール/擬似 tail)、stop/re-run(確認モーダル)、進行中パイプラインの自動ポーリング更新(tokio timer tick、`a` で ON/OFF、全完了で停止)を実装。**実 API 結合確認は環境に実 token が無いためスキップ**(Pipeline/Step の serde フィールド・state/result 値・log 404 挙動・trigger body の正確形・pipelines エンドポイントの trailing slash は下記「未検証の仮定」のまま。build+clippy+モックテストのみで検証)。
 - **M3 リポジトリブラウズ**: **実装完了(2026-07-10)**。`cargo build/clippy(--all-targets -D warnings)/fmt --check/test` すべて green(--offline)。ユニット136件 pass(+93→136) + `#[ignore]` 1件。repo/PR から Branches 一覧→Commits 履歴→CommitDetail→Diff(M1 流用) / Source(ツリー閲覧: ディレクトリ潜り/親戻り)→FileView(内容ページャ: logview 流用)を実装。閲覧専用。**実 API 結合確認は環境に実 token が無いためスキップ**(Branch/Commit/SrcEntry の serde フィールド・src の dir/file 応答形・diff spec・branch 名/パスの URL エンコード方針は下記「未検証の仮定」のまま。build+clippy+モックテストのみで検証)。
 - **ロードマップ M0〜M3 すべて実装完了(2026-07-10)**。
+- **M4 差分レビュー強化(現在行カーソル+インラインコメント)**: **実装完了(2026-07-10)**。`cargo fmt --check/clippy(--all-targets -D warnings)/test` すべて green(--offline)。ユニット380件 pass(+354→380、うち26件が本機能の新規テスト) + `#[ignore]` 1件。Diff 画面に現在行カーソル（`DiffState.cursor`。↑↓/jk=1行・Shift+J/K=10行・PgUp/PgDn=viewport・g/G=先頭末尾・n/N=ファイル先頭、常に自動スクロールで viewport 内へ）とハイライト表示・位置表示（`パス:行番号 (新/旧)`）を追加し、PR 差分のみ `c` でインラインコメント投稿（`Command::CreateInlineComment`→`client.create_inline_comment`）を実装。**実 API 結合確認は環境に実 token が無いためスキップ**（インラインコメントの `inline.{to,from}` の正確な意味論は下記「未検証の仮定」のまま。build+clippy+モックテストのみで検証。実ネットワーク投稿はテストしていない）。
 
 ## M0 実装メモ (2026-07-09)
 
@@ -57,6 +58,15 @@
 - **ナビゲーション**: `Repositories` で `b`=Branches / `s`=Source root(既定ブランチ)。`Enter`=PR・`p`=Pipelines は不変。`PullRequests` からも `b`/`s`。Branches: `Enter`=Commits・`s`=そのブランチの Source root・`r`=再読込。Commits: `Enter`=CommitDetail・`r`=再読込。CommitDetail: `d`=Diff・`↑↓/PgUp/PgDn`=メッセージスクロール。Source: `Enter`=潜る/開く・`Backspace`/`Esc`=親(ルートで repo)・`r`=再読込。FileView: `↑↓/jk PgUp/PgDn g/G`=スクロール・`Esc`=Source。各画面 `q`/`Ctrl+C`/`?` 踏襲。
 - **未実施**: 実 token が無いため Branches→Commits→CommitDetail→Diff / Source 潜行→FileView の実結合確認はしていない。build+clippy(-D warnings)+モックテストのみ green。
 
+## M4 実装メモ (2026-07-10): 現在行カーソル + インラインコメント
+
+- **行番号マッピング(`tui/diff.rs`)**: `DiffLine` に `old_no`/`new_no: Option<u32>` を追加。`parse()` が hunk ヘッダ `@@ -a,b +c,d @@`(`parse_hunk_header`/`parse_hunk_start`。カンマ以下の行数は無視し開始行番号のみ使用、`,b`/`,d` 省略形 `@@ -1 +1 @@` にも対応)から `old_cursor`/`new_cursor` を初期化し、文脈行(両方インクリメント)/追加行(new のみ)/削除行(old のみ)/メタ・ヘッダ・ハンク行(番号なし)で行ごとに更新。hunk ヘッダの解析に失敗した場合はそのハンク区間を `None` のままにし、誤った番号を捏造しない。`ParsedDiff::file_for_line`/`comment_anchor`(追加/文脈→`to`、削除→`from`、メタ/ヘッダ/ハンク→コメント不可)を追加。`CommentAnchor{path,side,line}` の `side` は `api::models::CommentSide`(`api` は `tui` に依存しない既存の一方向レイヤリングを維持するため、`tui::diff` 側が `api::models::CommentSide` を借用する形にした)。
+- **現在行カーソル(`tui/app.rs::DiffState`)**: `cursor: usize` を追加。`move_cursor(delta)`/`cursor_to_top`/`cursor_to_bottom` が範囲クランプ後 `ensure_cursor_visible`(cursor が `[scroll, scroll+viewport)` の外に出たら最小限だけ `scroll` を追従させる。上に出たら先頭合わせ、下に出たら末尾合わせ)を呼ぶ。Body フォーカス時の `↑↓/jk`(1行)・`Shift+J/K`(10行)・`PgUp/PgDn`(viewport分)・`g/G`(先頭/末尾)を、従来の直接スクロールからこのカーソル移動へ変更(Files フォーカス時の挙動・`n`/`N` のファイル境界ジャンプ・サイドバー選択との同期は不変)。`next_file`/`prev_file`/`select_file` は内部ヘルパ `jump_to_file` に統合し、`file_index`/`scroll`/`cursor` を常に一括同期する。
+- **現在行ハイライト・位置表示(`tui/ui.rs::render_diff_body`)**: Phase1 キャッシュ(`rendered_lines`)には焼き込まず、viewport 分にスライスした複製(`visible: Vec<Line>`)の該当行だけ `highlighted_diff_line`(`theme.selection_bg`/`selection_fg` で全 span を上書きした複製)に差し替える。キャッシュ本体は書き換えないため、cursor 変更を挟んでも `rendered_lines` の再構築は起きない(既存の cache-reuse テストと同じ流儀で新規テストを追加し確認)。位置表示は `diff_cursor_position_label`(`comment_anchor` があれば `パス:行番号 (新/旧)`、無ければパスのみ、ファイル境界すら無ければ空)をタイトルに埋め込む。
+- **`c` キーの衝突確認**: 既存 `on_key_diff` に `c` の割当は無かった(q/?/Esc/Tab/↑↓/jk/J/K/PgUp/PgDn/f/b/g/G/n/N のみ)。トップレベルの `q`/`?`/`Esc`/`Tab` と同格で追加。
+- **インラインコメント投稿(PR 差分のみ)**: `CommentEditor` に `inline: Option<CommentAnchor>` を追加(`None`=一般コメント、`Some`=インラインコメント。編集 UI・`Ctrl+S`/`Esc` は共通)。`c` は `App::open_inline_comment_editor` を呼び、`diff_return != Screen::PullRequestDetail || current_pr.is_none()` なら「コミット差分にはコメントできません」を Status に出して何もしない(コミット差分では投稿不可)。`comment_anchor` が `None`(メタ/ヘッダ/ハンク行)なら「この行にはコメントできません」。`submit_comment` は `editor.inline` の有無で `Command::CreateComment`/`Command::CreateInlineComment` を出し分け。`Command::CreateInlineComment`→`event::dispatch`→`BitbucketClient::create_inline_comment(workspace,repo,id,&InlineTarget{path,side,line},raw)`→`inline_comment_body`(`{"content":{"raw":".."},"inline":{"path":"..","to"|"from":<line>}}`。`clippy::too_many_arguments` 回避のため `path`/`side`/`line` を `api::models::InlineTarget` にまとめた)。成功時は既存の `Msg::CommentPosted`(一般コメントと共通)で `comment_editor=None`・`Status::Success`・PR 一覧キャッシュ無効化・`refresh_comments()` 再取得を行う(専用 Msg は追加不要)。
+- **未実施**: 実 token が無いためインラインコメント投稿の実結合確認はしていない(`inline.{to,from}` の正確な受理条件は下記「未検証の仮定」参照)。build+clippy(-D warnings)+モックテスト(Msg 駆動、実ネットワーク不使用)のみ green。
+
 ## 検証済みの事実 (2026-07-09)
 
 - 認証は HTTP Basic、**username = Atlassianアカウントのメール / password = API token(スコープ付き)**。Bitbucketユーザー名・トークン名では通らない(出典: Atlassian support "Using API tokens" / 401 KB)。
@@ -92,12 +102,13 @@
 - **(M3) commit diff の spec**: `GET .../diff/{hash}` に単一ハッシュを渡して当該コミットの差分を取得(親との差分)前提。M1 の diff パーサ/着色をそのまま流用。実際のリダイレクト/Content-Type/マージコミットの差分表現を確認。
 - **(M3) 既定ブランチのフォールバック**: repo 一覧の `mainbranch.name` を使い、未取得時は `"main"` にフォールバック。`master` 等の repo では Source root が 404 になり得る(その場合はステータス行にエラー表示・Branches から明示選択で回避)。repo 詳細取得によるフォールバックは未実装。
 - **(M3) バイナリ/巨大ファイル判定**: `reqwest` の `text()`(lossy UTF-8)後の NUL バイト有無 + mimetype でバイナリ判定、`MAX_FILE_LINES`(5000)超で先頭打切り。実バイナリ応答が本当にテキストとして返る(=生バイトが text() を通る)のか、`?format=meta` を使うべきか等は実挙動で確認。size ヘッダによる事前打切りは未実装(全取得後に行数で打切り)。
+- **(M4) インラインコメント投稿の `inline.{to,from}` の正確な受理条件**: `{"inline":{"path":"..","to":<int>}}`(追加/文脈行)・`{"inline":{"path":"..","from":<int>}}`(削除行)の形で送る前提(`to`/`from` を同時には送らない)。実 API が本当にこの形を受理するか(必須/任意フィールド、`from`/`to` 両方を要求するケースの有無、行番号が hunk 範囲外の場合の 400 応答等)は未確認。
 
 ## 未解決の問い
 
 - OAuth 2.0 対応の要否(現状 API token のみで足りる想定)。
 - M1 の PR 横断取得に最適なエンドポイント(repo単位 `.../pullrequests` の集約 vs 他)。→ **M1 では repo 単位 `.../pullrequests` を採用**(選択リポジトリ内の PR をレビューする体験を優先)。repo 横断は後続で検討。
-- (M1) inline コメント投稿(stretch)の要否と、inline アンカーの `from`/`to`(旧/新ファイル行)の正確な意味。一覧表示のみ実装済み、投稿は未実装。
+- (M1) inline コメント投稿(stretch)の要否と、inline アンカーの `from`/`to`(旧/新ファイル行)の正確な意味。→ **2026-07-10 M4 で投稿を実装**（`tui/diff.rs::ParsedDiff::comment_anchor` が hunk 行番号マッピングから `to`(追加/文脈)/`from`(削除)を判定、Diff 画面で `c` キー。PR 差分のみ、コミット差分では拒否）。実 API での受理条件は上記「未検証の仮定」参照。
 - (M1) コメント一覧・PR 一覧のページング UI(「さらに読み込む」)。現状は `get_paged` の安全上限(20 ページ)まで自動集約するのみで、明示的な追加読み込み UI は未実装。
 - (M2) 自動ポーリング間隔は固定 5 秒。実運用で適正か(レート制限との兼ね合い)、可変にすべきかは実挙動で判断。tick は常時 5 秒ごとに `Msg::Tick` を流すが、対象画面かつ進行中がある時のみ API を叩く設計。
 - (M2) `q` の終了スコープ: `StepLog`/`Diff` では `q`=終了、`Pipelines`/`PipelineDetail` でも `q`=終了(一覧系画面の共通踏襲)。監視中に誤終了しやすいなら要再検討。
