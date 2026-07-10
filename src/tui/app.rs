@@ -177,7 +177,20 @@ impl CommentEditor {
     }
 }
 
-/// Diff 画面の表示状態（スクロール・ファイル境界ジャンプ）。
+/// Diff 画面内のフォーカス（ファイル一覧サイドバー / 本文）。`Tab` で切り替える。
+///
+/// 既定は `Body`（サイドバー導入前の挙動＝矢印キーが直接本文をスクロールする、を維持する
+/// ため）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiffFocus {
+    /// ファイル一覧サイドバー。↑↓/jk でファイル選択（本文の `scroll` が追従する）。
+    Files,
+    /// 差分本文。既存の ↑↓/jk PgUp/PgDn g/G スクロール。
+    #[default]
+    Body,
+}
+
+/// Diff 画面の表示状態（スクロール・ファイル境界ジャンプ・サイドバー選択）。
 #[derive(Debug, Clone, Default)]
 pub struct DiffState {
     pub parsed: ParsedDiff,
@@ -193,6 +206,14 @@ pub struct DiffState {
     /// `ui` 側が一度だけ構築して書き戻す。新しい diff をロードした際は `DiffState` 自体を
     /// 作り直す（`rendered_lines: None` で始まる）ため、別途の無効化ロジックは不要。
     pub rendered_lines: Option<Vec<Line<'static>>>,
+    /// サイドバーで選択中のファイルインデックス（`parsed.files` へのインデックス）。
+    ///
+    /// `next_file`/`prev_file`（`n`/`N`）とサイドバー選択（`Tab` でフォーカス移動後の
+    /// ↑↓/jk）の双方から更新され、常に `scroll` と同期する（本文側からジャンプしても
+    /// サイドバーの選択が追従し、その逆も成り立つ）。
+    pub file_index: usize,
+    /// 画面内フォーカス（ファイル一覧 / 本文）。
+    pub focus: DiffFocus,
 }
 
 impl DiffState {
@@ -216,27 +237,67 @@ impl DiffState {
         self.scroll = self.max_scroll();
     }
 
+    /// 次のファイル境界へジャンプする（`n`）。サイドバー選択（`file_index`）も同期する。
     fn next_file(&mut self) {
-        if let Some(&position) = self
+        if let Some((index, &start)) = self
             .parsed
             .file_starts
             .iter()
-            .find(|&&start| start > self.scroll)
+            .enumerate()
+            .find(|&(_, &start)| start > self.scroll)
         {
-            self.scroll = position.min(self.max_scroll());
+            self.scroll = start.min(self.max_scroll());
+            self.file_index = index;
         }
     }
 
+    /// 前のファイル境界へジャンプする（`N`）。サイドバー選択（`file_index`）も同期する。
     fn prev_file(&mut self) {
-        if let Some(&position) = self
+        if let Some((index, &start)) = self
             .parsed
             .file_starts
             .iter()
+            .enumerate()
             .rev()
-            .find(|&&start| start < self.scroll)
+            .find(|&(_, &start)| start < self.scroll)
         {
-            self.scroll = position;
+            self.scroll = start;
+            self.file_index = index;
         }
+    }
+
+    /// サイドバーで指定インデックスのファイルを選択し、本文の `scroll` を先頭行に合わせる。
+    /// 範囲外は何もしない（パニックしない）。
+    fn select_file(&mut self, index: usize) {
+        if let Some(file) = self.parsed.files.get(index) {
+            self.file_index = index;
+            self.scroll = file.start.min(self.max_scroll());
+        }
+    }
+
+    /// サイドバー選択を 1 つ下へ（末尾で停止）。
+    fn select_file_next(&mut self) {
+        let len = self.parsed.files.len();
+        if len == 0 {
+            return;
+        }
+        self.select_file((self.file_index + 1).min(len - 1));
+    }
+
+    /// サイドバー選択を 1 つ上へ（先頭で停止）。
+    fn select_file_prev(&mut self) {
+        if self.parsed.files.is_empty() {
+            return;
+        }
+        self.select_file(self.file_index.saturating_sub(1));
+    }
+
+    /// Diff 画面内のフォーカスを切り替える（`Tab`）。
+    fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            DiffFocus::Files => DiffFocus::Body,
+            DiffFocus::Body => DiffFocus::Files,
+        };
     }
 }
 
@@ -996,6 +1057,8 @@ impl App {
                         viewport: 0,
                         title: format!("#{id}"),
                         rendered_lines: None,
+                        file_index: 0,
+                        focus: DiffFocus::Body,
                     });
                 }
                 Command::None
@@ -1125,6 +1188,8 @@ impl App {
                         viewport: 0,
                         title: short_hash_str(&spec),
                         rendered_lines: None,
+                        file_index: 0,
+                        focus: DiffFocus::Body,
                     });
                 }
                 Command::None
@@ -2075,12 +2140,32 @@ impl App {
                 self.screen = self.diff_return;
                 return Command::None;
             }
+            KeyCode::Tab => {
+                if let Some(diff) = self.diff.as_mut() {
+                    diff.toggle_focus();
+                }
+                return Command::None;
+            }
             _ => {}
         }
 
         let Some(diff) = self.diff.as_mut() else {
             return Command::None;
         };
+
+        // ファイル一覧サイドバーにフォーカス中は ↑↓/jk がファイル選択（本文が追従）。
+        // `n`/`N` は境界ジャンプとして本文フォーカス時と同じ挙動（サイドバー選択も同期）。
+        if diff.focus == DiffFocus::Files {
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => diff.select_file_next(),
+                KeyCode::Up | KeyCode::Char('k') => diff.select_file_prev(),
+                KeyCode::Char('n') => diff.next_file(),
+                KeyCode::Char('N') => diff.prev_file(),
+                _ => {}
+            }
+            return Command::None;
+        }
+
         let page = diff.viewport.max(1);
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => diff.scroll_down(1),
@@ -3366,6 +3451,8 @@ mod tests {
             viewport: 0,
             title: "#1".to_string(),
             rendered_lines: Some(Vec::new()),
+            file_index: 0,
+            focus: DiffFocus::Body,
         });
 
         app.update(Msg::Key(ctrl(KeyCode::Char('t'))));
@@ -3619,9 +3706,130 @@ mod tests {
         });
         let diff = app.diff.as_ref().expect("diff present");
         assert_eq!(diff.parsed.len(), 4);
+        // 既定フォーカスは本文なので、サイドバー導入前と同じく ↑↓/jk が直接スクロールする。
+        assert_eq!(diff.focus, DiffFocus::Body);
         // ビューポート未設定でも 1 行スクロールできる。
         app.update(Msg::Key(key(KeyCode::Char('j'))));
         assert_eq!(app.diff.as_ref().expect("diff").scroll, 1);
+    }
+
+    /// 2 ファイル分の diff テキスト（各ファイル 3 行のコンテキスト行）。サイドバー関連の
+    /// テストで使う。
+    fn multi_file_diff_text() -> String {
+        "diff --git a/one.txt b/one.txt\n\
+--- a/one.txt\n\
++++ b/one.txt\n\
+@@ -1,3 +1,3 @@\n\
+ one line 0\n\
+ one line 1\n\
+ one line 2\n\
+diff --git a/two.txt b/two.txt\n\
+--- a/two.txt\n\
++++ b/two.txt\n\
+@@ -1,3 +1,3 @@\n\
+ two line 0\n\
+ two line 1\n\
+ two line 2\n"
+            .to_string()
+    }
+
+    #[test]
+    fn diff_tab_toggles_focus_between_files_and_body() {
+        let mut app = review_app();
+        app.current_pr = Some(make_pr(9, "OPEN"));
+        app.screen = Screen::Diff;
+        app.update(Msg::DiffLoaded {
+            id: 9,
+            text: multi_file_diff_text(),
+        });
+        assert_eq!(app.diff.as_ref().expect("diff").focus, DiffFocus::Body);
+
+        app.update(Msg::Key(key(KeyCode::Tab)));
+        assert_eq!(app.diff.as_ref().expect("diff").focus, DiffFocus::Files);
+
+        app.update(Msg::Key(key(KeyCode::Tab)));
+        assert_eq!(app.diff.as_ref().expect("diff").focus, DiffFocus::Body);
+    }
+
+    #[test]
+    fn diff_sidebar_selection_moves_scroll_to_file_start() {
+        let mut app = review_app();
+        app.current_pr = Some(make_pr(9, "OPEN"));
+        app.screen = Screen::Diff;
+        app.update(Msg::DiffLoaded {
+            id: 9,
+            text: multi_file_diff_text(),
+        });
+        let second_file_start = app.diff.as_ref().expect("diff").parsed.files[1].start;
+
+        app.update(Msg::Key(key(KeyCode::Tab))); // フォーカスをファイル一覧へ。
+        app.update(Msg::Key(key(KeyCode::Char('j')))); // 1 つ下（2 番目のファイル）を選択。
+
+        let diff = app.diff.as_ref().expect("diff present");
+        assert_eq!(diff.file_index, 1);
+        assert_eq!(diff.scroll, second_file_start);
+    }
+
+    #[test]
+    fn diff_sidebar_selection_stays_within_bounds() {
+        let mut app = review_app();
+        app.current_pr = Some(make_pr(9, "OPEN"));
+        app.screen = Screen::Diff;
+        app.update(Msg::DiffLoaded {
+            id: 9,
+            text: multi_file_diff_text(),
+        });
+        app.update(Msg::Key(key(KeyCode::Tab)));
+
+        // 先頭で上へ: 変化しない。
+        app.update(Msg::Key(key(KeyCode::Up)));
+        assert_eq!(app.diff.as_ref().expect("diff").file_index, 0);
+
+        // 末尾を超えて下へ連打しても最後のファイルで止まる（2 ファイルのみ）。
+        for _ in 0..5 {
+            app.update(Msg::Key(key(KeyCode::Down)));
+        }
+        assert_eq!(app.diff.as_ref().expect("diff").file_index, 1);
+    }
+
+    #[test]
+    fn diff_body_focus_ignores_sidebar_navigation_and_scrolls_instead() {
+        let mut app = review_app();
+        app.current_pr = Some(make_pr(9, "OPEN"));
+        app.screen = Screen::Diff;
+        app.update(Msg::DiffLoaded {
+            id: 9,
+            text: multi_file_diff_text(),
+        });
+
+        // 本文フォーカスのまま（Tab を押していない）↓ を押すと本文が 1 行スクロールし、
+        // サイドバー選択（file_index）は動かない。
+        app.update(Msg::Key(key(KeyCode::Down)));
+        let diff = app.diff.as_ref().expect("diff present");
+        assert_eq!(diff.scroll, 1);
+        assert_eq!(diff.file_index, 0);
+    }
+
+    #[test]
+    fn diff_next_file_key_syncs_sidebar_file_index_regardless_of_focus() {
+        let mut app = review_app();
+        app.current_pr = Some(make_pr(9, "OPEN"));
+        app.screen = Screen::Diff;
+        app.update(Msg::DiffLoaded {
+            id: 9,
+            text: multi_file_diff_text(),
+        });
+
+        // 本文フォーカスのまま `n` で次ファイルへジャンプしても file_index が同期する。
+        app.update(Msg::Key(key(KeyCode::Char('n'))));
+        let diff = app.diff.as_ref().expect("diff present");
+        assert_eq!(diff.file_index, 1);
+        assert_eq!(diff.scroll, diff.parsed.files[1].start);
+
+        app.update(Msg::Key(key(KeyCode::Char('N'))));
+        let diff = app.diff.as_ref().expect("diff present");
+        assert_eq!(diff.file_index, 0);
+        assert_eq!(diff.scroll, diff.parsed.files[0].start);
     }
 
     #[test]

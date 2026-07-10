@@ -12,7 +12,7 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Clear, HighlightSpacing, List, ListItem, Padding, Paragraph, Wrap,
+    Block, BorderType, Clear, HighlightSpacing, List, ListItem, ListState, Padding, Paragraph, Wrap,
 };
 
 use crate::api::{
@@ -20,8 +20,8 @@ use crate::api::{
     PullRequest, SrcEntry,
 };
 use crate::tui::app::{
-    App, CommentEditor, ConfirmModal, DiffState, JumpPaletteState, MergeModal, Screen, SelectList,
-    Status,
+    App, CommentEditor, ConfirmModal, DiffFocus, DiffState, JumpPaletteState, MergeModal, Screen,
+    SelectList, Status,
 };
 use crate::tui::diff::DiffLineKind;
 use crate::tui::onboarding::Field;
@@ -616,6 +616,9 @@ fn comment_inline_anchor(comment: &Comment) -> Option<String> {
     }
 }
 
+/// サイドバー（ファイル一覧）の幅比率。右の本文が主ペインなので控えめに 30%。
+const DIFF_SIDEBAR_PERCENT: u16 = 30;
+
 fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = app.theme;
     if app.diff.as_ref().is_none_or(|diff| diff.parsed.is_empty()) {
@@ -626,15 +629,87 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
         render_placeholder(frame, area, &app.status, "差分がありません", &theme);
         return;
     };
+
+    // 左: ファイル一覧サイドバー / 右: 差分本文（Phase1 のキャッシュ＋viewport スライス描画を
+    // 維持するため、本文の再構築ロジックは `render_diff_body` に閉じたまま変更しない）。
+    let cols = Layout::horizontal([
+        Constraint::Percentage(DIFF_SIDEBAR_PERCENT),
+        Constraint::Percentage(100 - DIFF_SIDEBAR_PERCENT),
+    ])
+    .split(area);
+
     // 枠線ぶんを差し引いたビューポート高さを保持（スクロール上限計算に使う）。
-    let viewport = area.height.saturating_sub(2) as usize;
+    let viewport = cols[1].height.saturating_sub(2) as usize;
     diff.viewport = viewport;
     let max_scroll = diff.parsed.len().saturating_sub(viewport.max(1));
     if diff.scroll > max_scroll {
         diff.scroll = max_scroll;
     }
 
-    render_diff_body(frame, area, diff, &theme);
+    render_diff_sidebar(frame, cols[0], diff, &theme);
+    render_diff_body(frame, cols[1], diff, &theme);
+}
+
+/// ファイル一覧サイドバー。選択中ファイル（`file_index`）をハイライトし、フォーカス中は
+/// 枠線を `theme.border_focus` にする。
+fn render_diff_sidebar(frame: &mut Frame, area: Rect, diff: &DiffState, theme: &Theme) {
+    let focused = diff.focus == DiffFocus::Files;
+    let title = format!(" ファイル ({}) ", diff.parsed.files.len());
+    let block = themed_block(theme, focused).title(title);
+
+    if diff.parsed.files.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "（ファイル境界なし）",
+                Style::new().dim(),
+            )))
+            .block(block),
+            area,
+        );
+        return;
+    }
+
+    // 枠線 + 左右パディングぶん（`rounded_block` が `Padding::horizontal(1)` を持つ）を
+    // 差し引いた表示可能文字数。
+    let name_width = area.width.saturating_sub(4);
+    let items: Vec<ListItem> = diff
+        .parsed
+        .files
+        .iter()
+        .map(|file| {
+            ListItem::new(Line::from(Span::raw(truncate_file_name(
+                &file.name, name_width,
+            ))))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(
+            Style::new()
+                .bg(theme.selection_bg)
+                .fg(theme.selection_fg)
+                .bold(),
+        )
+        .highlight_symbol("▌ ")
+        .highlight_spacing(HighlightSpacing::Always);
+
+    let selected = diff.file_index.min(diff.parsed.files.len() - 1);
+    let mut state = ListState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// ファイル名を表示幅に収める。長い場合は先頭を省略し末尾（ファイル名側）を優先して残す。
+fn truncate_file_name(name: &str, max_width: u16) -> String {
+    let budget = (max_width as usize).max(1);
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() <= budget {
+        return name.to_string();
+    }
+    // 省略記号 1 文字ぶんを差し引いた残りを末尾から残す。
+    let tail_len = budget.saturating_sub(1);
+    let tail: String = chars[chars.len() - tail_len..].iter().collect();
+    format!("…{tail}")
 }
 
 /// 差分の可視範囲 `[start, end)` を計算する。
@@ -671,7 +746,8 @@ fn render_diff_body(frame: &mut Frame, area: Rect, diff: &mut DiffState, theme: 
     let (start, end) = diff_visible_range(diff.scroll, diff.viewport, lines.len());
     let visible: Vec<Line> = lines[start..end].to_vec();
 
-    let paragraph = Paragraph::new(visible).block(themed_block(theme, true).title(title));
+    let focused = diff.focus == DiffFocus::Body;
+    let paragraph = Paragraph::new(visible).block(themed_block(theme, focused).title(title));
     frame.render_widget(paragraph, area);
 }
 
@@ -1310,10 +1386,11 @@ fn hint_entries(screen: Screen) -> &'static [(&'static str, &'static str)] {
             ("Esc", "戻る"),
         ],
         Screen::Diff => &[
-            ("↑↓/jk", "スクロール"),
+            ("Tab", "一覧/本文"),
+            ("↑↓/jk", "選択/スクロール"),
+            ("n/N", "ファイル境界"),
             ("PgUp/PgDn", "1画面"),
             ("g/G", "先頭/末尾"),
-            ("n/N", "ファイル境界"),
             ("Esc", "戻る"),
             ("q", "終了"),
         ],
@@ -1535,10 +1612,11 @@ fn render_help(frame: &mut Frame, screen: Screen, theme: &Theme) {
             "↑↓             変更ファイル選択  PgUp/PgDn: 本文スクロール",
         ],
         Screen::Diff => &[
-            "↑↓ / j k       1 行スクロール",
-            "PgUp/PgDn      1 画面スクロール",
-            "g / G          先頭 / 末尾",
-            "n / N          次 / 前のファイル境界",
+            "Tab            ファイル一覧 / 本文フォーカス切替",
+            "↑↓ / j k       (一覧) ファイル選択  /  (本文) 1 行スクロール",
+            "PgUp/PgDn      1 画面スクロール（本文）",
+            "g / G          先頭 / 末尾（本文）",
+            "n / N          次 / 前のファイル境界（フォーカス問わず）",
         ],
         Screen::Repositories => &[
             "Enter          プルリクエスト一覧を開く",
@@ -1715,6 +1793,34 @@ mod tests {
             viewport: 0,
             title: "#1".to_string(),
             rendered_lines: None,
+            file_index: 0,
+            focus: DiffFocus::Body,
+        }
+    }
+
+    /// ファイル境界を複数持つ diff（サイドバー・フォーカス関連のテスト用）。
+    /// `file_count` 個のファイル、各ファイル `lines_per_file` 行のコンテキスト行を持つ。
+    fn make_multi_file_diff_state(file_count: usize, lines_per_file: usize) -> DiffState {
+        let mut text = String::new();
+        for file_index in 0..file_count {
+            text.push_str(&format!(
+                "diff --git a/file{file_index}.txt b/file{file_index}.txt\n\
+--- a/file{file_index}.txt\n\
++++ b/file{file_index}.txt\n\
+@@ -1,{lines_per_file} +1,{lines_per_file} @@\n"
+            ));
+            for line_index in 0..lines_per_file {
+                text.push_str(&format!(" file{file_index} line {line_index}\n"));
+            }
+        }
+        DiffState {
+            parsed: parse_diff(&text),
+            scroll: 0,
+            viewport: 0,
+            title: "#1".to_string(),
+            rendered_lines: None,
+            file_index: 0,
+            focus: DiffFocus::Body,
         }
     }
 
@@ -1879,6 +1985,134 @@ mod tests {
             diff.rendered_lines.is_some(),
             "無効化後はキャッシュが再構築されるべき"
         );
+    }
+
+    /// `diff` を持つ最小構成の `App`（Diff 画面の 2 ペイン描画テスト用）。
+    fn app_with_diff(diff: DiffState) -> App {
+        let mut app = App::new(crate::config::Config::default(), None);
+        app.screen = Screen::Diff;
+        app.diff = Some(diff);
+        app
+    }
+
+    #[test]
+    fn truncate_file_name_keeps_short_names_untouched() {
+        assert_eq!(truncate_file_name("src/main.rs", 20), "src/main.rs");
+    }
+
+    #[test]
+    fn truncate_file_name_prefers_tail_when_too_long() {
+        let truncated = truncate_file_name("very/long/nested/path/to/file.rs", 10);
+        assert_eq!(truncated.chars().count(), 10);
+        assert!(truncated.starts_with('…'));
+        assert!(truncated.ends_with("file.rs"));
+    }
+
+    #[test]
+    fn truncate_file_name_never_panics_on_zero_width() {
+        assert_eq!(truncate_file_name("file.rs", 0), "…");
+    }
+
+    #[test]
+    fn render_diff_renders_two_panes_with_file_list_and_body() {
+        let mut app = app_with_diff(make_multi_file_diff_state(2, 3));
+
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_diff(frame, area, &mut app);
+            })
+            .expect("draw succeeds");
+
+        let content = buffer_text(terminal.backend().buffer());
+        // サイドバーにファイル名が並ぶ。
+        assert!(content.contains("file0.txt"));
+        assert!(content.contains("file1.txt"));
+        // 本文には選択中（先頭）ファイルの内容が見える。
+        assert!(content.contains("file0 line 0"));
+    }
+
+    #[test]
+    fn render_diff_keeps_body_cache_across_frames_with_sidebar_present() {
+        // Phase1 の性能最適化（`rendered_lines` を 1 度だけ構築しキャッシュを使い回す）が
+        // サイドバー追加後も壊れていないことを確認する。
+        let mut app = app_with_diff(make_multi_file_diff_state(3, 100));
+
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_diff(frame, area, &mut app);
+            })
+            .expect("first draw succeeds");
+        let first_ptr = app
+            .diff
+            .as_ref()
+            .expect("diff present")
+            .rendered_lines
+            .as_ref()
+            .expect("cache built on first render")
+            .as_ptr();
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_diff(frame, area, &mut app);
+            })
+            .expect("second draw succeeds");
+        let second_ptr = app
+            .diff
+            .as_ref()
+            .expect("diff present")
+            .rendered_lines
+            .as_ref()
+            .expect("cache still present")
+            .as_ptr();
+
+        assert_eq!(
+            first_ptr, second_ptr,
+            "サイドバー描画を挟んでも本文の着色済み行キャッシュは再構築されないべき"
+        );
+    }
+
+    #[test]
+    fn render_diff_sidebar_selection_highlights_and_focus_moves_border_color() {
+        let mut diff = make_multi_file_diff_state(2, 3);
+        diff.file_index = 1;
+        let theme = Theme::default();
+        let sidebar_area = Rect::new(0, 0, 20, 12);
+
+        // フォーカスがファイル一覧のとき: 左ペイン枠線がフォーカス色。
+        diff.focus = DiffFocus::Files;
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| render_diff_sidebar(frame, sidebar_area, &diff, &theme))
+            .expect("draw succeeds");
+        let top_left = terminal
+            .backend()
+            .buffer()
+            .cell((0, 0))
+            .expect("cell exists");
+        assert_eq!(top_left.fg, theme.border_focus);
+        let content = buffer_text(terminal.backend().buffer());
+        // 選択中（file_index = 1）のファイル行にハイライト記号が付く。
+        assert!(content.contains("▌"));
+
+        // フォーカスが本文のとき: 左ペイン枠線は非フォーカス色。
+        diff.focus = DiffFocus::Body;
+        terminal
+            .draw(|frame| render_diff_sidebar(frame, sidebar_area, &diff, &theme))
+            .expect("draw succeeds");
+        let top_left = terminal
+            .backend()
+            .buffer()
+            .cell((0, 0))
+            .expect("cell exists");
+        assert_eq!(top_left.fg, theme.border);
     }
 
     #[test]
