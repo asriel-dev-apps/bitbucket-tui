@@ -5,6 +5,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use reqwest::{Client as HttpClient, Method};
 use serde::Serialize;
@@ -24,6 +25,12 @@ const MAX_PAGES: usize = 20;
 
 /// `User-Agent` ヘッダ値。
 const USER_AGENT: &str = concat!("bitbucket-tui/", env!("CARGO_PKG_VERSION"));
+
+/// TCP 接続確立のタイムアウト。ネットワーク不調時に無限に固まらないための早期打ち切り。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// リクエスト全体（接続〜応答受信完了）のタイムアウト。
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `paginate` に渡すページ取得フューチャの型。
 ///
@@ -54,9 +61,14 @@ impl std::fmt::Debug for BitbucketClient {
 
 impl BitbucketClient {
     /// メールと API token からクライアントを構築する。
+    ///
+    /// `connect_timeout`/`timeout` を設定し、ネットワーク不調時に無限に待たず早期に
+    /// エラーを返すようにする（TUI が「固まる」ことを防ぐ）。
     pub fn new(email: String, token: String) -> Result<Self, ApiError> {
         let http = HttpClient::builder()
             .user_agent(USER_AGENT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|error| ApiError::Network(error.to_string()))?;
         Ok(Self { http, email, token })
@@ -777,6 +789,14 @@ mod tests {
         .await;
 
         assert_eq!(result, Err(ApiError::Auth));
+    }
+
+    #[test]
+    fn new_builds_client_with_timeouts_configured() {
+        // connect_timeout/timeout を設定しても生成が panic せず、クローンも安価に行えること。
+        let client = BitbucketClient::new("me@example.com".to_string(), "token".to_string())
+            .expect("client builds with timeouts configured");
+        let _cloned = client.clone();
     }
 
     /// 実 API を叩くスモークテスト。実ネットワーク＋実 token が必要なので通常はスキップする。

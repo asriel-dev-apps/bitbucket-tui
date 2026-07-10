@@ -4,7 +4,7 @@
 //! [`Command`] として返す。実際の非同期実行（API 呼び出しの spawn）は `event` モジュールが行う。
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Line;
@@ -41,7 +41,9 @@ pub enum Screen {
 }
 
 /// PR 一覧の state フィルタ。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Hash` は PR 一覧キャッシュ（[`RevisitCache`]）のキーの一部として使うために導出する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PrStateFilter {
     Open,
     Merged,
@@ -820,6 +822,78 @@ fn jump_entry_key(entry: &JumpEntry) -> String {
     entry.search_key.clone()
 }
 
+/// 1 キャッシュ（[`RevisitCache`]）あたりの最大保持件数。
+///
+/// 超過時は最も古いキー（挿入順）を 1 件追い出す（FIFO）。ワークスペース/リポジトリ/PR は
+/// セッション中に無制限に増え得るため、素の `HashMap` のままだと長時間のレビューセッションで
+/// メモリが際限なく肥大する。真の LRU（アクセス順追跡）は実装コストの割に本用途では過剰と
+/// 判断し、挿入順ベースの単純な FIFO 追い出しのみを採用する。
+const REVISIT_CACHE_MAX_ENTRIES: usize = 30;
+
+/// 画面再訪時の stale-while-revalidate キャッシュ用コンテナ。
+///
+/// 「再訪時にキャッシュがあれば即表示し、裏で再取得して届いたら差し替える」ために使う
+/// 単純なキー・バリューストア。挿入順を [`VecDeque`] で追跡し、
+/// [`REVISIT_CACHE_MAX_ENTRIES`] を超えたら最も古いキーを追い出す。
+#[derive(Debug)]
+pub struct RevisitCache<K, V> {
+    map: HashMap<K, V>,
+    order: VecDeque<K>,
+}
+
+impl<K, V> Default for RevisitCache<K, V> {
+    fn default() -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+}
+
+impl<K, V> RevisitCache<K, V>
+where
+    K: std::hash::Hash + Eq + Clone,
+{
+    /// キーに対応する値への参照を返す（キャッシュ命中判定に使う）。
+    fn get(&self, key: &K) -> Option<&V> {
+        self.map.get(key)
+    }
+
+    /// キーに対応する値への可変参照を返す（部分更新の upsert に使う）。
+    fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        self.map.get_mut(key)
+    }
+
+    /// 挿入/上書きする。新規キーの追加で上限を超える場合は最も古いキーを 1 件追い出す
+    /// （既存キーの上書きは追い出しを起こさない＝挿入順は保持する）。
+    fn insert(&mut self, key: K, value: V) {
+        if !self.map.contains_key(&key) {
+            if self.order.len() >= REVISIT_CACHE_MAX_ENTRIES
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.map.remove(&oldest);
+            }
+            self.order.push_back(key.clone());
+        }
+        self.map.insert(key, value);
+    }
+
+    /// 指定キーのエントリを取り除く（書き込み操作後の無効化に使う）。
+    fn remove(&mut self, key: &K) {
+        self.map.remove(key);
+        self.order.retain(|existing| existing != key);
+    }
+}
+
+/// PR 詳細キャッシュの 1 エントリ。詳細・diffstat・コメントをまとめて保持し、
+/// [`App::open_pr_detail_with`] での即時表示と 3 種の `Msg::*Loaded` からの部分更新に使う。
+#[derive(Debug, Clone)]
+pub struct PrDetailCache {
+    pub pr: PullRequest,
+    pub diffstat: Vec<DiffStatEntry>,
+    pub comments: Vec<Comment>,
+}
+
 /// アプリ全体の状態。
 pub struct App {
     pub screen: Screen,
@@ -837,6 +911,10 @@ pub struct App {
     pub repositories_sort: SortMode,
     /// Repositories の取得順スナップショット（`SortMode::Fetched` に戻すための元データ）。
     pub repositories_fetch_order: Vec<Repository>,
+    /// リポジトリ一覧の再訪キャッシュ（workspace slug → 取得結果）。
+    /// [`App::jump_to_workspace`] が再訪時に即表示するために使い、`Msg::RepositoriesLoaded`
+    /// 受信のたびに最新化する（stale-while-revalidate）。
+    pub repositories_cache: RevisitCache<String, Vec<Repository>>,
     pub selected_workspace: Option<String>,
     pub selected_repo: Option<String>,
     /// 選択リポジトリの既定ブランチ名（`mainbranch.name`）。Source ルートに使う。
@@ -846,8 +924,17 @@ pub struct App {
     pub pull_requests_sort: SortMode,
     /// PullRequests の取得順スナップショット（`SortMode::Fetched` に戻すための元データ）。
     pub pull_requests_fetch_order: Vec<PullRequest>,
+    /// PR 一覧の再訪キャッシュ（キー = (repo slug, state フィルタ)）。
+    /// `repo` は `Msg::PullRequestsLoaded` が運ぶ値（`review_context()` 由来の repo slug）に
+    /// 合わせており、既存のステイル判定ガード（`repo_slug()` 一致チェック）と精度を揃えている
+    /// （workspace をまたいだ同名 repo slug の衝突は既存ガードと同じ既知の制約）。
+    pub pull_requests_cache: RevisitCache<(String, PrStateFilter), Vec<PullRequest>>,
     pub pr_state_filter: PrStateFilter,
     pub current_pr: Option<PullRequest>,
+    /// PR 詳細の再訪キャッシュ（キー = (repo full_name, PR id)）。
+    /// [`App::open_pr_detail_with`] が即時表示に使い、`Msg::PrDetailLoaded`/`DiffStatLoaded`/
+    /// `CommentsLoaded` の受信ごとに該当フィールドだけ部分更新する。
+    pub pr_detail_cache: RevisitCache<(String, u64), PrDetailCache>,
     pub diffstat: SelectList<DiffStatEntry>,
     pub comments: Vec<Comment>,
     pub detail_scroll: u16,
@@ -930,14 +1017,17 @@ impl App {
             repositories: SelectList::default(),
             repositories_sort: SortMode::default(),
             repositories_fetch_order: Vec::new(),
+            repositories_cache: RevisitCache::default(),
             selected_workspace: None,
             selected_repo: None,
             repo_main_branch: None,
             pull_requests: SelectList::default(),
             pull_requests_sort: SortMode::default(),
             pull_requests_fetch_order: Vec::new(),
+            pull_requests_cache: RevisitCache::default(),
             pr_state_filter: PrStateFilter::Open,
             current_pr: None,
+            pr_detail_cache: RevisitCache::default(),
             diffstat: SelectList::default(),
             comments: Vec::new(),
             detail_scroll: 0,
@@ -1001,13 +1091,14 @@ impl App {
                 Command::None
             }
             Msg::RepositoriesLoaded { workspace, repos } => {
-                // 取得中に別ワークスペースへ切り替えていた場合は破棄。
+                // 表示中かどうかに関わらずキャッシュは最新化する（裏で他ワークスペースへ
+                // 切り替えていても、その結果は次回再訪時に活かす）。
+                self.repositories_cache
+                    .insert(workspace.clone(), repos.clone());
+                // 取得中に別ワークスペースへ切り替えていた場合は画面反映のみ破棄。
                 if self.selected_workspace.as_deref() == Some(workspace.as_str()) {
                     self.status = Status::Idle;
-                    // 新しい取得結果を「取得順」の起点として保持し、ソートモードもリセットする。
-                    self.repositories_fetch_order = repos.clone();
-                    self.repositories_sort = SortMode::Fetched;
-                    self.repositories.set_items(repos);
+                    self.apply_repositories(repos);
                 }
                 Command::None
             }
@@ -1016,35 +1107,42 @@ impl App {
                 Command::None
             }
             Msg::PullRequestsLoaded { repo, filter, prs } => {
+                // 表示中かどうかに関わらずキャッシュは最新化する（他 repo/フィルタへ切り替えて
+                // いても、その結果は次回再訪時に活かす）。
+                self.pull_requests_cache
+                    .insert((repo.clone(), filter), prs.clone());
                 if self.repo_slug().as_deref() == Some(repo.as_str())
                     && self.pr_state_filter == filter
                 {
                     self.status = Status::Idle;
-                    self.pull_requests_fetch_order = prs.clone();
-                    self.pull_requests_sort = SortMode::Fetched;
-                    self.pull_requests.set_items(prs);
+                    self.apply_pull_requests(prs);
                 }
                 Command::None
             }
             Msg::PrDetailLoaded { id, pr } => {
                 if self.current_pr_id() == Some(id) {
                     self.clear_loading();
-                    self.current_pr = Some(*pr);
+                    let pr = *pr;
+                    self.current_pr = Some(pr.clone());
+                    self.update_pr_detail_cache(id, move |entry| entry.pr = pr);
                 }
                 Command::None
             }
             Msg::DiffStatLoaded { id, entries } => {
                 if self.current_pr_id() == Some(id) {
-                    self.diffstat.set_items(entries);
+                    self.diffstat.set_items(entries.clone());
+                    self.update_pr_detail_cache(id, move |entry| entry.diffstat = entries);
                 }
                 Command::None
             }
             Msg::CommentsLoaded { id, comments } => {
                 if self.current_pr_id() == Some(id) {
-                    self.comments = comments
+                    let comments: Vec<Comment> = comments
                         .into_iter()
                         .filter(|comment| !comment.deleted)
                         .collect();
+                    self.comments = comments.clone();
+                    self.update_pr_detail_cache(id, move |entry| entry.comments = comments);
                 }
                 Command::None
             }
@@ -1066,6 +1164,10 @@ impl App {
             Msg::ReviewActionDone { id, message } => {
                 if self.current_pr_id() == Some(id) {
                     self.status = Status::Success(message);
+                    // 承認/変更要求の状態は PR 一覧の ✔n/m バッジにも出るため、一覧キャッシュは
+                    // 無効化する（詳細側は refresh_detail() の再取得結果が update_pr_detail_cache
+                    // 経由で自動的に最新化される）。
+                    self.invalidate_pull_requests_cache_for_current_repo();
                     return self.refresh_detail();
                 }
                 Command::None
@@ -1074,6 +1176,7 @@ impl App {
                 self.comment_editor = None;
                 if self.current_pr_id() == Some(id) {
                     self.status = Status::Success("コメントを投稿しました".to_string());
+                    self.invalidate_pull_requests_cache_for_current_repo();
                     return self.refresh_comments();
                 }
                 Command::None
@@ -1082,6 +1185,9 @@ impl App {
                 self.merge_modal = None;
                 if self.current_pr_id() == Some(id) {
                     self.status = Status::Success(format!("PR #{id} をマージしました"));
+                    // マージで PR の state が変わり一覧の掲載フィルタ（OPEN/MERGED/…）を
+                    // またぐため、一覧キャッシュは無効化して次回表示を必ず再取得させる。
+                    self.invalidate_pull_requests_cache_for_current_repo();
                     return self.refresh_detail();
                 }
                 Command::None
@@ -1502,6 +1608,10 @@ impl App {
     /// 指定ワークスペースへ入る（既定ワークスペースの保存・使用頻度カウント・リポジトリ取得の
     /// 開始まで行う）。一覧での選択決定（[`App::enter_workspace`]）とジャンプパレットの
     /// 双方から呼ぶ共通経路。
+    ///
+    /// キャッシュ（[`App::repositories_cache`]）があれば即座に一覧を表示しつつ、裏で
+    /// `Command::LoadRepositories` を発行して最新化する（stale-while-revalidate）。
+    /// キャッシュが無ければ従来通り一覧をクリアして Loading 表示を出す。
     fn jump_to_workspace(&mut self, slug: String) -> Command {
         self.selected_workspace = Some(slug.clone());
         self.config.default_workspace = Some(slug.clone());
@@ -1510,9 +1620,18 @@ impl App {
             tracing::warn!(%error, "既定ワークスペース/使用頻度の保存に失敗しました");
         }
 
-        self.repositories.set_items(Vec::new());
         self.screen = Screen::Repositories;
-        self.status = Status::Loading(format!("{slug} のリポジトリを取得中…"));
+
+        match self.repositories_cache.get(&slug).cloned() {
+            Some(cached) => {
+                self.apply_repositories(cached);
+                self.status = Status::Idle;
+            }
+            None => {
+                self.repositories.set_items(Vec::new());
+                self.status = Status::Loading(format!("{slug} のリポジトリを取得中…"));
+            }
+        }
 
         match &self.client {
             Some(client) => Command::LoadRepositories {
@@ -1524,6 +1643,15 @@ impl App {
                 Command::None
             }
         }
+    }
+
+    /// 取得結果を `repositories` へ反映する（取得順スナップショットとソートモードの
+    /// リセットを含む）。新規取得（`Msg::RepositoriesLoaded`）とキャッシュからの即時表示
+    /// （[`App::jump_to_workspace`]）の両方から呼ぶ共通経路。
+    fn apply_repositories(&mut self, repos: Vec<Repository>) {
+        self.repositories_fetch_order = repos.clone();
+        self.repositories_sort = SortMode::Fetched;
+        self.repositories.set_items(repos);
     }
 
     /// `config.usage` のカウンタを 1 増やす（保存は呼び出し側の責務）。
@@ -1647,27 +1775,53 @@ impl App {
     fn open_pull_requests(&mut self) -> Command {
         self.screen = Screen::PullRequests;
         self.pr_state_filter = PrStateFilter::Open;
-        self.pull_requests.set_items(Vec::new());
         self.current_pr = None;
         self.reload_pull_requests()
     }
 
     /// 現在のフィルタで PR 一覧を再取得する。
+    ///
+    /// キャッシュ（[`App::pull_requests_cache`]、キー = (repo slug, state フィルタ)）が
+    /// あれば即座に一覧を表示しつつ、裏で `Command::LoadPullRequests` を発行して最新化する
+    /// （stale-while-revalidate）。この経路はリポジトリへの新規入場・フィルタ切り替え・
+    /// 手動リロード（`r`）のいずれからも呼ばれ、全て同じ挙動になる。キャッシュが無ければ
+    /// 従来通り一覧をクリアして Loading 表示を出す。
     fn reload_pull_requests(&mut self) -> Command {
         let Some((client, workspace, repo)) = self.review_context() else {
             self.status = Status::Error("認証クライアントが未初期化です".to_string());
             return Command::None;
         };
-        self.status = Status::Loading(format!(
-            "PR 一覧を取得中…（{}）",
-            self.pr_state_filter.label()
-        ));
+
+        let cache_key = (repo.clone(), self.pr_state_filter);
+        match self.pull_requests_cache.get(&cache_key).cloned() {
+            Some(cached) => {
+                self.apply_pull_requests(cached);
+                self.status = Status::Idle;
+            }
+            None => {
+                self.pull_requests.set_items(Vec::new());
+                self.status = Status::Loading(format!(
+                    "PR 一覧を取得中…（{}）",
+                    self.pr_state_filter.label()
+                ));
+            }
+        }
+
         Command::LoadPullRequests {
             client,
             workspace,
             repo,
             filter: self.pr_state_filter,
         }
+    }
+
+    /// 取得結果を `pull_requests` へ反映する（取得順スナップショットとソートモードの
+    /// リセットを含む）。新規取得（`Msg::PullRequestsLoaded`）とキャッシュからの即時表示
+    /// （[`App::reload_pull_requests`]）の両方から呼ぶ共通経路。
+    fn apply_pull_requests(&mut self, prs: Vec<PullRequest>) {
+        self.pull_requests_fetch_order = prs.clone();
+        self.pull_requests_sort = SortMode::Fetched;
+        self.pull_requests.set_items(prs);
     }
 
     fn on_key_pull_requests(&mut self, key: KeyEvent) -> Command {
@@ -1713,7 +1867,6 @@ impl App {
 
     fn set_pr_filter(&mut self, filter: PrStateFilter) -> Command {
         self.pr_state_filter = filter;
-        self.pull_requests.set_items(Vec::new());
         self.reload_pull_requests()
     }
 
@@ -1805,6 +1958,11 @@ impl App {
     /// PR 詳細画面へ遷移し、詳細/diffstat/コメントの取得を発行する共通経路。
     /// 一覧での決定（[`App::open_pr_detail`]）とジャンプパレット（[`App::jump_to_pr`]）の
     /// 双方から呼ぶ。
+    ///
+    /// キャッシュ（[`App::pr_detail_cache`]、キー = (repo full_name, PR id)）があれば
+    /// 詳細/diffstat/コメントを即座に表示しつつ、裏で 3 つの `Command::Load*` を発行して
+    /// 最新化する（stale-while-revalidate）。承認状態やコメント数はレビュー中に変わり得る
+    /// ため、キャッシュ命中時も必ず裏で再取得する。
     fn open_pr_detail_with(
         &mut self,
         client: BitbucketClient,
@@ -1814,14 +1972,26 @@ impl App {
     ) -> Command {
         let id = pr.id;
         self.current_pr = Some(pr.clone());
-        self.diffstat.set_items(Vec::new());
-        self.comments = Vec::new();
         self.diff = None;
         self.detail_scroll = 0;
         self.screen = Screen::PullRequestDetail;
         self.record_recent_pr(pr);
 
-        self.status = Status::Loading(format!("PR #{id} を取得中…"));
+        let cache_key = self.selected_repo.clone().map(|full_name| (full_name, id));
+        match cache_key.and_then(|key| self.pr_detail_cache.get(&key).cloned()) {
+            Some(cached) => {
+                self.current_pr = Some(cached.pr);
+                self.diffstat.set_items(cached.diffstat);
+                self.comments = cached.comments;
+                self.status = Status::Idle;
+            }
+            None => {
+                self.diffstat.set_items(Vec::new());
+                self.comments = Vec::new();
+                self.status = Status::Loading(format!("PR #{id} を取得中…"));
+            }
+        }
+
         Command::Batch(vec![
             Command::LoadPrDetail {
                 client: client.clone(),
@@ -2995,6 +3165,55 @@ impl App {
         }
     }
 
+    /// PR 詳細キャッシュ（[`App::pr_detail_cache`]）の該当エントリを取得-or-作成して
+    /// `update` で部分更新する。キーは (`selected_repo`, `id`)。エントリが無い場合は
+    /// `self.current_pr`（呼び出し元のガードで `id` と一致していることが確認済み）を
+    /// 土台にして新規作成する。`selected_repo`/`current_pr` のどちらかが無ければ何もしない
+    /// （レビュー系操作ができない状態と同じ扱い）。
+    fn update_pr_detail_cache<F>(&mut self, id: u64, update: F)
+    where
+        F: FnOnce(&mut PrDetailCache),
+    {
+        let Some(repo_full_name) = self.selected_repo.clone() else {
+            return;
+        };
+        let key = (repo_full_name, id);
+        if let Some(entry) = self.pr_detail_cache.get_mut(&key) {
+            update(entry);
+            return;
+        }
+        let Some(current_pr) = self.current_pr.clone() else {
+            return;
+        };
+        let mut entry = PrDetailCache {
+            pr: current_pr,
+            diffstat: Vec::new(),
+            comments: Vec::new(),
+        };
+        update(&mut entry);
+        self.pr_detail_cache.insert(key, entry);
+    }
+
+    /// 現在のリポジトリに紐づく PR 一覧キャッシュを全フィルタ分まとめて無効化する。
+    ///
+    /// 承認/変更要求/コメント/マージ成功後に呼ぶ。フィルタ別に承認バッジや PR の
+    /// 掲載フィルタ（マージで OPEN→MERGED 等）を厳密に差分更新するより、対象 repo の
+    /// キャッシュをまとめて削除して次回表示を必ず再取得（キャッシュミス）させる方が単純で
+    /// 確実なため、この方式を採る。
+    fn invalidate_pull_requests_cache_for_current_repo(&mut self) {
+        let Some(repo) = self.repo_slug() else {
+            return;
+        };
+        for filter in [
+            PrStateFilter::Open,
+            PrStateFilter::Merged,
+            PrStateFilter::Declined,
+            PrStateFilter::All,
+        ] {
+            self.pull_requests_cache.remove(&(repo.clone(), filter));
+        }
+    }
+
     /// 自分が現在この PR を承認しているか（participant を自分と照合）。
     fn i_approved(&self) -> bool {
         self.current_pr.as_ref().is_some_and(|pr| {
@@ -3363,6 +3582,22 @@ mod tests {
                   "close_source_branch": true, "participants": [] }}"#
         );
         serde_json::from_str(&json).expect("valid pr json")
+    }
+
+    fn make_diffstat_entry(path: &str) -> DiffStatEntry {
+        let json = format!(
+            r#"{{ "status": "modified", "lines_added": 1, "lines_removed": 0,
+                  "new": {{ "path": "{path}" }} }}"#
+        );
+        serde_json::from_str(&json).expect("valid diffstat entry json")
+    }
+
+    fn make_comment(id: u64, raw: &str) -> Comment {
+        let json = format!(
+            r#"{{ "id": {id}, "content": {{ "raw": "{raw}" }},
+                  "user": {{ "display_name": "Alice" }}, "deleted": false }}"#
+        );
+        serde_json::from_str(&json).expect("valid comment json")
     }
 
     fn make_branch(name: &str, hash: &str) -> Branch {
@@ -5203,5 +5438,297 @@ diff --git a/two.txt b/two.txt\n\
             }
             other => panic!("expected Batch, got {other:?}"),
         }
+    }
+
+    // ---- キャッシュ（stale-while-revalidate） ----
+
+    #[test]
+    fn revisit_cache_evicts_oldest_entry_once_over_capacity() {
+        let mut cache: RevisitCache<u32, u32> = RevisitCache::default();
+        for i in 0..REVISIT_CACHE_MAX_ENTRIES as u32 {
+            cache.insert(i, i);
+        }
+        assert!(cache.get(&0).is_some());
+
+        // 上限を超える 1 件を追加すると、最も古い(0)が追い出される。
+        cache.insert(REVISIT_CACHE_MAX_ENTRIES as u32, 999);
+        assert!(cache.get(&0).is_none());
+        assert!(cache.get(&1).is_some());
+        assert_eq!(cache.get(&(REVISIT_CACHE_MAX_ENTRIES as u32)), Some(&999));
+    }
+
+    #[test]
+    fn revisit_cache_overwriting_existing_key_does_not_evict() {
+        let mut cache: RevisitCache<&str, u32> = RevisitCache::default();
+        cache.insert("a", 1);
+        cache.insert("a", 2);
+        assert_eq!(cache.get(&"a"), Some(&2));
+    }
+
+    #[test]
+    fn revisit_cache_remove_drops_entry() {
+        let mut cache: RevisitCache<&str, u32> = RevisitCache::default();
+        cache.insert("a", 1);
+        cache.remove(&"a");
+        assert!(cache.get(&"a").is_none());
+    }
+
+    #[test]
+    fn revisiting_workspace_shows_cached_repositories_immediately_and_revalidates() {
+        let mut app = review_app();
+        app.screen = Screen::Workspaces;
+        app.workspaces.set_items(vec![Workspace {
+            slug: "acme".to_string(),
+            name: None,
+            uuid: None,
+        }]);
+
+        // 初回入場: キャッシュなし → 一覧クリア + Loading。
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+        assert_eq!(app.screen, Screen::Repositories);
+        assert!(app.repositories.items.is_empty());
+        assert!(matches!(app.status, Status::Loading(_)));
+        assert!(matches!(cmd, Command::LoadRepositories { .. }));
+
+        app.update(Msg::RepositoriesLoaded {
+            workspace: "acme".to_string(),
+            repos: vec![make_repo("acme/widget", None)],
+        });
+        assert_eq!(app.repositories.items.len(), 1);
+
+        // 別画面を経由して再訪する。
+        app.screen = Screen::Workspaces;
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+
+        // キャッシュ命中: 即座に一覧が表示され、Loading にはならない。
+        assert_eq!(app.repositories.items.len(), 1);
+        assert_eq!(app.status, Status::Idle);
+        // それでも裏では再取得コマンドを発行する（stale-while-revalidate）。
+        assert!(matches!(cmd, Command::LoadRepositories { .. }));
+    }
+
+    #[test]
+    fn revisiting_workspace_from_cache_resets_sort_and_fetch_order_like_fresh_load() {
+        let mut app = review_app();
+        app.screen = Screen::Workspaces;
+        app.workspaces.set_items(vec![Workspace {
+            slug: "acme".to_string(),
+            name: None,
+            uuid: None,
+        }]);
+        app.update(Msg::Key(key(KeyCode::Enter)));
+        app.update(Msg::RepositoriesLoaded {
+            workspace: "acme".to_string(),
+            repos: vec![make_repo("acme/zeta", None), make_repo("acme/alpha", None)],
+        });
+
+        app.update(Msg::Key(key(KeyCode::Char('S'))));
+        assert_eq!(app.repositories_sort, SortMode::NameAsc);
+        assert_eq!(app.repositories.items[0].name, "alpha");
+
+        // 別画面 → 再訪（キャッシュ命中）。
+        app.screen = Screen::Workspaces;
+        app.update(Msg::Key(key(KeyCode::Enter)));
+
+        // キャッシュ復元でも fetch_order スナップショットが張り直され、ソートモードは
+        // 新規取得時と同じく Fetched にリセットされる。
+        assert_eq!(app.repositories_sort, SortMode::Fetched);
+        assert_eq!(app.repositories.items[0].name, "zeta");
+        assert_eq!(app.repositories_fetch_order.len(), 2);
+    }
+
+    #[test]
+    fn reentering_repository_shows_cached_pull_requests_immediately_and_revalidates() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        app.repositories
+            .set_items(vec![make_repo("acme/widget", None)]);
+
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+        assert_eq!(app.screen, Screen::PullRequests);
+        assert!(app.pull_requests.items.is_empty());
+        assert!(matches!(app.status, Status::Loading(_)));
+        assert!(matches!(cmd, Command::LoadPullRequests { .. }));
+
+        app.update(Msg::PullRequestsLoaded {
+            repo: "widget".to_string(),
+            filter: PrStateFilter::Open,
+            prs: vec![make_pr(1, "OPEN")],
+        });
+        assert_eq!(app.pull_requests.items.len(), 1);
+
+        // Repositories へ戻り、同じ repo へ再入場する。
+        app.screen = Screen::Repositories;
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+
+        // キャッシュ命中: 即座に表示され、Loading にはならない。
+        assert_eq!(app.pull_requests.items.len(), 1);
+        assert_eq!(app.status, Status::Idle);
+        assert!(matches!(cmd, Command::LoadPullRequests { .. }));
+    }
+
+    #[test]
+    fn pull_requests_cache_is_keyed_by_filter_and_does_not_leak_across_filters() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.pr_state_filter = PrStateFilter::Open;
+        app.update(Msg::PullRequestsLoaded {
+            repo: "widget".to_string(),
+            filter: PrStateFilter::Open,
+            prs: vec![make_pr(1, "OPEN")],
+        });
+
+        // Merged へ切り替え: Open 用キャッシュを誤って使わないこと。
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('m'))));
+        assert!(app.pull_requests.items.is_empty());
+        assert!(matches!(app.status, Status::Loading(_)));
+        match cmd {
+            Command::LoadPullRequests { filter, .. } => {
+                assert_eq!(filter, PrStateFilter::Merged);
+            }
+            other => panic!("expected LoadPullRequests, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pull_requests_cache_restore_resets_sort_and_fetch_order_like_fresh_load() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.update(Msg::PullRequestsLoaded {
+            repo: "widget".to_string(),
+            filter: PrStateFilter::Open,
+            prs: vec![make_pr(9, "OPEN"), make_pr(2, "OPEN")],
+        });
+        app.update(Msg::Key(key(KeyCode::Char('S')))); // NameAsc
+        assert_eq!(app.pull_requests_sort, SortMode::NameAsc);
+        assert_eq!(app.pull_requests.items[0].id, 2);
+
+        // 別画面 → 再訪（手動リロードでもキャッシュ命中の経路を通る）。
+        app.screen = Screen::Repositories;
+        app.screen = Screen::PullRequests;
+        app.update(Msg::Key(key(KeyCode::Char('r'))));
+
+        assert_eq!(app.pull_requests_sort, SortMode::Fetched);
+        assert_eq!(app.pull_requests.items[0].id, 9);
+    }
+
+    #[test]
+    fn reopening_pr_detail_shows_cached_data_immediately_and_revalidates() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.pull_requests.set_items(vec![make_pr(7, "OPEN")]);
+
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+        assert_eq!(app.screen, Screen::PullRequestDetail);
+        assert!(matches!(app.status, Status::Loading(_)));
+        assert!(app.diffstat.items.is_empty());
+        assert!(app.comments.is_empty());
+        assert!(matches!(cmd, Command::Batch(_)));
+
+        app.update(Msg::PrDetailLoaded {
+            id: 7,
+            pr: Box::new(make_pr(7, "OPEN")),
+        });
+        app.update(Msg::DiffStatLoaded {
+            id: 7,
+            entries: vec![make_diffstat_entry("src/lib.rs")],
+        });
+        app.update(Msg::CommentsLoaded {
+            id: 7,
+            comments: vec![make_comment(1, "LGTM")],
+        });
+        assert_eq!(app.diffstat.items.len(), 1);
+        assert_eq!(app.comments.len(), 1);
+
+        // 一覧へ戻り、同じ PR を再度開く。
+        app.screen = Screen::PullRequests;
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+
+        // キャッシュ命中: 詳細/diffstat/コメントが即座に表示され、Loading にはならない。
+        assert_eq!(app.screen, Screen::PullRequestDetail);
+        assert_eq!(app.status, Status::Idle);
+        assert_eq!(app.diffstat.items.len(), 1);
+        assert_eq!(app.comments.len(), 1);
+        assert_eq!(app.current_pr.as_ref().map(|pr| pr.id), Some(7));
+        // それでも裏では詳細/diffstat/コメントの再取得コマンドを発行する。
+        match cmd {
+            Command::Batch(cmds) => assert_eq!(cmds.len(), 3),
+            other => panic!("expected Batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn review_action_success_invalidates_pull_requests_cache_for_current_repo() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.pr_state_filter = PrStateFilter::Open;
+        app.update(Msg::PullRequestsLoaded {
+            repo: "widget".to_string(),
+            filter: PrStateFilter::Open,
+            prs: vec![make_pr(1, "OPEN")],
+        });
+
+        // 再訪してキャッシュ命中（Idle）を確認しておく。
+        app.screen = Screen::Repositories;
+        app.screen = Screen::PullRequests;
+        app.update(Msg::Key(key(KeyCode::Char('r'))));
+        assert_eq!(app.status, Status::Idle);
+
+        app.current_pr = Some(make_pr(1, "OPEN"));
+        app.update(Msg::ReviewActionDone {
+            id: 1,
+            message: "承認しました".to_string(),
+        });
+
+        // 一覧キャッシュが無効化され、再訪すると Loading（キャッシュミス）に戻ること。
+        app.screen = Screen::Repositories;
+        app.screen = Screen::PullRequests;
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('r'))));
+        assert!(matches!(app.status, Status::Loading(_)));
+        assert!(matches!(cmd, Command::LoadPullRequests { .. }));
+    }
+
+    #[test]
+    fn merge_success_invalidates_pull_requests_cache_for_current_repo() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.pr_state_filter = PrStateFilter::Open;
+        app.update(Msg::PullRequestsLoaded {
+            repo: "widget".to_string(),
+            filter: PrStateFilter::Open,
+            prs: vec![make_pr(3, "OPEN")],
+        });
+
+        app.current_pr = Some(make_pr(3, "OPEN"));
+        app.merge_modal = Some(MergeModal::new(false));
+        app.update(Msg::MergeDone { id: 3 });
+
+        app.screen = Screen::Repositories;
+        app.screen = Screen::PullRequests;
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('r'))));
+        assert!(matches!(app.status, Status::Loading(_)));
+        assert!(matches!(cmd, Command::LoadPullRequests { .. }));
+    }
+
+    #[test]
+    fn comment_posted_invalidates_pull_requests_cache_for_current_repo() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.pr_state_filter = PrStateFilter::Open;
+        app.update(Msg::PullRequestsLoaded {
+            repo: "widget".to_string(),
+            filter: PrStateFilter::Open,
+            prs: vec![make_pr(5, "OPEN")],
+        });
+
+        app.current_pr = Some(make_pr(5, "OPEN"));
+        app.comment_editor = Some(CommentEditor::default());
+        app.update(Msg::CommentPosted { id: 5 });
+
+        app.screen = Screen::Repositories;
+        app.screen = Screen::PullRequests;
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('r'))));
+        assert!(matches!(app.status, Status::Loading(_)));
+        assert!(matches!(cmd, Command::LoadPullRequests { .. }));
     }
 }
