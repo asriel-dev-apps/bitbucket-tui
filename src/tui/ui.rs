@@ -16,8 +16,8 @@ use ratatui::widgets::{
 };
 
 use crate::api::{
-    Branch, Comment, Commit, DiffStatEntry, MergeStrategy, Pipeline, PipelineStatus, PipelineStep,
-    PullRequest, SrcEntry,
+    Branch, Comment, Commit, DiffStatEntry, MergeStrategy, PageInfo, Pipeline, PipelineStatus,
+    PipelineStep, PullRequest, SrcEntry,
 };
 use crate::tui::app::{
     App, CommentEditor, ConfirmModal, DiffFocus, DiffState, JumpPaletteState, MergeModal, Screen,
@@ -297,89 +297,194 @@ fn count_label<T>(list: &SelectList<T>) -> String {
     }
 }
 
+/// 一覧本体とページャ行（下端 1 行）に分割する。3 画面（Workspaces/Repositories/
+/// PullRequests）共通のレイアウト。
+fn split_list_and_pager(area: Rect) -> (Rect, Rect) {
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+    (rows[0], rows[1])
+}
+
 fn render_workspaces(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = app.theme;
+    let (list_area, pager_area) = split_list_and_pager(area);
+
     if app.workspaces.matches.is_empty() {
         let text = list_empty_text(&app.workspaces, "参加しているワークスペースがありません");
-        render_placeholder(frame, area, &app.status, &text, &theme);
-        return;
+        render_placeholder(frame, list_area, &app.status, &text, &theme);
+    } else {
+        let items: Vec<ListItem> = app
+            .workspaces
+            .visible()
+            .map(|workspace| {
+                ListItem::new(Line::from(vec![
+                    Span::raw(workspace.display_name().to_string()),
+                    Span::styled(format!("  ({})", workspace.slug), Style::new().dim()),
+                ]))
+            })
+            .collect();
+        let title = format!(" ワークスペース ({}) ", count_label(&app.workspaces));
+        let list = list_widget(&theme, items, title);
+        frame.render_stateful_widget(list, list_area, &mut app.workspaces.state);
     }
-    let items: Vec<ListItem> = app
-        .workspaces
-        .visible()
-        .map(|workspace| {
-            ListItem::new(Line::from(vec![
-                Span::raw(workspace.display_name().to_string()),
-                Span::styled(format!("  ({})", workspace.slug), Style::new().dim()),
-            ]))
-        })
-        .collect();
-    let title = format!(" ワークスペース ({}) ", count_label(&app.workspaces));
-    let list = list_widget(&theme, items, title);
-    frame.render_stateful_widget(list, area, &mut app.workspaces.state);
+
+    render_pager(frame, pager_area, app.workspaces_page_info, &theme);
 }
 
 fn render_repositories(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = app.theme;
+    let (list_area, pager_area) = split_list_and_pager(area);
+
     if app.repositories.matches.is_empty() {
         let text = list_empty_text(&app.repositories, "リポジトリがありません");
-        render_placeholder(frame, area, &app.status, &text, &theme);
-        return;
+        render_placeholder(frame, list_area, &app.status, &text, &theme);
+    } else {
+        let items: Vec<ListItem> = app
+            .repositories
+            .visible()
+            .map(|repo| {
+                let visibility = if repo.is_private { "private" } else { "public" };
+                let visibility_style = if repo.is_private {
+                    Style::new().fg(theme.accent)
+                } else {
+                    Style::new().fg(theme.success)
+                };
+                let updated = repo
+                    .updated_on
+                    .as_deref()
+                    .map(|value| value.chars().take(10).collect::<String>())
+                    .unwrap_or_default();
+                ListItem::new(Line::from(vec![
+                    Span::raw(repo.name.clone()),
+                    Span::raw("  "),
+                    Span::styled(format!("[{visibility}]"), visibility_style),
+                    Span::styled(format!("  {updated}"), Style::new().dim()),
+                ]))
+            })
+            .collect();
+        let title = format!(
+            " リポジトリ ({}) [{}] ",
+            count_label(&app.repositories),
+            app.repositories_sort.label()
+        );
+        let list = list_widget(&theme, items, title);
+        frame.render_stateful_widget(list, list_area, &mut app.repositories.state);
     }
-    let items: Vec<ListItem> = app
-        .repositories
-        .visible()
-        .map(|repo| {
-            let visibility = if repo.is_private { "private" } else { "public" };
-            let visibility_style = if repo.is_private {
-                Style::new().fg(theme.accent)
-            } else {
-                Style::new().fg(theme.success)
-            };
-            let updated = repo
-                .updated_on
-                .as_deref()
-                .map(|value| value.chars().take(10).collect::<String>())
-                .unwrap_or_default();
-            ListItem::new(Line::from(vec![
-                Span::raw(repo.name.clone()),
-                Span::raw("  "),
-                Span::styled(format!("[{visibility}]"), visibility_style),
-                Span::styled(format!("  {updated}"), Style::new().dim()),
-            ]))
-        })
-        .collect();
-    let title = format!(
-        " リポジトリ ({}) [{}] ",
-        count_label(&app.repositories),
-        app.repositories_sort.label()
-    );
-    let list = list_widget(&theme, items, title);
-    frame.render_stateful_widget(list, area, &mut app.repositories.state);
+
+    render_pager(frame, pager_area, app.repositories_page_info, &theme);
 }
 
 fn render_pull_requests(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = app.theme;
     let filter = app.pr_state_filter.label();
+    let (list_area, pager_area) = split_list_and_pager(area);
+
     if app.pull_requests.matches.is_empty() {
         let no_data_text = format!("{filter} の PR がありません");
         let text = list_empty_text(&app.pull_requests, &no_data_text);
-        render_placeholder(frame, area, &app.status, &text, &theme);
-        return;
+        render_placeholder(frame, list_area, &app.status, &text, &theme);
+    } else {
+        let items: Vec<ListItem> = app
+            .pull_requests
+            .visible()
+            .map(|pr| ListItem::new(pull_request_row(pr, &theme)))
+            .collect();
+        let title = format!(
+            " PR [{}] ({}) [{}] ",
+            filter,
+            count_label(&app.pull_requests),
+            app.pull_requests_sort.label()
+        );
+        let list = list_widget(&theme, items, title);
+        frame.render_stateful_widget(list, list_area, &mut app.pull_requests.state);
     }
-    let items: Vec<ListItem> = app
-        .pull_requests
-        .visible()
-        .map(|pr| ListItem::new(pull_request_row(pr, &theme)))
-        .collect();
-    let title = format!(
-        " PR [{}] ({}) [{}] ",
-        filter,
-        count_label(&app.pull_requests),
-        app.pull_requests_sort.label()
-    );
-    let list = list_widget(&theme, items, title);
-    frame.render_stateful_widget(list, area, &mut app.pull_requests.state);
+
+    render_pager(frame, pager_area, app.pull_requests_page_info, &theme);
+}
+
+/// ページャ行を描画する（`‹ 1 2 [3] 4 … N ›` 形式）。[`pager_line`] を参照。
+fn render_pager(frame: &mut Frame, area: Rect, info: PageInfo, theme: &Theme) {
+    let paragraph = Paragraph::new(pager_line(info, theme)).alignment(Alignment::Center);
+    frame.render_widget(paragraph, area);
+}
+
+/// ページャに表示するページ番号を、`None`（省略記号 `…`）を挟みつつ列挙する。
+///
+/// 先頭・末尾・現在ページの前後 1 件だけを候補にし、間が空けば `None` を 1 つ挿む。
+/// `total`（総ページ数）ぶん全件を走査しないため、総ページ数が大きくても O(1) で済む。
+/// `current` が `[1, total]` の範囲外でも（`total.max(1)` へクランプして）破綻しない。
+fn pager_page_labels(current: u32, total: u32) -> Vec<Option<u32>> {
+    let total = total.max(1);
+    let current = current.clamp(1, total);
+
+    let mut candidates = vec![
+        1,
+        total,
+        current.saturating_sub(1).max(1),
+        current,
+        (current + 1).min(total),
+    ];
+    candidates.retain(|&page| (1..=total).contains(&page));
+    candidates.sort_unstable();
+    candidates.dedup();
+
+    let mut labels = Vec::with_capacity(candidates.len() * 2);
+    let mut prev: Option<u32> = None;
+    for page in candidates {
+        if let Some(prev_page) = prev
+            && page - prev_page > 1
+        {
+            labels.push(None);
+        }
+        labels.push(Some(page));
+        prev = Some(page);
+    }
+    labels
+}
+
+/// ページャの 1 行を組み立てる（`‹ 1 2 [3] 4 … N ›` 形式）。
+///
+/// `total_pages` が判明していれば省略記号込みのページ番号列（[`pager_page_labels`]、現在ページ
+/// 前後 1 件 + 先頭/末尾、間は `…` で省略）を、不明なら `page N` のみを表示する（総ページ数
+/// 不明時のフォールバック）。現在ページは `theme.accent` の太字で強調する。矢印 `‹`/`›` は
+/// `page > 1` / `has_next` で活性・非活性を切り替える（非活性は `theme.muted` で淡色）。
+/// 1 ページのみ・0 ページ（空一覧）でも破綻しない。
+fn pager_line(info: PageInfo, theme: &Theme) -> Line<'static> {
+    let prev_style = if info.page > 1 {
+        Style::new().fg(theme.fg)
+    } else {
+        Style::new().fg(theme.muted)
+    };
+    let next_style = if info.has_next {
+        Style::new().fg(theme.fg)
+    } else {
+        Style::new().fg(theme.muted)
+    };
+
+    let mut spans = vec![Span::styled("‹", prev_style), Span::raw(" ")];
+
+    match info.total_pages {
+        Some(total) => {
+            for label in pager_page_labels(info.page, total) {
+                match label {
+                    None => spans.push(Span::styled("… ", Style::new().fg(theme.muted))),
+                    Some(page) if page == info.page => spans.push(Span::styled(
+                        format!("{page} "),
+                        Style::new().fg(theme.accent).bold(),
+                    )),
+                    Some(page) => spans.push(Span::raw(format!("{page} "))),
+                }
+            }
+        }
+        None => {
+            spans.push(Span::styled(
+                format!("page {} ", info.page),
+                Style::new().fg(theme.accent).bold(),
+            ));
+        }
+    }
+
+    spans.push(Span::styled("›", next_style));
+    Line::from(spans)
 }
 
 fn pull_request_row(pr: &PullRequest, theme: &Theme) -> Line<'static> {
@@ -1518,7 +1623,13 @@ fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("Esc", "エラー消去"),
             ("Ctrl+C", "終了"),
         ],
-        Screen::Workspaces => vec![("↑↓/jk", "移動"), ("Enter", "開く"), ("/", "検索")],
+        Screen::Workspaces => vec![
+            ("↑↓/jk", "移動"),
+            ("Enter", "開く"),
+            ("/", "検索"),
+            ("[/]", "前/次ページ"),
+            ("g", "ページ番号ジャンプ"),
+        ],
         Screen::Repositories => vec![
             ("↑↓/jk", "移動"),
             ("Enter", "PR"),
@@ -1527,6 +1638,8 @@ fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("s", "ソース"),
             ("/", "検索"),
             ("S", "並び替え"),
+            ("[/]", "前/次ページ"),
+            ("g", "ページ番号ジャンプ"),
             ("Esc", "戻る"),
         ],
         Screen::PullRequests => vec![
@@ -1538,6 +1651,8 @@ fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("b/s", "ブラウズ"),
             ("/", "検索"),
             ("S", "並び替え"),
+            ("[/]", "前/次ページ"),
+            ("g", "ページ番号ジャンプ"),
             ("Esc", "戻る"),
         ],
         Screen::PullRequestDetail => vec![
@@ -1777,11 +1892,13 @@ fn render_help(frame: &mut Frame, screen: Screen, theme: &Theme) {
         ],
         Screen::PullRequests => &[
             "o / m / d / a  状態フィルタ (OPEN/MERGED/DECLINED/ALL)",
-            "r              再読込",
+            "r              再読込（現在ページ）",
             "Enter          PR 詳細を開く",
             "P              パイプライン一覧を開く",
             "b / s          ブランチ一覧 / ソースを開く",
             "S              並び替え（取得順→名前昇順→更新日時降順→使用頻度降順の順に巡回）",
+            "[ / ]          前 / 次ページ（1 ページ 20 件）",
+            "g              ページ番号ジャンプ（数字入力 + Enter, Esc で取消）",
         ],
         Screen::PullRequestDetail => &[
             "d              Diff を開く",
@@ -1807,6 +1924,8 @@ fn render_help(frame: &mut Frame, screen: Screen, theme: &Theme) {
             "b              ブランチ一覧を開く",
             "s              ソース（既定ブランチのルート）を開く",
             "S              並び替え（取得順→名前昇順→更新日時降順→使用頻度降順の順に巡回）",
+            "[ / ]          前 / 次ページ（1 ページ 20 件）",
+            "g              ページ番号ジャンプ（数字入力 + Enter, Esc で取消）",
         ],
         Screen::Pipelines => &[
             "Enter          パイプライン詳細を開く",
@@ -1851,7 +1970,10 @@ fn render_help(frame: &mut Frame, screen: Screen, theme: &Theme) {
             "PgUp/PgDn / f/b 1 画面スクロール",
             "g / Home, G / End 先頭 / 末尾",
         ],
-        Screen::Workspaces => &[],
+        Screen::Workspaces => &[
+            "[ / ]          前 / 次ページ（1 ページ 20 件）",
+            "g              ページ番号ジャンプ（数字入力 + Enter, Esc で取消）",
+        ],
     };
     if !screen_keys.is_empty() {
         lines.push(Line::raw(""));
@@ -2593,6 +2715,186 @@ mod tests {
             Some(theme.info)
         );
         assert_eq!(diffstat_status_style("other", &theme).fg, Some(theme.muted));
+    }
+
+    /// スパンから連結テキストを取り出す（ページャ行のテキスト内容を検証するためのヘルパ）。
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn pager_page_labels_small_total_shows_every_page_without_ellipsis() {
+        assert_eq!(
+            pager_page_labels(3, 5),
+            vec![Some(1), Some(2), Some(3), Some(4), Some(5)]
+        );
+    }
+
+    #[test]
+    fn pager_page_labels_large_total_elides_far_pages() {
+        assert_eq!(
+            pager_page_labels(5, 20),
+            vec![Some(1), None, Some(4), Some(5), Some(6), None, Some(20)]
+        );
+    }
+
+    #[test]
+    fn pager_page_labels_current_near_start_has_single_trailing_ellipsis() {
+        assert_eq!(
+            pager_page_labels(1, 20),
+            vec![Some(1), Some(2), None, Some(20)]
+        );
+    }
+
+    #[test]
+    fn pager_page_labels_current_near_end_has_single_leading_ellipsis() {
+        assert_eq!(
+            pager_page_labels(20, 20),
+            vec![Some(1), None, Some(19), Some(20)]
+        );
+    }
+
+    #[test]
+    fn pager_page_labels_clamps_zero_total_to_single_page() {
+        assert_eq!(pager_page_labels(1, 0), vec![Some(1)]);
+    }
+
+    #[test]
+    fn pager_page_labels_clamps_out_of_range_current() {
+        // current が total を超えていても panic せず、末尾へクランプする。
+        assert_eq!(
+            pager_page_labels(99, 5),
+            vec![Some(1), None, Some(4), Some(5)]
+        );
+    }
+
+    #[test]
+    fn pager_line_single_page_shows_only_page_one_with_inactive_arrows() {
+        let theme = Theme::default();
+        let info = PageInfo {
+            page: 1,
+            total_pages: Some(1),
+            has_next: false,
+        };
+        let line = pager_line(info, &theme);
+        assert_eq!(line_text(&line), "‹ 1 ›");
+        // 矢印は両方非活性（前ページ無し・次ページ無し）。
+        assert_eq!(
+            line.spans.first().expect("prev arrow").style.fg,
+            Some(theme.muted)
+        );
+        assert_eq!(
+            line.spans.last().expect("next arrow").style.fg,
+            Some(theme.muted)
+        );
+    }
+
+    #[test]
+    fn pager_line_empty_list_with_zero_total_pages_does_not_panic() {
+        let theme = Theme::default();
+        let info = PageInfo {
+            page: 1,
+            total_pages: Some(0),
+            has_next: false,
+        };
+        // 0 ページ（空一覧）でも panic せず、単一の空ページとして "1" を表示する。
+        let line = pager_line(info, &theme);
+        assert_eq!(line_text(&line), "‹ 1 ›");
+    }
+
+    #[test]
+    fn pager_line_highlights_current_page_with_accent() {
+        let theme = Theme::default();
+        let info = PageInfo {
+            page: 3,
+            total_pages: Some(5),
+            has_next: true,
+        };
+        let line = pager_line(info, &theme);
+        let current = line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "3 ")
+            .expect("current page span present");
+        assert_eq!(current.style.fg, Some(theme.accent));
+    }
+
+    #[test]
+    fn pager_line_elides_far_pages_with_ellipsis() {
+        let theme = Theme::default();
+        let info = PageInfo {
+            page: 5,
+            total_pages: Some(20),
+            has_next: true,
+        };
+        let text = line_text(&pager_line(info, &theme));
+        // 先頭(1) … 隣接(4 5 6) … 末尾(20) の形。
+        assert!(text.contains("1 "));
+        assert!(text.contains("4 "));
+        assert!(text.contains("5 "));
+        assert!(text.contains("6 "));
+        assert!(text.contains("20 "));
+        assert!(text.contains('…'));
+    }
+
+    #[test]
+    fn pager_line_falls_back_to_page_label_when_total_unknown() {
+        let theme = Theme::default();
+        let info = PageInfo {
+            page: 4,
+            total_pages: None,
+            has_next: true,
+        };
+        let line = pager_line(info, &theme);
+        assert_eq!(line_text(&line), "‹ page 4 ›");
+        // 次ページありなので `›` は活性（非 muted）。
+        assert_ne!(
+            line.spans.last().expect("next arrow").style.fg,
+            Some(theme.muted)
+        );
+    }
+
+    #[test]
+    fn pager_line_arrows_active_when_prev_and_next_available() {
+        let theme = Theme::default();
+        let info = PageInfo {
+            page: 2,
+            total_pages: Some(3),
+            has_next: true,
+        };
+        let line = pager_line(info, &theme);
+        assert_ne!(
+            line.spans.first().expect("prev arrow").style.fg,
+            Some(theme.muted)
+        );
+        assert_ne!(
+            line.spans.last().expect("next arrow").style.fg,
+            Some(theme.muted)
+        );
+    }
+
+    #[test]
+    fn render_repositories_with_pager_does_not_panic_and_shows_page_label() {
+        let mut app = App::new(crate::config::Config::default(), None);
+        app.repositories.set_items(vec![]);
+        app.repositories_page_info = PageInfo {
+            page: 2,
+            total_pages: None,
+            has_next: false,
+        };
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_repositories(frame, area, &mut app);
+            })
+            .expect("draw succeeds even with empty list");
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("page 2"));
     }
 
     #[test]

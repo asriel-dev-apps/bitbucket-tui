@@ -103,22 +103,33 @@ fn dispatch(command: Command, api_tx: &mpsc::Sender<Msg>) -> bool {
             });
             true
         }
-        Command::LoadWorkspaces { client } => {
+        Command::LoadWorkspaces { client, page } => {
             let tx = api_tx.clone();
             tokio::spawn(async move {
-                let msg = match client.list_workspaces().await {
-                    Ok(workspaces) => Msg::WorkspacesLoaded(workspaces),
+                let msg = match client.get_workspaces_page(page).await {
+                    Ok(result) => Msg::WorkspacesLoaded {
+                        workspaces: result.values,
+                        page_info: result.info,
+                    },
                     Err(error) => Msg::LoadFailed(error),
                 };
                 let _ = tx.send(msg).await;
             });
             true
         }
-        Command::LoadRepositories { client, workspace } => {
+        Command::LoadRepositories {
+            client,
+            workspace,
+            page,
+        } => {
             let tx = api_tx.clone();
             tokio::spawn(async move {
-                let msg = match client.list_repositories(&workspace).await {
-                    Ok(repos) => Msg::RepositoriesLoaded { workspace, repos },
+                let msg = match client.get_repositories_page(&workspace, page).await {
+                    Ok(result) => Msg::RepositoriesLoaded {
+                        workspace,
+                        repos: result.values,
+                        page_info: result.info,
+                    },
                     Err(error) => Msg::LoadFailed(error),
                 };
                 let _ = tx.send(msg).await;
@@ -130,14 +141,20 @@ fn dispatch(command: Command, api_tx: &mpsc::Sender<Msg>) -> bool {
             workspace,
             repo,
             filter,
+            page,
         } => {
             let tx = api_tx.clone();
             tokio::spawn(async move {
                 let msg = match client
-                    .list_pull_requests(&workspace, &repo, filter.states())
+                    .get_pull_requests_page(&workspace, &repo, filter.states(), page)
                     .await
                 {
-                    Ok(prs) => Msg::PullRequestsLoaded { repo, filter, prs },
+                    Ok(result) => Msg::PullRequestsLoaded {
+                        repo,
+                        filter,
+                        prs: result.values,
+                        page_info: result.info,
+                    },
                     Err(error) => Msg::LoadFailed(error),
                 };
                 let _ = tx.send(msg).await;

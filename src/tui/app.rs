@@ -12,7 +12,8 @@ use ratatui::widgets::ListState;
 
 use crate::api::{
     ApiError, BitbucketClient, Branch, Comment, Commit, DiffStatEntry, MergeParams, MergeStrategy,
-    Pipeline, PipelineStep, PipelineTarget, PullRequest, Repository, SrcEntry, User, Workspace,
+    PageInfo, Pipeline, PipelineStep, PipelineTarget, PullRequest, Repository, SrcEntry, User,
+    Workspace,
 };
 use crate::auth;
 use crate::config::Config;
@@ -343,20 +344,25 @@ pub enum Msg {
     },
     /// Onboarding の認証検証に失敗。
     AuthFailed(ApiError),
-    /// ワークスペース一覧の取得完了。
-    WorkspacesLoaded(Vec<Workspace>),
-    /// リポジトリ一覧の取得完了。
+    /// ワークスペース一覧（1 ページ分）の取得完了。
+    WorkspacesLoaded {
+        workspaces: Vec<Workspace>,
+        page_info: PageInfo,
+    },
+    /// リポジトリ一覧（1 ページ分）の取得完了。
     RepositoriesLoaded {
         workspace: String,
         repos: Vec<Repository>,
+        page_info: PageInfo,
     },
     /// ワークスペース/リポジトリ取得の失敗。
     LoadFailed(ApiError),
-    /// PR 一覧の取得完了。
+    /// PR 一覧（1 ページ分）の取得完了。
     PullRequestsLoaded {
         repo: String,
         filter: PrStateFilter,
         prs: Vec<PullRequest>,
+        page_info: PageInfo,
     },
     /// PR 詳細の取得完了（承認状態の再反映にも使う）。
     PrDetailLoaded { id: u64, pr: Box<PullRequest> },
@@ -433,19 +439,21 @@ pub enum Command {
     Batch(Vec<Command>),
     /// email+token を検証する（`GET /2.0/user`）。
     ValidateAuth { email: String, token: String },
-    /// ワークスペース一覧を取得する。
-    LoadWorkspaces { client: BitbucketClient },
-    /// 指定ワークスペースのリポジトリ一覧を取得する。
+    /// ワークスペース一覧の指定ページを取得する（1 ページ = [`crate::api::client::PAGE_SIZE`] 件）。
+    LoadWorkspaces { client: BitbucketClient, page: u32 },
+    /// 指定ワークスペースのリポジトリ一覧の指定ページを取得する。
     LoadRepositories {
         client: BitbucketClient,
         workspace: String,
+        page: u32,
     },
-    /// PR 一覧を取得する。
+    /// PR 一覧の指定ページを取得する。
     LoadPullRequests {
         client: BitbucketClient,
         workspace: String,
         repo: String,
         filter: PrStateFilter,
+        page: u32,
     },
     /// PR 詳細を取得する。
     LoadPrDetail {
@@ -817,6 +825,15 @@ pub struct JumpPaletteState {
     pub entries: SelectList<JumpEntry>,
 }
 
+/// ページ番号ジャンプ（`g`）の入力状態。Workspaces/Repositories/PullRequests 共通。
+///
+/// 数字のみを受け付ける簡易バッファ（`on_key_page_jump` 参照）。`Enter` で確定し
+/// [`App::goto_page`] を呼ぶ、`Esc` で取消。
+#[derive(Debug, Clone, Default)]
+pub struct PageJumpModal {
+    pub input: String,
+}
+
 /// `JumpEntry` の検索キー抽出（`SelectList::set_filter`/`reorder` に渡す）。
 fn jump_entry_key(entry: &JumpEntry) -> String {
     entry.search_key.clone()
@@ -878,10 +895,25 @@ where
         self.map.insert(key, value);
     }
 
-    /// 指定キーのエントリを取り除く（書き込み操作後の無効化に使う）。
-    fn remove(&mut self, key: &K) {
-        self.map.remove(key);
-        self.order.retain(|existing| existing != key);
+    /// 述語 `keep` が `false` を返すキーをすべて取り除く。
+    ///
+    /// キーの一部（例: repo slug）だけが一致すればページ番号を問わず一括無効化したい場合に使う
+    /// （[`App::invalidate_pull_requests_cache_for_current_repo`] 参照。ページ番号までは
+    /// 追跡していないため、`remove` を全ページ分呼ぶ代わりにこちらを使う）。
+    fn retain<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(&K) -> bool,
+    {
+        let removed: Vec<K> = self
+            .order
+            .iter()
+            .filter(|key| !keep(key))
+            .cloned()
+            .collect();
+        for key in removed {
+            self.map.remove(&key);
+        }
+        self.order.retain(|key| keep(key));
     }
 }
 
@@ -906,15 +938,25 @@ pub struct App {
     pub me: Me,
     pub onboarding: OnboardingState,
     pub workspaces: SelectList<Workspace>,
+    /// Workspaces 一覧のページ状態（1 ページ = [`crate::api::client::PAGE_SIZE`] 件）。
+    /// `[`/`]` でページ間移動、`g` でページ番号ジャンプ。
+    pub workspaces_page_info: PageInfo,
+    /// ワークスペース一覧の再訪キャッシュ（キー = ページ番号）。`[`/`]`/`g` でのページ移動と
+    /// 画面再訪の双方で即時表示に使い、`Msg::WorkspacesLoaded` 受信のたびに最新化する
+    /// （stale-while-revalidate）。
+    pub workspaces_cache: RevisitCache<u32, (Vec<Workspace>, PageInfo)>,
     pub repositories: SelectList<Repository>,
     /// Repositories 一覧の現在のソートモード（`S` キーで巡回）。
     pub repositories_sort: SortMode,
     /// Repositories の取得順スナップショット（`SortMode::Fetched` に戻すための元データ）。
+    /// ページ単位（現在ページの 20 件以内）でのみ有効。
     pub repositories_fetch_order: Vec<Repository>,
-    /// リポジトリ一覧の再訪キャッシュ（workspace slug → 取得結果）。
-    /// [`App::jump_to_workspace`] が再訪時に即表示するために使い、`Msg::RepositoriesLoaded`
+    /// Repositories 一覧のページ状態。
+    pub repositories_page_info: PageInfo,
+    /// リポジトリ一覧の再訪キャッシュ（キー = (workspace slug, ページ番号)）。
+    /// [`App::load_repositories_page`] が再訪時に即表示するために使い、`Msg::RepositoriesLoaded`
     /// 受信のたびに最新化する（stale-while-revalidate）。
-    pub repositories_cache: RevisitCache<String, Vec<Repository>>,
+    pub repositories_cache: RevisitCache<(String, u32), (Vec<Repository>, PageInfo)>,
     pub selected_workspace: Option<String>,
     pub selected_repo: Option<String>,
     /// 選択リポジトリの既定ブランチ名（`mainbranch.name`）。Source ルートに使う。
@@ -923,12 +965,16 @@ pub struct App {
     /// PullRequests 一覧の現在のソートモード（`S` キーで巡回）。
     pub pull_requests_sort: SortMode,
     /// PullRequests の取得順スナップショット（`SortMode::Fetched` に戻すための元データ）。
+    /// ページ単位（現在ページの 20 件以内）でのみ有効。
     pub pull_requests_fetch_order: Vec<PullRequest>,
-    /// PR 一覧の再訪キャッシュ（キー = (repo slug, state フィルタ)）。
+    /// PullRequests 一覧のページ状態。
+    pub pull_requests_page_info: PageInfo,
+    /// PR 一覧の再訪キャッシュ（キー = (repo slug, state フィルタ, ページ番号)）。
     /// `repo` は `Msg::PullRequestsLoaded` が運ぶ値（`review_context()` 由来の repo slug）に
     /// 合わせており、既存のステイル判定ガード（`repo_slug()` 一致チェック）と精度を揃えている
     /// （workspace をまたいだ同名 repo slug の衝突は既存ガードと同じ既知の制約）。
-    pub pull_requests_cache: RevisitCache<(String, PrStateFilter), Vec<PullRequest>>,
+    pub pull_requests_cache:
+        RevisitCache<(String, PrStateFilter, u32), (Vec<PullRequest>, PageInfo)>,
     pub pr_state_filter: PrStateFilter,
     pub current_pr: Option<PullRequest>,
     /// PR 詳細の再訪キャッシュ（キー = (repo full_name, PR id)）。
@@ -975,6 +1021,8 @@ pub struct App {
     pub search_editing: bool,
     /// ジャンプパレット（`Ctrl+K`）の状態。開いている間は最優先でキー入力を奪う。
     pub jump_palette: Option<JumpPaletteState>,
+    /// ページ番号ジャンプ（`g`）の入力状態。開いている間は最優先でキー入力を奪う。
+    pub page_jump: Option<PageJumpModal>,
     /// 直近開いた PR（新しい順）。ジャンプパレットの候補に使う。
     pub recent_prs: Vec<RecentPr>,
 }
@@ -1028,9 +1076,12 @@ impl App {
             me,
             onboarding,
             workspaces: SelectList::default(),
+            workspaces_page_info: PageInfo::default(),
+            workspaces_cache: RevisitCache::default(),
             repositories: SelectList::default(),
             repositories_sort: SortMode::default(),
             repositories_fetch_order: Vec::new(),
+            repositories_page_info: PageInfo::default(),
             repositories_cache: RevisitCache::default(),
             selected_workspace: None,
             selected_repo: None,
@@ -1038,6 +1089,7 @@ impl App {
             pull_requests: SelectList::default(),
             pull_requests_sort: SortMode::default(),
             pull_requests_fetch_order: Vec::new(),
+            pull_requests_page_info: PageInfo::default(),
             pull_requests_cache: RevisitCache::default(),
             pr_state_filter: PrStateFilter::Open,
             current_pr: None,
@@ -1070,20 +1122,18 @@ impl App {
             show_help: false,
             search_editing: false,
             jump_palette: None,
+            page_jump: None,
             recent_prs: Vec::new(),
         }
     }
 
     /// 起動直後に実行すべきコマンドを返し、初期画面を確定する。
     ///
-    /// 認証済みなら Workspaces へ進み一覧取得を開始、未認証なら Onboarding に留まる。
+    /// 認証済みなら Workspaces へ進み 1 ページ目の取得を開始、未認証なら Onboarding に留まる。
     pub fn init_command(&mut self) -> Command {
-        if let Some(client) = &self.client {
+        if self.client.is_some() {
             self.screen = Screen::Workspaces;
-            self.status = Status::Loading("ワークスペースを取得中…".to_string());
-            return Command::LoadWorkspaces {
-                client: client.clone(),
-            };
+            return self.load_workspaces_page(1);
         }
         self.screen = Screen::Onboarding;
         Command::None
@@ -1099,20 +1149,37 @@ impl App {
                 self.onboarding.error = Some(error.to_string());
                 Command::None
             }
-            Msg::WorkspacesLoaded(workspaces) => {
-                self.status = Status::Idle;
-                self.workspaces.set_items(workspaces);
+            Msg::WorkspacesLoaded {
+                workspaces,
+                page_info,
+            } => {
+                // ページ単位でキャッシュを最新化する（他ページへ移動していても次回再訪時に活かす）。
+                self.workspaces_cache
+                    .insert(page_info.page, (workspaces.clone(), page_info));
+                // 取得中に別ページへ移動していた場合（要求ページと不一致）は画面反映のみ破棄。
+                if self.workspaces_page_info.page == page_info.page {
+                    self.status = Status::Idle;
+                    self.apply_workspaces(workspaces, page_info);
+                }
                 Command::None
             }
-            Msg::RepositoriesLoaded { workspace, repos } => {
-                // 表示中かどうかに関わらずキャッシュは最新化する（裏で他ワークスペースへ
+            Msg::RepositoriesLoaded {
+                workspace,
+                repos,
+                page_info,
+            } => {
+                // 表示中かどうかに関わらずキャッシュは最新化する（裏で他ワークスペース/ページへ
                 // 切り替えていても、その結果は次回再訪時に活かす）。
-                self.repositories_cache
-                    .insert(workspace.clone(), repos.clone());
-                // 取得中に別ワークスペースへ切り替えていた場合は画面反映のみ破棄。
-                if self.selected_workspace.as_deref() == Some(workspace.as_str()) {
+                self.repositories_cache.insert(
+                    (workspace.clone(), page_info.page),
+                    (repos.clone(), page_info),
+                );
+                // 取得中に別ワークスペース/ページへ切り替えていた場合は画面反映のみ破棄。
+                if self.selected_workspace.as_deref() == Some(workspace.as_str())
+                    && self.repositories_page_info.page == page_info.page
+                {
                     self.status = Status::Idle;
-                    self.apply_repositories(repos);
+                    self.apply_repositories(repos, page_info);
                 }
                 Command::None
             }
@@ -1120,16 +1187,24 @@ impl App {
                 self.status = Status::Error(error.to_string());
                 Command::None
             }
-            Msg::PullRequestsLoaded { repo, filter, prs } => {
-                // 表示中かどうかに関わらずキャッシュは最新化する（他 repo/フィルタへ切り替えて
-                // いても、その結果は次回再訪時に活かす）。
-                self.pull_requests_cache
-                    .insert((repo.clone(), filter), prs.clone());
+            Msg::PullRequestsLoaded {
+                repo,
+                filter,
+                prs,
+                page_info,
+            } => {
+                // 表示中かどうかに関わらずキャッシュは最新化する（他 repo/フィルタ/ページへ
+                // 切り替えていても、その結果は次回再訪時に活かす）。
+                self.pull_requests_cache.insert(
+                    (repo.clone(), filter, page_info.page),
+                    (prs.clone(), page_info),
+                );
                 if self.repo_slug().as_deref() == Some(repo.as_str())
                     && self.pr_state_filter == filter
+                    && self.pull_requests_page_info.page == page_info.page
                 {
                     self.status = Status::Idle;
-                    self.apply_pull_requests(prs);
+                    self.apply_pull_requests(prs, page_info);
                 }
                 Command::None
             }
@@ -1385,10 +1460,9 @@ impl App {
                 return Command::None;
             }
         };
-        self.client = Some(client.clone());
+        self.client = Some(client);
         self.screen = Screen::Workspaces;
-        self.status = Status::Loading("ワークスペースを取得中…".to_string());
-        Command::LoadWorkspaces { client }
+        self.load_workspaces_page(1)
     }
 
     /// キー入力の処理。グローバルキー（Ctrl+C / Ctrl+T / ジャンプパレット / ヘルプ / モーダル）
@@ -1435,6 +1509,9 @@ impl App {
         }
         if self.confirm_modal.is_some() {
             return self.on_key_confirm_modal(key);
+        }
+        if self.page_jump.is_some() {
+            return self.on_key_page_jump(key);
         }
         if self.search_editing {
             return self.on_key_search_editing(key);
@@ -1605,6 +1682,9 @@ impl App {
                 self.workspaces.select_prev();
                 Command::None
             }
+            KeyCode::Char('[') => self.prev_page(),
+            KeyCode::Char(']') => self.next_page(),
+            KeyCode::Char('g') => self.open_page_jump(),
             KeyCode::Enter => self.enter_workspace(),
             _ => Command::None,
         }
@@ -1619,38 +1699,58 @@ impl App {
         self.jump_to_workspace(slug)
     }
 
-    /// 指定ワークスペースへ入る（既定ワークスペースの保存・使用頻度カウント・リポジトリ取得の
-    /// 開始まで行う）。一覧での選択決定（[`App::enter_workspace`]）とジャンプパレットの
-    /// 双方から呼ぶ共通経路。
-    ///
-    /// キャッシュ（[`App::repositories_cache`]）があれば即座に一覧を表示しつつ、裏で
-    /// `Command::LoadRepositories` を発行して最新化する（stale-while-revalidate）。
-    /// キャッシュが無ければ従来通り一覧をクリアして Loading 表示を出す。
+    /// 指定ワークスペースへ入る（既定ワークスペースの保存・使用頻度カウント・
+    /// リポジトリ 1 ページ目の取得開始まで行う）。一覧での選択決定
+    /// （[`App::enter_workspace`]）とジャンプパレットの双方から呼ぶ共通経路。
     fn jump_to_workspace(&mut self, slug: String) -> Command {
         self.selected_workspace = Some(slug.clone());
         self.config.default_workspace = Some(slug.clone());
-        self.bump_usage(slug.clone());
+        self.bump_usage(slug);
         if let Err(error) = self.config.save() {
             tracing::warn!(%error, "既定ワークスペース/使用頻度の保存に失敗しました");
         }
 
         self.screen = Screen::Repositories;
+        self.load_repositories_page(1)
+    }
 
-        match self.repositories_cache.get(&slug).cloned() {
-            Some(cached) => {
-                self.apply_repositories(cached);
+    /// リポジトリ一覧の指定ページを読み込む。
+    ///
+    /// キャッシュ（[`App::repositories_cache`]、キー = (workspace slug, ページ番号)）があれば
+    /// 即座に一覧を表示しつつ、裏で `Command::LoadRepositories` を発行して最新化する
+    /// （stale-while-revalidate）。キャッシュが無ければ一覧をクリアして Loading 表示を出す。
+    /// [`App::jump_to_workspace`]（新規入場は 1 ページ目から）と `[`/`]`/`g`（ページ移動）の
+    /// 双方から呼ぶ共通経路。
+    fn load_repositories_page(&mut self, page: u32) -> Command {
+        let Some(workspace) = self.selected_workspace.clone() else {
+            self.status = Status::Error("ワークスペースが未選択です".to_string());
+            return Command::None;
+        };
+
+        let cache_key = (workspace.clone(), page);
+        match self.repositories_cache.get(&cache_key).cloned() {
+            Some((cached, info)) => {
+                self.apply_repositories(cached, info);
                 self.status = Status::Idle;
             }
             None => {
                 self.repositories.set_items(Vec::new());
-                self.status = Status::Loading(format!("{slug} のリポジトリを取得中…"));
+                self.repositories_page_info = PageInfo {
+                    page,
+                    total_pages: None,
+                    has_next: false,
+                };
+                self.status = Status::Loading(format!(
+                    "{workspace} のリポジトリを取得中…（{page} ページ目）"
+                ));
             }
         }
 
         match &self.client {
             Some(client) => Command::LoadRepositories {
                 client: client.clone(),
-                workspace: slug,
+                workspace,
+                page,
             },
             None => {
                 self.status = Status::Error("認証クライアントが未初期化です".to_string());
@@ -1659,13 +1759,17 @@ impl App {
         }
     }
 
-    /// 取得結果を `repositories` へ反映する（取得順スナップショットとソートモードの
-    /// リセットを含む）。新規取得（`Msg::RepositoriesLoaded`）とキャッシュからの即時表示
-    /// （[`App::jump_to_workspace`]）の両方から呼ぶ共通経路。
-    fn apply_repositories(&mut self, repos: Vec<Repository>) {
+    /// 取得結果を `repositories` へ反映する（取得順スナップショット・ソートモード・
+    /// ページ状態のリセットを含む）。新規取得（`Msg::RepositoriesLoaded`）とキャッシュからの
+    /// 即時表示（[`App::load_repositories_page`]）の両方から呼ぶ共通経路。
+    ///
+    /// 検索フィルタは（`SelectList::set_items` により）ここで必ずクリアされる。ページが変われば
+    /// 表示される 20 件が入れ替わるため、前ページのフィルタを引き継がない設計判断。
+    fn apply_repositories(&mut self, repos: Vec<Repository>, page_info: PageInfo) {
         self.repositories_fetch_order = repos.clone();
         self.repositories_sort = SortMode::Fetched;
         self.repositories.set_items(repos);
+        self.repositories_page_info = page_info;
     }
 
     /// `config.usage` のカウンタを 1 増やす（保存は呼び出し側の責務）。
@@ -1698,6 +1802,9 @@ impl App {
                 self.repositories.select_prev();
                 Command::None
             }
+            KeyCode::Char('[') => self.prev_page(),
+            KeyCode::Char(']') => self.next_page(),
+            KeyCode::Char('g') => self.open_page_jump(),
             KeyCode::Enter => {
                 let Some(repo) = self.repositories.selected().cloned() else {
                     return Command::None;
@@ -1785,37 +1892,42 @@ impl App {
             .reorder(items, |repo| format!("{} {}", repo.full_name, repo.name));
     }
 
-    /// PR 一覧画面へ遷移し、OPEN の一覧取得を開始する。
+    /// PR 一覧画面へ遷移し、OPEN の一覧の 1 ページ目取得を開始する。
     fn open_pull_requests(&mut self) -> Command {
         self.screen = Screen::PullRequests;
         self.pr_state_filter = PrStateFilter::Open;
         self.current_pr = None;
-        self.reload_pull_requests()
+        self.load_pull_requests_page(1)
     }
 
-    /// 現在のフィルタで PR 一覧を再取得する。
+    /// PR 一覧の指定ページを読み込む。
     ///
-    /// キャッシュ（[`App::pull_requests_cache`]、キー = (repo slug, state フィルタ)）が
-    /// あれば即座に一覧を表示しつつ、裏で `Command::LoadPullRequests` を発行して最新化する
-    /// （stale-while-revalidate）。この経路はリポジトリへの新規入場・フィルタ切り替え・
-    /// 手動リロード（`r`）のいずれからも呼ばれ、全て同じ挙動になる。キャッシュが無ければ
-    /// 従来通り一覧をクリアして Loading 表示を出す。
-    fn reload_pull_requests(&mut self) -> Command {
+    /// キャッシュ（[`App::pull_requests_cache`]、キー = (repo slug, state フィルタ,
+    /// ページ番号)）があれば即座に一覧を表示しつつ、裏で `Command::LoadPullRequests` を
+    /// 発行して最新化する（stale-while-revalidate）。キャッシュが無ければ一覧をクリアして
+    /// Loading 表示を出す。リポジトリへの新規入場・フィルタ切り替え（いずれも 1 ページ目から）・
+    /// ページ移動（`[`/`]`/`g`）・手動リロード（`r`、現在ページを再取得）の共通経路。
+    fn load_pull_requests_page(&mut self, page: u32) -> Command {
         let Some((client, workspace, repo)) = self.review_context() else {
             self.status = Status::Error("認証クライアントが未初期化です".to_string());
             return Command::None;
         };
 
-        let cache_key = (repo.clone(), self.pr_state_filter);
+        let cache_key = (repo.clone(), self.pr_state_filter, page);
         match self.pull_requests_cache.get(&cache_key).cloned() {
-            Some(cached) => {
-                self.apply_pull_requests(cached);
+            Some((cached, info)) => {
+                self.apply_pull_requests(cached, info);
                 self.status = Status::Idle;
             }
             None => {
                 self.pull_requests.set_items(Vec::new());
+                self.pull_requests_page_info = PageInfo {
+                    page,
+                    total_pages: None,
+                    has_next: false,
+                };
                 self.status = Status::Loading(format!(
-                    "PR 一覧を取得中…（{}）",
+                    "PR 一覧を取得中…（{}・{page} ページ目）",
                     self.pr_state_filter.label()
                 ));
             }
@@ -1826,16 +1938,26 @@ impl App {
             workspace,
             repo,
             filter: self.pr_state_filter,
+            page,
         }
     }
 
-    /// 取得結果を `pull_requests` へ反映する（取得順スナップショットとソートモードの
-    /// リセットを含む）。新規取得（`Msg::PullRequestsLoaded`）とキャッシュからの即時表示
-    /// （[`App::reload_pull_requests`]）の両方から呼ぶ共通経路。
-    fn apply_pull_requests(&mut self, prs: Vec<PullRequest>) {
+    /// 現在のフィルタ・現在ページで PR 一覧を再取得する（`r` キー）。
+    fn reload_pull_requests(&mut self) -> Command {
+        self.load_pull_requests_page(self.pull_requests_page_info.page)
+    }
+
+    /// 取得結果を `pull_requests` へ反映する（取得順スナップショット・ソートモード・
+    /// ページ状態のリセットを含む）。新規取得（`Msg::PullRequestsLoaded`）とキャッシュからの
+    /// 即時表示（[`App::load_pull_requests_page`]）の両方から呼ぶ共通経路。
+    ///
+    /// 検索フィルタは（`SelectList::set_items` により）ここで必ずクリアされる。ページが変われば
+    /// 表示される 20 件が入れ替わるため、前ページのフィルタを引き継がない設計判断。
+    fn apply_pull_requests(&mut self, prs: Vec<PullRequest>, page_info: PageInfo) {
         self.pull_requests_fetch_order = prs.clone();
         self.pull_requests_sort = SortMode::Fetched;
         self.pull_requests.set_items(prs);
+        self.pull_requests_page_info = page_info;
     }
 
     fn on_key_pull_requests(&mut self, key: KeyEvent) -> Command {
@@ -1863,6 +1985,9 @@ impl App {
                 self.pull_requests.select_prev();
                 Command::None
             }
+            KeyCode::Char('[') => self.prev_page(),
+            KeyCode::Char(']') => self.next_page(),
+            KeyCode::Char('g') => self.open_page_jump(),
             KeyCode::Char('o') => self.set_pr_filter(PrStateFilter::Open),
             KeyCode::Char('m') => self.set_pr_filter(PrStateFilter::Merged),
             KeyCode::Char('d') => self.set_pr_filter(PrStateFilter::Declined),
@@ -1879,9 +2004,10 @@ impl App {
         }
     }
 
+    /// 状態フィルタを切り替え、1 ページ目から読み込み直す（新しいフィルタ文脈のため）。
     fn set_pr_filter(&mut self, filter: PrStateFilter) -> Command {
         self.pr_state_filter = filter;
-        self.reload_pull_requests()
+        self.load_pull_requests_page(1)
     }
 
     /// PullRequests 一覧のソートモードを次へ巡回し、適用する。
@@ -1908,6 +2034,158 @@ impl App {
         }
         self.pull_requests
             .reorder(items, |pr| format!("{} #{}", pr.title_str(), pr.id));
+    }
+
+    // ---- サーバサイド・ページネーション（Workspaces/Repositories/PullRequests 共通） ----
+
+    /// ワークスペース一覧の指定ページを読み込む。
+    ///
+    /// キャッシュ（[`App::workspaces_cache`]、キー = ページ番号）があれば即座に一覧を表示し
+    /// つつ、裏で `Command::LoadWorkspaces` を発行して最新化する（stale-while-revalidate）。
+    /// キャッシュが無ければ一覧をクリアして Loading 表示を出す。起動時（1 ページ目）と
+    /// `[`/`]`/`g`（ページ移動）の双方から呼ぶ共通経路。
+    fn load_workspaces_page(&mut self, page: u32) -> Command {
+        match self.workspaces_cache.get(&page).cloned() {
+            Some((cached, info)) => {
+                self.apply_workspaces(cached, info);
+                self.status = Status::Idle;
+            }
+            None => {
+                self.workspaces.set_items(Vec::new());
+                self.workspaces_page_info = PageInfo {
+                    page,
+                    total_pages: None,
+                    has_next: false,
+                };
+                self.status =
+                    Status::Loading(format!("ワークスペースを取得中…（{page} ページ目）"));
+            }
+        }
+
+        match &self.client {
+            Some(client) => Command::LoadWorkspaces {
+                client: client.clone(),
+                page,
+            },
+            None => {
+                self.status = Status::Error("認証クライアントが未初期化です".to_string());
+                Command::None
+            }
+        }
+    }
+
+    /// 取得結果を `workspaces` へ反映する（ページ状態の更新を含む）。新規取得
+    /// （`Msg::WorkspacesLoaded`）とキャッシュからの即時表示（[`App::load_workspaces_page`]）の
+    /// 両方から呼ぶ共通経路。検索フィルタは（`SelectList::set_items` により）ここで必ずクリア
+    /// される（ページが変われば表示される 20 件が入れ替わるため）。
+    fn apply_workspaces(&mut self, workspaces: Vec<Workspace>, page_info: PageInfo) {
+        self.workspaces.set_items(workspaces);
+        self.workspaces_page_info = page_info;
+    }
+
+    /// 現在の画面がページング対象（Workspaces/Repositories/PullRequests）なら、その
+    /// ページ状態を返す。それ以外の画面では `None`（ページ移動キーは何もしない）。
+    fn page_info(&self) -> Option<PageInfo> {
+        match self.screen {
+            Screen::Workspaces => Some(self.workspaces_page_info),
+            Screen::Repositories => Some(self.repositories_page_info),
+            Screen::PullRequests => Some(self.pull_requests_page_info),
+            _ => None,
+        }
+    }
+
+    /// 指定ページ番号のデータを、現在の画面に応じて読み込む。
+    fn load_page(&mut self, page: u32) -> Command {
+        match self.screen {
+            Screen::Workspaces => self.load_workspaces_page(page),
+            Screen::Repositories => self.load_repositories_page(page),
+            Screen::PullRequests => self.load_pull_requests_page(page),
+            _ => Command::None,
+        }
+    }
+
+    /// 前ページへ（`[`）。1 ページ目では何もしない（パニックせずクランプ）。
+    fn prev_page(&mut self) -> Command {
+        let Some(info) = self.page_info() else {
+            return Command::None;
+        };
+        if info.page <= 1 {
+            return Command::None;
+        }
+        self.load_page(info.page - 1)
+    }
+
+    /// 次ページへ（`]`）。`has_next`（次ページ無し）が `false` なら何もしない。
+    fn next_page(&mut self) -> Command {
+        let Some(info) = self.page_info() else {
+            return Command::None;
+        };
+        if !info.has_next {
+            return Command::None;
+        }
+        self.load_page(info.page + 1)
+    }
+
+    /// 指定ページ番号へジャンプする（ページ番号ジャンプの入力確定時）。既知の総ページ数が
+    /// あればその範囲へクランプし、無ければ 1 未満のみクランプする（範囲外はサーバ応答
+    /// （`has_next=false` 等）に委ねる。パニックしない）。
+    fn goto_page(&mut self, page: u32) -> Command {
+        let Some(info) = self.page_info() else {
+            return Command::None;
+        };
+        let target = match info.total_pages {
+            Some(total) if total > 0 => page.clamp(1, total),
+            _ => page.max(1),
+        };
+        self.load_page(target)
+    }
+
+    /// ページ番号ジャンプの入力プロンプトを開く（`g`）。ページング対象外の画面では何もしない。
+    fn open_page_jump(&mut self) -> Command {
+        if self.page_info().is_some() {
+            self.page_jump = Some(PageJumpModal::default());
+        }
+        Command::None
+    }
+
+    /// ページ番号ジャンプの入力プロンプトのキー処理。数字のみ受け付け、`Enter` で確定
+    /// （[`App::goto_page`]）、`Esc`/`Backspace` で取消/1 文字削除する。
+    fn on_key_page_jump(&mut self, key: KeyEvent) -> Command {
+        match key.code {
+            KeyCode::Esc => {
+                self.page_jump = None;
+                Command::None
+            }
+            KeyCode::Enter => {
+                let Some(modal) = self.page_jump.take() else {
+                    return Command::None;
+                };
+                match modal.input.parse::<u32>() {
+                    Ok(page) if page >= 1 => self.goto_page(page),
+                    _ => {
+                        self.status =
+                            Status::Error("1 以上のページ番号を入力してください".to_string());
+                        Command::None
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(modal) = self.page_jump.as_mut() {
+                    modal.input.pop();
+                }
+                Command::None
+            }
+            KeyCode::Char(ch) if ch.is_ascii_digit() => {
+                // 極端な桁数の入力を防ぐ安全上限（6 桁あれば実用上十分）。
+                if let Some(modal) = self.page_jump.as_mut()
+                    && modal.input.len() < 6
+                {
+                    modal.input.push(ch);
+                }
+                Command::None
+            }
+            _ => Command::None,
+        }
     }
 
     /// PR 詳細本文の表示行数（ヘッダ 4 行 + 承認/変更要求パネル行 + 本文行数。
@@ -3242,18 +3520,14 @@ impl App {
     /// 掲載フィルタ（マージで OPEN→MERGED 等）を厳密に差分更新するより、対象 repo の
     /// キャッシュをまとめて削除して次回表示を必ず再取得（キャッシュミス）させる方が単純で
     /// 確実なため、この方式を採る。
+    /// 現在の repo のキャッシュを、フィルタ・ページ番号を問わずすべて無効化する
+    /// （承認/変更要求/コメント投稿/マージ後、一覧のバッジ・掲載フィルタが変わり得るため）。
     fn invalidate_pull_requests_cache_for_current_repo(&mut self) {
         let Some(repo) = self.repo_slug() else {
             return;
         };
-        for filter in [
-            PrStateFilter::Open,
-            PrStateFilter::Merged,
-            PrStateFilter::Declined,
-            PrStateFilter::All,
-        ] {
-            self.pull_requests_cache.remove(&(repo.clone(), filter));
-        }
+        self.pull_requests_cache
+            .retain(|(cached_repo, _filter, _page)| cached_repo != &repo);
     }
 
     /// 自分が現在この PR を承認しているか（participant を自分と照合）。
@@ -3594,6 +3868,20 @@ mod tests {
             .expect("client builds")
     }
 
+    /// テスト用の `PageInfo`（総ページ数・次ページ有無を明示指定）。
+    fn page_info(page: u32, total_pages: Option<u32>, has_next: bool) -> PageInfo {
+        PageInfo {
+            page,
+            total_pages,
+            has_next,
+        }
+    }
+
+    /// 1 ページに収まる小さな一覧を想定した `PageInfo`（1 ページ目・総 1 ページ・次ページ無し）。
+    fn single_page() -> PageInfo {
+        page_info(1, Some(1), false)
+    }
+
     /// レビュー系操作ができる状態（client + workspace + repo）を用意した App。
     fn review_app() -> App {
         let mut app = app();
@@ -3795,18 +4083,21 @@ mod tests {
     fn workspaces_loaded_selects_first() {
         let mut app = app();
         app.screen = Screen::Workspaces;
-        app.update(Msg::WorkspacesLoaded(vec![
-            Workspace {
-                slug: "a".to_string(),
-                name: Some("A".to_string()),
-                uuid: None,
-            },
-            Workspace {
-                slug: "b".to_string(),
-                name: None,
-                uuid: None,
-            },
-        ]));
+        app.update(Msg::WorkspacesLoaded {
+            workspaces: vec![
+                Workspace {
+                    slug: "a".to_string(),
+                    name: Some("A".to_string()),
+                    uuid: None,
+                },
+                Workspace {
+                    slug: "b".to_string(),
+                    name: None,
+                    uuid: None,
+                },
+            ],
+            page_info: single_page(),
+        });
         assert_eq!(app.workspaces.state.selected(), Some(0));
         app.update(Msg::Key(key(KeyCode::Char('j'))));
         assert_eq!(app.workspaces.state.selected(), Some(1));
@@ -3821,6 +4112,7 @@ mod tests {
         app.update(Msg::RepositoriesLoaded {
             workspace: "stale".to_string(),
             repos: vec![make_repo("x/y", None)],
+            page_info: single_page(),
         });
         assert!(app.repositories.items.is_empty());
     }
@@ -3833,6 +4125,7 @@ mod tests {
         app.update(Msg::RepositoriesLoaded {
             workspace: "acme".to_string(),
             repos: vec![make_repo("acme/widget", None)],
+            page_info: single_page(),
         });
         let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
         assert_eq!(app.screen, Screen::PullRequests);
@@ -3861,6 +4154,7 @@ mod tests {
             repo: "widget".to_string(),
             filter: PrStateFilter::Open,
             prs: vec![make_pr(1, "OPEN"), make_pr(2, "OPEN")],
+            page_info: single_page(),
         });
         assert_eq!(app.pull_requests.items.len(), 2);
         assert_eq!(app.pull_requests.state.selected(), Some(0));
@@ -3874,6 +4168,7 @@ mod tests {
             repo: "widget".to_string(),
             filter: PrStateFilter::Merged,
             prs: vec![make_pr(1, "MERGED")],
+            page_info: single_page(),
         });
         assert!(app.pull_requests.items.is_empty());
     }
@@ -5212,6 +5507,7 @@ diff --git a/two.txt b/two.txt\n\
         app.update(Msg::RepositoriesLoaded {
             workspace: "acme".to_string(),
             repos: vec![make_repo("acme/zeta", None), make_repo("acme/alpha", None)],
+            page_info: single_page(),
         });
         assert_eq!(app.repositories_sort, SortMode::Fetched);
         assert_eq!(app.repositories.items[0].name, "zeta");
@@ -5235,6 +5531,7 @@ diff --git a/two.txt b/two.txt\n\
             repo: "widget".to_string(),
             filter: PrStateFilter::Open,
             prs: vec![make_pr(9, "OPEN"), make_pr(2, "OPEN")],
+            page_info: single_page(),
         });
         // タイトルは "PR {id}" なので文字列としては "PR 2" < "PR 9"。
         app.update(Msg::Key(key(KeyCode::Char('S'))));
@@ -5249,6 +5546,7 @@ diff --git a/two.txt b/two.txt\n\
         app.update(Msg::RepositoriesLoaded {
             workspace: "acme".to_string(),
             repos: vec![make_repo("acme/foo", None), make_repo("acme/bar", None)],
+            page_info: single_page(),
         });
 
         // "bar" を 2 回選択して使用回数を稼ぐ。
@@ -5277,6 +5575,7 @@ diff --git a/two.txt b/two.txt\n\
             repo: "widget".to_string(),
             filter: PrStateFilter::Open,
             prs: vec![make_pr(9, "OPEN"), make_pr(2, "OPEN")],
+            page_info: single_page(),
         });
         app.update(Msg::Key(key(KeyCode::Char('S')))); // NameAsc
         app.update(Msg::Key(key(KeyCode::Char('S')))); // UpdatedDesc
@@ -5551,11 +5850,27 @@ diff --git a/two.txt b/two.txt\n\
     }
 
     #[test]
-    fn revisit_cache_remove_drops_entry() {
+    fn revisit_cache_retain_drops_entries_failing_predicate() {
         let mut cache: RevisitCache<&str, u32> = RevisitCache::default();
         cache.insert("a", 1);
-        cache.remove(&"a");
+        cache.insert("b", 2);
+        cache.retain(|key| *key != "a");
         assert!(cache.get(&"a").is_none());
+        assert_eq!(cache.get(&"b"), Some(&2));
+    }
+
+    #[test]
+    fn revisit_cache_retain_can_match_across_multiple_keys() {
+        // `(String, PrStateFilter, u32)` のようなタプルキーで、一部フィールドだけが一致すれば
+        // 一括で無効化できること（ページ番号を問わず repo 単位で無効化する用途）。
+        let mut cache: RevisitCache<(String, u32), u32> = RevisitCache::default();
+        cache.insert(("widget".to_string(), 1), 1);
+        cache.insert(("widget".to_string(), 2), 2);
+        cache.insert(("other".to_string(), 1), 3);
+        cache.retain(|(repo, _page)| repo != "widget");
+        assert!(cache.get(&("widget".to_string(), 1)).is_none());
+        assert!(cache.get(&("widget".to_string(), 2)).is_none());
+        assert_eq!(cache.get(&("other".to_string(), 1)), Some(&3));
     }
 
     #[test]
@@ -5578,6 +5893,7 @@ diff --git a/two.txt b/two.txt\n\
         app.update(Msg::RepositoriesLoaded {
             workspace: "acme".to_string(),
             repos: vec![make_repo("acme/widget", None)],
+            page_info: single_page(),
         });
         assert_eq!(app.repositories.items.len(), 1);
 
@@ -5605,6 +5921,7 @@ diff --git a/two.txt b/two.txt\n\
         app.update(Msg::RepositoriesLoaded {
             workspace: "acme".to_string(),
             repos: vec![make_repo("acme/zeta", None), make_repo("acme/alpha", None)],
+            page_info: single_page(),
         });
 
         app.update(Msg::Key(key(KeyCode::Char('S'))));
@@ -5639,6 +5956,7 @@ diff --git a/two.txt b/two.txt\n\
             repo: "widget".to_string(),
             filter: PrStateFilter::Open,
             prs: vec![make_pr(1, "OPEN")],
+            page_info: single_page(),
         });
         assert_eq!(app.pull_requests.items.len(), 1);
 
@@ -5661,6 +5979,7 @@ diff --git a/two.txt b/two.txt\n\
             repo: "widget".to_string(),
             filter: PrStateFilter::Open,
             prs: vec![make_pr(1, "OPEN")],
+            page_info: single_page(),
         });
 
         // Merged へ切り替え: Open 用キャッシュを誤って使わないこと。
@@ -5683,6 +6002,7 @@ diff --git a/two.txt b/two.txt\n\
             repo: "widget".to_string(),
             filter: PrStateFilter::Open,
             prs: vec![make_pr(9, "OPEN"), make_pr(2, "OPEN")],
+            page_info: single_page(),
         });
         app.update(Msg::Key(key(KeyCode::Char('S')))); // NameAsc
         assert_eq!(app.pull_requests_sort, SortMode::NameAsc);
@@ -5751,6 +6071,7 @@ diff --git a/two.txt b/two.txt\n\
             repo: "widget".to_string(),
             filter: PrStateFilter::Open,
             prs: vec![make_pr(1, "OPEN")],
+            page_info: single_page(),
         });
 
         // 再訪してキャッシュ命中（Idle）を確認しておく。
@@ -5782,6 +6103,7 @@ diff --git a/two.txt b/two.txt\n\
             repo: "widget".to_string(),
             filter: PrStateFilter::Open,
             prs: vec![make_pr(3, "OPEN")],
+            page_info: single_page(),
         });
 
         app.current_pr = Some(make_pr(3, "OPEN"));
@@ -5804,6 +6126,7 @@ diff --git a/two.txt b/two.txt\n\
             repo: "widget".to_string(),
             filter: PrStateFilter::Open,
             prs: vec![make_pr(5, "OPEN")],
+            page_info: single_page(),
         });
 
         app.current_pr = Some(make_pr(5, "OPEN"));
@@ -5815,5 +6138,357 @@ diff --git a/two.txt b/two.txt\n\
         let cmd = app.update(Msg::Key(key(KeyCode::Char('r'))));
         assert!(matches!(app.status, Status::Loading(_)));
         assert!(matches!(cmd, Command::LoadPullRequests { .. }));
+    }
+
+    // ---- サーバサイド・ページネーション（1 ページ 20 件） ----
+
+    #[test]
+    fn repositories_next_page_dispatches_load_with_incremented_page() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        app.repositories_page_info = page_info(1, Some(3), true);
+        let cmd = app.update(Msg::Key(key(KeyCode::Char(']'))));
+        match cmd {
+            Command::LoadRepositories { page, .. } => assert_eq!(page, 2),
+            other => panic!("expected LoadRepositories, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repositories_next_page_is_noop_when_has_next_is_false() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        app.repositories_page_info = page_info(3, Some(3), false);
+        let cmd = app.update(Msg::Key(key(KeyCode::Char(']'))));
+        assert!(matches!(cmd, Command::None));
+        assert_eq!(app.repositories_page_info.page, 3);
+    }
+
+    #[test]
+    fn repositories_prev_page_is_noop_on_first_page() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        app.repositories_page_info = page_info(1, Some(3), true);
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('['))));
+        assert!(matches!(cmd, Command::None));
+        assert_eq!(app.repositories_page_info.page, 1);
+    }
+
+    #[test]
+    fn repositories_prev_page_dispatches_load_with_decremented_page() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        app.repositories_page_info = page_info(2, Some(3), true);
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('['))));
+        match cmd {
+            Command::LoadRepositories { page, .. } => assert_eq!(page, 1),
+            other => panic!("expected LoadRepositories, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pull_requests_next_page_preserves_current_filter() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.pr_state_filter = PrStateFilter::Merged;
+        app.pull_requests_page_info = page_info(2, Some(5), true);
+        let cmd = app.update(Msg::Key(key(KeyCode::Char(']'))));
+        match cmd {
+            Command::LoadPullRequests { page, filter, .. } => {
+                assert_eq!(page, 3);
+                assert_eq!(filter, PrStateFilter::Merged);
+            }
+            other => panic!("expected LoadPullRequests, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspaces_next_page_dispatches_load_workspaces_with_incremented_page() {
+        let mut app = review_app();
+        app.screen = Screen::Workspaces;
+        app.workspaces_page_info = page_info(1, Some(2), true);
+        let cmd = app.update(Msg::Key(key(KeyCode::Char(']'))));
+        match cmd {
+            Command::LoadWorkspaces { page, .. } => assert_eq!(page, 2),
+            other => panic!("expected LoadWorkspaces, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn page_nav_keys_do_nothing_on_non_paged_screens() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequestDetail;
+        app.current_pr = Some(make_pr(1, "OPEN"));
+        assert!(matches!(
+            app.update(Msg::Key(key(KeyCode::Char(']')))),
+            Command::None
+        ));
+        assert!(matches!(
+            app.update(Msg::Key(key(KeyCode::Char('[')))),
+            Command::None
+        ));
+        assert!(app.page_jump.is_none());
+    }
+
+    #[test]
+    fn page_jump_prompt_opens_with_g_and_closes_with_esc() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('g'))));
+        assert!(matches!(cmd, Command::None));
+        assert!(app.page_jump.is_some());
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        assert!(app.page_jump.is_none());
+    }
+
+    #[test]
+    fn page_jump_does_not_open_on_non_paged_screen() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequestDetail;
+        app.current_pr = Some(make_pr(1, "OPEN"));
+        app.update(Msg::Key(key(KeyCode::Char('g'))));
+        assert!(app.page_jump.is_none());
+    }
+
+    #[test]
+    fn page_jump_digit_input_and_enter_navigates_clamped_to_total_pages() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        app.repositories_page_info = page_info(1, Some(3), true);
+        app.update(Msg::Key(key(KeyCode::Char('g'))));
+        for ch in "99".chars() {
+            app.update(Msg::Key(key(KeyCode::Char(ch))));
+        }
+        assert_eq!(app.page_jump.as_ref().expect("open").input, "99");
+
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+        assert!(app.page_jump.is_none());
+        match cmd {
+            // 総ページ数(3)でクランプされる。
+            Command::LoadRepositories { page, .. } => assert_eq!(page, 3),
+            other => panic!("expected LoadRepositories, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn page_jump_backspace_removes_last_digit() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        app.update(Msg::Key(key(KeyCode::Char('g'))));
+        app.update(Msg::Key(key(KeyCode::Char('1'))));
+        app.update(Msg::Key(key(KeyCode::Char('2'))));
+        app.update(Msg::Key(key(KeyCode::Backspace)));
+        assert_eq!(app.page_jump.as_ref().expect("open").input, "1");
+    }
+
+    #[test]
+    fn page_jump_ignores_non_digit_characters() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        app.update(Msg::Key(key(KeyCode::Char('g'))));
+        app.update(Msg::Key(key(KeyCode::Char('a'))));
+        assert_eq!(app.page_jump.as_ref().expect("open").input, "");
+    }
+
+    #[test]
+    fn page_jump_enter_with_empty_input_reports_error_and_closes_modal() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        app.update(Msg::Key(key(KeyCode::Char('g'))));
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+        assert!(matches!(cmd, Command::None));
+        assert!(app.page_jump.is_none());
+        assert!(matches!(app.status, Status::Error(_)));
+    }
+
+    #[test]
+    fn goto_page_clamps_below_one_to_one_when_total_unknown() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.pull_requests_page_info = page_info(2, None, true);
+        let cmd = app.goto_page(0);
+        match cmd {
+            Command::LoadPullRequests { page, .. } => assert_eq!(page, 1),
+            other => panic!("expected LoadPullRequests, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspaces_loaded_ignored_when_page_does_not_match_current_request() {
+        let mut app = review_app();
+        app.screen = Screen::Workspaces;
+        app.workspaces_page_info = page_info(2, None, false);
+        app.update(Msg::WorkspacesLoaded {
+            workspaces: vec![Workspace {
+                slug: "stale".to_string(),
+                name: None,
+                uuid: None,
+            }],
+            page_info: page_info(1, None, true),
+        });
+        assert!(app.workspaces.items.is_empty());
+    }
+
+    #[test]
+    fn repositories_loaded_ignored_when_page_does_not_match_current_request() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        app.repositories_page_info = page_info(2, None, false);
+        app.update(Msg::RepositoriesLoaded {
+            workspace: "acme".to_string(),
+            repos: vec![make_repo("acme/stale", None)],
+            page_info: page_info(1, None, true),
+        });
+        assert!(app.repositories.items.is_empty());
+    }
+
+    #[test]
+    fn pull_requests_loaded_ignored_when_page_does_not_match_current_request() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.pr_state_filter = PrStateFilter::Open;
+        app.pull_requests_page_info = page_info(2, None, false);
+        app.update(Msg::PullRequestsLoaded {
+            repo: "widget".to_string(),
+            filter: PrStateFilter::Open,
+            prs: vec![make_pr(1, "OPEN")],
+            page_info: page_info(1, None, true),
+        });
+        assert!(app.pull_requests.items.is_empty());
+    }
+
+    #[test]
+    fn repositories_cache_is_keyed_by_page_and_does_not_leak_across_pages() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        app.update(Msg::RepositoriesLoaded {
+            workspace: "acme".to_string(),
+            repos: vec![make_repo("acme/foo", None)],
+            page_info: page_info(1, Some(2), true),
+        });
+
+        // 2 ページ目へ移動: 未キャッシュなので一覧クリア + Loading。
+        let cmd = app.update(Msg::Key(key(KeyCode::Char(']'))));
+        assert!(app.repositories.items.is_empty());
+        assert!(matches!(app.status, Status::Loading(_)));
+        assert!(matches!(cmd, Command::LoadRepositories { .. }));
+
+        app.update(Msg::RepositoriesLoaded {
+            workspace: "acme".to_string(),
+            repos: vec![make_repo("acme/bar", None)],
+            page_info: page_info(2, Some(2), false),
+        });
+        assert_eq!(app.repositories.items[0].name, "bar");
+
+        // 1 ページ目へ戻る: キャッシュ命中で即座に表示（Loading にならない）。
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('['))));
+        assert_eq!(app.repositories.items[0].name, "foo");
+        assert_eq!(app.status, Status::Idle);
+        assert!(matches!(cmd, Command::LoadRepositories { .. }));
+    }
+
+    #[test]
+    fn pull_requests_cache_is_keyed_by_page_and_does_not_leak_across_pages() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.pr_state_filter = PrStateFilter::Open;
+        app.update(Msg::PullRequestsLoaded {
+            repo: "widget".to_string(),
+            filter: PrStateFilter::Open,
+            prs: vec![make_pr(1, "OPEN")],
+            page_info: page_info(1, Some(2), true),
+        });
+
+        let cmd = app.update(Msg::Key(key(KeyCode::Char(']'))));
+        assert!(app.pull_requests.items.is_empty());
+        assert!(matches!(app.status, Status::Loading(_)));
+        assert!(matches!(cmd, Command::LoadPullRequests { .. }));
+
+        app.update(Msg::PullRequestsLoaded {
+            repo: "widget".to_string(),
+            filter: PrStateFilter::Open,
+            prs: vec![make_pr(2, "OPEN")],
+            page_info: page_info(2, Some(2), false),
+        });
+        assert_eq!(app.pull_requests.items[0].id, 2);
+
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('['))));
+        assert_eq!(app.pull_requests.items[0].id, 1);
+        assert_eq!(app.status, Status::Idle);
+        assert!(matches!(cmd, Command::LoadPullRequests { .. }));
+    }
+
+    #[test]
+    fn changing_page_clears_confirmed_search_filter() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        app.update(Msg::RepositoriesLoaded {
+            workspace: "acme".to_string(),
+            repos: vec![make_repo("acme/foo", None), make_repo("acme/bar", None)],
+            page_info: page_info(1, Some(2), true),
+        });
+
+        app.update(Msg::Key(key(KeyCode::Char('/'))));
+        app.update(Msg::Key(key(KeyCode::Char('f'))));
+        app.update(Msg::Key(key(KeyCode::Enter))); // 検索確定（Enter 後もフィルタは維持される）。
+        assert_eq!(app.repositories.filter, "f");
+
+        // ページ移動: 表示される 20 件が入れ替わるため、前ページの検索フィルタは引き継がない。
+        app.update(Msg::Key(key(KeyCode::Char(']'))));
+        assert!(app.repositories.filter.is_empty());
+    }
+
+    #[test]
+    fn changing_page_resets_sort_to_fetched_once_new_page_data_arrives() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        app.update(Msg::RepositoriesLoaded {
+            workspace: "acme".to_string(),
+            repos: vec![make_repo("acme/zeta", None), make_repo("acme/alpha", None)],
+            page_info: page_info(1, Some(2), true),
+        });
+        app.update(Msg::Key(key(KeyCode::Char('S')))); // NameAsc
+        assert_eq!(app.repositories_sort, SortMode::NameAsc);
+
+        app.update(Msg::Key(key(KeyCode::Char(']')))); // 2 ページ目へ（未キャッシュ）
+        app.update(Msg::RepositoriesLoaded {
+            workspace: "acme".to_string(),
+            repos: vec![make_repo("acme/gamma", None)],
+            page_info: page_info(2, Some(2), false),
+        });
+
+        assert_eq!(app.repositories_sort, SortMode::Fetched);
+        assert_eq!(app.repositories_page_info.page, 2);
+    }
+
+    #[test]
+    fn switching_pr_filter_resets_to_page_one() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.pr_state_filter = PrStateFilter::Open;
+        app.pull_requests_page_info = page_info(3, Some(5), true);
+
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('m')))); // Merged へ切替
+        match cmd {
+            Command::LoadPullRequests { page, filter, .. } => {
+                assert_eq!(page, 1);
+                assert_eq!(filter, PrStateFilter::Merged);
+            }
+            other => panic!("expected LoadPullRequests, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reload_key_reuses_current_page_not_page_one() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.pr_state_filter = PrStateFilter::Open;
+        app.pull_requests_page_info = page_info(2, Some(5), true);
+
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('r'))));
+        match cmd {
+            Command::LoadPullRequests { page, .. } => assert_eq!(page, 2),
+            other => panic!("expected LoadPullRequests, got {other:?}"),
+        }
     }
 }

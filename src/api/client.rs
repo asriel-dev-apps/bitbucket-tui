@@ -13,8 +13,9 @@ use serde::de::DeserializeOwned;
 
 use crate::api::error::{ApiError, classify_error};
 use crate::api::models::{
-    Branch, Comment, Commit, DiffStatEntry, MergeParams, Paginated, Pipeline, PipelineStep,
-    PipelineTarget, PullRequest, Repository, SrcEntry, User, Workspace, WorkspaceMembership,
+    Branch, Comment, Commit, DiffStatEntry, MergeParams, PageInfo, Paginated, Pipeline,
+    PipelineStep, PipelineTarget, PullRequest, Repository, SrcEntry, User, Workspace,
+    WorkspaceMembership,
 };
 
 /// API のベース URL（Bitbucket Cloud）。
@@ -22,6 +23,13 @@ const BASE_URL: &str = "https://api.bitbucket.org/2.0";
 
 /// ページング追跡の安全上限。これを超える `next` は打ち切り、ログに残す。
 const MAX_PAGES: usize = 20;
+
+/// workspaces / repositories / pull_requests のサーバサイド・ページネーション 1 ページあたりの件数。
+///
+/// 従来の `get_paged`（`next` を最大 [`MAX_PAGES`] ページ直列取得して集約）は、全ページ揃うまで
+/// 一覧が表示されず初回取得が遅くなるため、この 3 画面は 1 ページ（20 件）のみを取得して
+/// 即座に表示し、ページャ UI（`tui::app`）でページ間を移動する方式に変更した。
+pub const PAGE_SIZE: u32 = 20;
 
 /// `User-Agent` ヘッダ値。
 const USER_AGENT: &str = concat!("bitbucket-tui/", env!("CARGO_PKG_VERSION"));
@@ -79,46 +87,57 @@ impl BitbucketClient {
         self.send_get(format!("{BASE_URL}/user"), Vec::new()).await
     }
 
-    /// 参加しているワークスペース一覧を取得する。
+    /// 参加しているワークスペース一覧の指定ページを取得する（`pagelen` 固定 [`PAGE_SIZE`]）。
     ///
     /// 旧 `/2.0/workspaces` は `CHANGE-2770` で廃止されたため `/2.0/user/workspaces` を使う。
     /// 各要素はメンバーシップ（`{ "workspace": {..} }`）なので `workspace` を取り出す。
-    pub async fn list_workspaces(&self) -> Result<Vec<Workspace>, ApiError> {
-        let memberships: Vec<WorkspaceMembership> = self
-            .get_paged("/user/workspaces", &[("pagelen", "50")])
+    pub async fn get_workspaces_page(&self, page: u32) -> Result<Page<Workspace>, ApiError> {
+        let paginated: Paginated<WorkspaceMembership> = self
+            .fetch_single_page("/user/workspaces", &[], page)
             .await?;
-        Ok(memberships.into_iter().map(|m| m.workspace).collect())
+        let info = PageInfo::from_paginated(&paginated, page, PAGE_SIZE);
+        let values = paginated.values.into_iter().map(|m| m.workspace).collect();
+        Ok(Page { values, info })
     }
 
-    /// 指定ワークスペースで閲覧可能なリポジトリ一覧を更新日時降順で取得する。
-    pub async fn list_repositories(&self, workspace: &str) -> Result<Vec<Repository>, ApiError> {
+    /// 指定ワークスペースで閲覧可能なリポジトリ一覧（更新日時降順）の指定ページを取得する
+    /// （`pagelen` 固定 [`PAGE_SIZE`]）。
+    pub async fn get_repositories_page(
+        &self,
+        workspace: &str,
+        page: u32,
+    ) -> Result<Page<Repository>, ApiError> {
         let path = format!("/repositories/{workspace}");
-        self.get_paged(
-            &path,
-            &[
-                ("role", "member"),
-                ("sort", "-updated_on"),
-                ("pagelen", "50"),
-            ],
-        )
-        .await
+        let paginated: Paginated<Repository> = self
+            .fetch_single_page(&path, &[("role", "member"), ("sort", "-updated_on")], page)
+            .await?;
+        let info = PageInfo::from_paginated(&paginated, page, PAGE_SIZE);
+        Ok(Page {
+            values: paginated.values,
+            info,
+        })
     }
 
-    /// PR 一覧を取得する（更新日時降順）。
+    /// PR 一覧（更新日時降順）の指定ページを取得する（`pagelen` 固定 [`PAGE_SIZE`]）。
     ///
     /// `states` は繰り返し `state` クエリとして送る（例: `["OPEN","MERGED"]`）。空の場合は
     /// Bitbucket 既定（OPEN のみ）になる。
-    pub async fn list_pull_requests(
+    pub async fn get_pull_requests_page(
         &self,
         workspace: &str,
         repo: &str,
         states: &[&str],
-    ) -> Result<Vec<PullRequest>, ApiError> {
+        page: u32,
+    ) -> Result<Page<PullRequest>, ApiError> {
         let path = format!("/repositories/{workspace}/{repo}/pullrequests");
         let mut query: Vec<(&str, &str)> = states.iter().map(|state| ("state", *state)).collect();
-        query.push(("pagelen", "50"));
         query.push(("sort", "-updated_on"));
-        self.get_paged(&path, &query).await
+        let paginated: Paginated<PullRequest> = self.fetch_single_page(&path, &query, page).await?;
+        let info = PageInfo::from_paginated(&paginated, page, PAGE_SIZE);
+        Ok(Page {
+            values: paginated.values,
+            info,
+        })
     }
 
     /// PR 詳細を取得する。
@@ -428,6 +447,19 @@ impl BitbucketClient {
         .await
     }
 
+    /// `page`/`pagelen`（固定 [`PAGE_SIZE`]）を含む単一ページ分の GET を行い、生のページ応答
+    /// （`Paginated<T>`）を返す。全集約する [`Self::get_paged`] とは異なり、指定ページのみを
+    /// 取得する（workspaces/repositories/pull_requests のサーバサイド・ページネーションで使う）。
+    async fn fetch_single_page<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        extra_query: &[(&str, &str)],
+        page: u32,
+    ) -> Result<Paginated<T>, ApiError> {
+        let url = format!("{BASE_URL}{path}");
+        self.send_get(url, page_query(extra_query, page)).await
+    }
+
     /// 認証付き GET を実行し、成功時は本文を `T` にデシリアライズする。
     async fn send_get<T: DeserializeOwned>(
         &self,
@@ -540,6 +572,26 @@ impl BitbucketClient {
             .await
             .map_err(|error| ApiError::Network(error.to_string()))
     }
+}
+
+/// 単一ページ取得の結果（値とページ情報）。[`BitbucketClient::get_workspaces_page`] 等が返す。
+#[derive(Debug, Clone)]
+pub struct Page<T> {
+    pub values: Vec<T>,
+    pub info: PageInfo,
+}
+
+/// 単一ページ取得のクエリを組み立てる。`extra` の後ろに `page`/`pagelen`（固定 [`PAGE_SIZE`]）
+/// を追加する。ネットワークを介さずに検証できるよう、実際のリクエスト送信
+/// （[`BitbucketClient::fetch_single_page`]）から切り出した純粋関数にしている。
+fn page_query(extra: &[(&str, &str)], page: u32) -> Vec<(String, String)> {
+    let mut query: Vec<(String, String)> = extra
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect();
+    query.push(("page".to_string(), page.to_string()));
+    query.push(("pagelen".to_string(), PAGE_SIZE.to_string()));
+    query
 }
 
 /// 一般コメント投稿のリクエストボディ（`{"content":{"raw":".."}}`）を組み立てる。
@@ -737,6 +789,37 @@ mod tests {
 
         // 3 ページ分だけ取得して打ち切る。
         assert_eq!(result, vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn page_query_includes_page_and_fixed_pagelen_after_extra_query() {
+        let query = page_query(&[("role", "member"), ("sort", "-updated_on")], 3);
+        assert_eq!(
+            query,
+            vec![
+                ("role".to_string(), "member".to_string()),
+                ("sort".to_string(), "-updated_on".to_string()),
+                ("page".to_string(), "3".to_string()),
+                ("pagelen".to_string(), "20".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn page_query_with_no_extra_query() {
+        let query = page_query(&[], 1);
+        assert_eq!(
+            query,
+            vec![
+                ("page".to_string(), "1".to_string()),
+                ("pagelen".to_string(), "20".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn page_size_constant_is_twenty() {
+        assert_eq!(PAGE_SIZE, 20);
     }
 
     #[test]

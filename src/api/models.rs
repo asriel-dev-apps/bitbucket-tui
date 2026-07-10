@@ -17,15 +17,58 @@ pub struct Paginated<T> {
     pub values: Vec<T>,
     #[serde(default)]
     pub next: Option<String>,
+    /// 現在ページ番号（1 始まり）。単一ページ取得（[`PageInfo::from_paginated`]）で使用する。
     #[serde(default)]
-    #[allow(dead_code, reason = "M1 以降のページ情報表示で使用予定")]
     pub page: Option<u32>,
+    /// 総件数。単一ページ取得の総ページ数算出（[`PageInfo::from_paginated`]）で使用する。
+    /// 応答によっては省略され得る。
     #[serde(default)]
-    #[allow(dead_code, reason = "M1 以降のページ情報表示で使用予定")]
     pub size: Option<u32>,
     #[serde(default)]
-    #[allow(dead_code, reason = "M1 以降のページ情報表示で使用予定")]
+    #[allow(
+        dead_code,
+        reason = "1 ページの件数はリクエスト側の固定値として扱うため未使用"
+    )]
     pub pagelen: Option<u32>,
+}
+
+/// 単一ページ取得の結果に付随するページ情報。
+///
+/// `page`: 現在ページ（1 始まり）。`total_pages`: `size`（総件数）が判明していれば
+/// `ceil(size / page_size)`、レスポンスで `size` が省略されていれば `None`。
+/// `has_next`: レスポンスの `next` の有無（次ページが存在するか）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageInfo {
+    pub page: u32,
+    pub total_pages: Option<u32>,
+    pub has_next: bool,
+}
+
+impl Default for PageInfo {
+    /// 未取得時の初期値（1 ページ目・総数不明・次ページなし）。
+    fn default() -> Self {
+        Self {
+            page: 1,
+            total_pages: None,
+            has_next: false,
+        }
+    }
+}
+
+impl PageInfo {
+    /// `Paginated<T>` から算出する。`page` は応答の `page` を優先し、無ければ
+    /// リクエスト時の `requested_page` にフォールバックする。
+    pub fn from_paginated<T>(
+        paginated: &Paginated<T>,
+        requested_page: u32,
+        page_size: u32,
+    ) -> Self {
+        Self {
+            page: paginated.page.unwrap_or(requested_page),
+            total_pages: paginated.size.map(|size| size.div_ceil(page_size.max(1))),
+            has_next: paginated.next.is_some(),
+        }
+    }
 }
 
 /// `GET /2.0/user` の応答（認証検証に使用）。
@@ -949,6 +992,59 @@ mod tests {
         let page: Paginated<Repository> = serde_json::from_str(json).expect("valid json");
         assert!(page.values.is_empty());
         assert!(page.next.is_none());
+    }
+
+    #[test]
+    fn page_info_default_starts_at_page_one_with_unknown_total() {
+        let info = PageInfo::default();
+        assert_eq!(info.page, 1);
+        assert_eq!(info.total_pages, None);
+        assert!(!info.has_next);
+    }
+
+    #[test]
+    fn page_info_from_paginated_computes_ceil_total_pages() {
+        let paginated: Paginated<Repository> = serde_json::from_str(
+            r#"{ "values": [], "next": "https://api.bitbucket.org/2.0/x?page=2",
+                 "page": 2, "size": 45 }"#,
+        )
+        .expect("valid json");
+        let info = PageInfo::from_paginated(&paginated, 2, 20);
+        assert_eq!(info.page, 2);
+        // ceil(45 / 20) = 3
+        assert_eq!(info.total_pages, Some(3));
+        assert!(info.has_next);
+    }
+
+    #[test]
+    fn page_info_from_paginated_falls_back_to_requested_page_when_omitted() {
+        let paginated: Paginated<Repository> =
+            serde_json::from_str(r#"{ "values": [] }"#).expect("valid json");
+        let info = PageInfo::from_paginated(&paginated, 4, 20);
+        assert_eq!(info.page, 4);
+        assert_eq!(info.total_pages, None);
+        assert!(!info.has_next);
+    }
+
+    #[test]
+    fn page_info_from_paginated_total_pages_none_when_size_omitted() {
+        let paginated: Paginated<Repository> = serde_json::from_str(
+            r#"{ "values": [], "next": "https://api.bitbucket.org/2.0/x?page=2" }"#,
+        )
+        .expect("valid json");
+        let info = PageInfo::from_paginated(&paginated, 1, 20);
+        assert_eq!(info.total_pages, None);
+        assert!(info.has_next);
+    }
+
+    #[test]
+    fn page_info_from_paginated_exact_multiple_has_no_remainder_page() {
+        let paginated: Paginated<Repository> =
+            serde_json::from_str(r#"{ "values": [], "size": 40 }"#).expect("valid json");
+        let info = PageInfo::from_paginated(&paginated, 1, 20);
+        // ceil(40 / 20) = 2 ちょうど（余りによる +1 が発生しない）。
+        assert_eq!(info.total_pages, Some(2));
+        assert!(!info.has_next);
     }
 
     #[test]
