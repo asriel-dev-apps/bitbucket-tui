@@ -331,11 +331,16 @@ fn dispatch(command: Command, api_tx: &mpsc::Sender<Msg>) -> bool {
             client,
             workspace,
             repo,
+            page,
         } => {
             let tx = api_tx.clone();
             tokio::spawn(async move {
-                let msg = match client.list_pipelines(&workspace, &repo).await {
-                    Ok(pipelines) => Msg::PipelinesLoaded { repo, pipelines },
+                let msg = match client.get_pipelines_page(&workspace, &repo, page).await {
+                    Ok(result) => Msg::PipelinesLoaded {
+                        repo,
+                        pipelines: result.values,
+                        page_info: result.info,
+                    },
                     Err(error) => Msg::LoadFailed(error),
                 };
                 let _ = tx.send(msg).await;

@@ -24,11 +24,11 @@ const BASE_URL: &str = "https://api.bitbucket.org/2.0";
 /// ページング追跡の安全上限。これを超える `next` は打ち切り、ログに残す。
 const MAX_PAGES: usize = 20;
 
-/// workspaces / repositories / pull_requests / branches のサーバサイド・ページネーション
-/// 1 ページあたりの件数。
+/// workspaces / repositories / pull_requests / branches / pipelines のサーバサイド・
+/// ページネーション 1 ページあたりの件数。
 ///
 /// 従来の `get_paged`（`next` を最大 [`MAX_PAGES`] ページ直列取得して集約）は、全ページ揃うまで
-/// 一覧が表示されず初回取得が遅くなるため、この 4 画面は 1 ページ（40 件）のみを取得して
+/// 一覧が表示されず初回取得が遅くなるため、この 5 画面は 1 ページ（40 件）のみを取得して
 /// 即座に表示し、ページャ UI（`tui::app`）でページ間を移動する方式に変更した。
 pub const PAGE_SIZE: u32 = 40;
 
@@ -248,15 +248,24 @@ impl BitbucketClient {
         self.send_json_discard(Method::POST, url, params).await
     }
 
-    /// パイプライン一覧を作成日時降順で取得する。
-    pub async fn list_pipelines(
+    /// パイプライン一覧の指定ページを作成日時降順で取得する（`pagelen` 固定 [`PAGE_SIZE`]）。
+    ///
+    /// エンドポイントは末尾スラッシュ `/pipelines/` の既存仕様に合わせる（`get_pipeline`/
+    /// `trigger_pipeline` と同じ形）。
+    pub async fn get_pipelines_page(
         &self,
         workspace: &str,
         repo: &str,
-    ) -> Result<Vec<Pipeline>, ApiError> {
+        page: u32,
+    ) -> Result<Page<Pipeline>, ApiError> {
         let path = format!("/repositories/{workspace}/{repo}/pipelines/");
-        self.get_paged(&path, &[("sort", "-created_on"), ("pagelen", "50")])
-            .await
+        let query = pipelines_query();
+        let paginated: Paginated<Pipeline> = self.fetch_single_page(&path, &query, page).await?;
+        let info = PageInfo::from_paginated(&paginated, page, PAGE_SIZE);
+        Ok(Page {
+            values: paginated.values,
+            info,
+        })
     }
 
     /// パイプライン詳細を取得する。
@@ -613,6 +622,12 @@ fn branches_query() -> [(&'static str, &'static str); 1] {
     [("sort", "-target.date")]
 }
 
+/// パイプライン一覧取得の追加クエリ（作成日時降順で固定）。ネットワークを介さずに検証
+/// できるよう純粋関数として切り出している（[`branches_query`] と同じ狙い）。
+fn pipelines_query() -> [(&'static str, &'static str); 1] {
+    [("sort", "-created_on")]
+}
+
 /// 単一ページ取得のクエリを組み立てる。`extra` の後ろに `page`/`pagelen`（固定 [`PAGE_SIZE`]）
 /// を追加する。ネットワークを介さずに検証できるよう、実際のリクエスト送信
 /// （[`BitbucketClient::fetch_single_page`]）から切り出した純粋関数にしている。
@@ -858,6 +873,24 @@ mod tests {
     #[test]
     fn branches_query_sorts_by_target_date_descending() {
         assert_eq!(branches_query(), [("sort", "-target.date")]);
+    }
+
+    #[test]
+    fn pipelines_query_sorts_by_created_on_descending() {
+        assert_eq!(pipelines_query(), [("sort", "-created_on")]);
+    }
+
+    #[test]
+    fn page_query_for_pipelines_includes_sort_page_and_fixed_pagelen() {
+        let query = page_query(&pipelines_query(), 2);
+        assert_eq!(
+            query,
+            vec![
+                ("sort".to_string(), "-created_on".to_string()),
+                ("page".to_string(), "2".to_string()),
+                ("pagelen".to_string(), "40".to_string()),
+            ]
+        );
     }
 
     #[test]

@@ -388,10 +388,11 @@ pub enum Msg {
     ActionFailed(ApiError),
     /// 自動ポーリングのタイマ tick（進行中パイプラインの定期リフレッシュ）。
     Tick,
-    /// パイプライン一覧の取得完了。
+    /// パイプライン一覧（1 ページ分）の取得完了。
     PipelinesLoaded {
         repo: String,
         pipelines: Vec<Pipeline>,
+        page_info: PageInfo,
     },
     /// パイプライン詳細の取得完了。
     PipelineLoaded {
@@ -524,11 +525,12 @@ pub enum Command {
         id: u64,
         params: MergeParams,
     },
-    /// パイプライン一覧を取得する。
+    /// パイプライン一覧の指定ページを取得する（1 ページ = [`crate::api::client::PAGE_SIZE`] 件）。
     LoadPipelines {
         client: BitbucketClient,
         workspace: String,
         repo: String,
+        page: u32,
     },
     /// パイプライン詳細を取得する。
     LoadPipeline {
@@ -1005,6 +1007,13 @@ pub struct App {
     pub comment_editor: Option<CommentEditor>,
     pub merge_modal: Option<MergeModal>,
     pub pipelines: SelectList<Pipeline>,
+    /// Pipelines 一覧のページ状態。`[`/`]` でページ間移動、`g` でページ番号ジャンプ。
+    pub pipelines_page_info: PageInfo,
+    /// パイプライン一覧の再訪キャッシュ（キー = (repo slug, ページ番号)）。
+    /// [`App::load_pipelines_page`] が再訪時に即表示するために使い、`Msg::PipelinesLoaded`
+    /// 受信のたびに最新化する（stale-while-revalidate）。自動ポーリング（tick）による
+    /// 再取得結果もここへ流れるため、進行中パイプラインがある間は最新のページ内容に保たれる。
+    pub pipelines_cache: RevisitCache<(String, u32), (Vec<Pipeline>, PageInfo)>,
     pub current_pipeline: Option<Pipeline>,
     pub pipeline_steps: SelectList<PipelineStep>,
     pub step_log: Option<LogView>,
@@ -1015,10 +1024,11 @@ pub struct App {
     pub auto_refresh: bool,
     /// Diff 画面から `Esc` で戻る先（PR 詳細 or コミット詳細）。
     pub diff_return: Screen,
-    /// Branches/Source を `Repositories`/`PullRequests` から開いたときの「戻り先」画面。
-    /// 各画面での `b`/`s` キー押下時に記録し、Branches 画面の `Esc`・Source 画面のルートでの
-    /// `Esc`/`Backspace`（親が無い＝これ以上遡れない）がこの戻り先を使う。Branches 経由で
-    /// Source を開いた場合（Branches 画面の `s`）は更新しない（最初に入って来た画面を保つ）。
+    /// Pipelines/Branches/Source を `Repositories`/`PullRequests` から開いたときの「戻り先」
+    /// 画面。各画面での `p`/`P`/`b`/`s` キー押下時に記録し、Pipelines 画面・Branches 画面の
+    /// `Esc`・Source 画面のルートでの `Esc`/`Backspace`（親が無い＝これ以上遡れない）がこの
+    /// 戻り先を使う。Branches 経由で Source を開いた場合（Branches 画面の `s`）は更新しない
+    /// （最初に入って来た画面を保つ）。
     pub browse_return: Screen,
     pub branches: SelectList<Branch>,
     /// Branches 一覧のページ状態。`[`/`]` でページ間移動、`g` でページ番号ジャンプ。
@@ -1125,6 +1135,8 @@ impl App {
             comment_editor: None,
             merge_modal: None,
             pipelines: SelectList::default(),
+            pipelines_page_info: PageInfo::default(),
+            pipelines_cache: RevisitCache::default(),
             current_pipeline: None,
             pipeline_steps: SelectList::default(),
             step_log: None,
@@ -1337,10 +1349,26 @@ impl App {
                 Command::None
             }
             Msg::Tick => self.on_tick(),
-            Msg::PipelinesLoaded { repo, pipelines } => {
-                if self.repo_slug().as_deref() == Some(repo.as_str()) {
+            Msg::PipelinesLoaded {
+                repo,
+                pipelines,
+                page_info,
+            } => {
+                // 表示中かどうかに関わらずキャッシュは最新化する（裏で他 repo/ページへ
+                // 切り替えていても、その結果は次回再訪時に活かす）。
+                self.pipelines_cache.insert(
+                    (repo.clone(), page_info.page),
+                    (pipelines.clone(), page_info),
+                );
+                // 取得中に別 repo/ページへ切り替えていた場合（自動ポーリングの tick が古い
+                // ページの結果を運んできた場合を含む）は画面反映のみ破棄する文脈ガード。
+                if self.repo_slug().as_deref() == Some(repo.as_str())
+                    && self.pipelines_page_info.page == page_info.page
+                {
                     self.clear_loading();
+                    // 自動ポーリング/再検証で一覧が毎回先頭に戻らないよう選択位置を維持する。
                     self.pipelines.set_items_keep_selection(pipelines);
+                    self.pipelines_page_info = page_info;
                 }
                 Command::None
             }
@@ -1389,8 +1417,11 @@ impl App {
                     }
                     PipelineAction::Rerun => {
                         self.status = Status::Success("パイプラインを再実行しました".to_string());
-                        // 新しい実行が一覧の先頭に現れるため一覧へ戻し、静かに再取得する。
+                        // 新しい実行は 1 ページ目の先頭に現れるため、一覧の 1 ページ目へ戻し
+                        // 静かに再取得する（他ページ表示中に rerun した場合も先頭が見える位置
+                        // へ揃える）。
                         self.screen = Screen::Pipelines;
+                        self.pipelines_page_info.page = 1;
                         self.refresh_pipelines_silent()
                     }
                 }
@@ -1886,6 +1917,7 @@ impl App {
                     return Command::None;
                 };
                 self.select_repo(&repo);
+                self.browse_return = Screen::Repositories;
                 self.open_pipelines()
             }
             KeyCode::Char('b') => {
@@ -2049,7 +2081,10 @@ impl App {
             KeyCode::Char('d') => self.set_pr_filter(PrStateFilter::Declined),
             KeyCode::Char('a') => self.set_pr_filter(PrStateFilter::All),
             KeyCode::Char('r') => self.reload_pull_requests(),
-            KeyCode::Char('P') => self.open_pipelines(),
+            KeyCode::Char('P') => {
+                self.browse_return = Screen::PullRequests;
+                self.open_pipelines()
+            }
             KeyCode::Char('b') => {
                 self.browse_return = Screen::PullRequests;
                 self.open_branches()
@@ -2123,13 +2158,14 @@ impl App {
         self.workspaces_page_info = page_info;
     }
 
-    /// 現在の画面がページング対象（Workspaces/Repositories/PullRequests/Branches）なら、その
-    /// ページ状態を返す。それ以外の画面では `None`（ページ移動キーは何もしない）。
+    /// 現在の画面がページング対象（Workspaces/Repositories/PullRequests/Pipelines/Branches）
+    /// なら、そのページ状態を返す。それ以外の画面では `None`（ページ移動キーは何もしない）。
     fn page_info(&self) -> Option<PageInfo> {
         match self.screen {
             Screen::Workspaces => Some(self.workspaces_page_info),
             Screen::Repositories => Some(self.repositories_page_info),
             Screen::PullRequests => Some(self.pull_requests_page_info),
+            Screen::Pipelines => Some(self.pipelines_page_info),
             Screen::Branches => Some(self.branches_page_info),
             _ => None,
         }
@@ -2141,6 +2177,7 @@ impl App {
             Screen::Workspaces => self.load_workspaces_page(page),
             Screen::Repositories => self.load_repositories_page(page),
             Screen::PullRequests => self.load_pull_requests_page(page),
+            Screen::Pipelines => self.load_pipelines_page(page),
             Screen::Branches => self.load_branches_page(page),
             _ => Command::None,
         }
@@ -2726,29 +2763,69 @@ impl App {
 
     // ---- パイプライン監視（M2） ----
 
-    /// Pipelines 一覧画面へ遷移し、一覧取得を開始する。
+    /// Pipelines 一覧画面へ遷移し、1 ページ目の取得を開始する。
     fn open_pipelines(&mut self) -> Command {
         self.screen = Screen::Pipelines;
-        self.pipelines.set_items(Vec::new());
         self.current_pipeline = None;
-        self.reload_pipelines()
+        self.load_pipelines_page(1)
     }
 
-    /// パイプライン一覧を取得する（Loading 表示あり・手動 `r` / 再実行後に使う）。
-    fn reload_pipelines(&mut self) -> Command {
+    /// パイプライン一覧の指定ページを読み込む。
+    ///
+    /// キャッシュ（[`App::pipelines_cache`]、キー = (repo slug, ページ番号)）があれば即座に
+    /// 一覧を表示しつつ、裏で `Command::LoadPipelines` を発行して最新化する
+    /// （stale-while-revalidate）。キャッシュが無ければ一覧をクリアして Loading 表示を出す。
+    /// [`App::open_pipelines`]（新規入場は 1 ページ目から）・`[`/`]`/`g`（ページ移動）・
+    /// `r`（手動リロード、現在ページを再取得）の共通経路。
+    fn load_pipelines_page(&mut self, page: u32) -> Command {
         let Some((client, workspace, repo)) = self.review_context() else {
             self.status = Status::Error("認証クライアントが未初期化です".to_string());
             return Command::None;
         };
-        self.status = Status::Loading("パイプライン一覧を取得中…".to_string());
+
+        let cache_key = (repo.clone(), page);
+        match self.pipelines_cache.get(&cache_key).cloned() {
+            Some((cached, info)) => {
+                self.apply_pipelines(cached, info);
+                self.status = Status::Idle;
+            }
+            None => {
+                self.pipelines.set_items(Vec::new());
+                self.pipelines_page_info = PageInfo {
+                    page,
+                    total_pages: None,
+                    has_next: false,
+                };
+                self.status =
+                    Status::Loading(format!("パイプライン一覧を取得中…（{page} ページ目）"));
+            }
+        }
+
         Command::LoadPipelines {
             client,
             workspace,
             repo,
+            page,
         }
     }
 
-    /// パイプライン一覧を静かに再取得する（自動ポーリング用・Loading 表示なし）。
+    /// 取得結果を `pipelines` へ反映する（ページ状態の更新を含む）。新規ナビゲーション
+    /// （リポジトリ変更・ページ変更）はここで選択を先頭にリセットする（キャッシュヒットに
+    /// よる即時表示（[`App::load_pipelines_page`]）専用。バックグラウンド再検証結果は
+    /// `Msg::PipelinesLoaded` 側で選択を保持したまま部分更新する）。
+    fn apply_pipelines(&mut self, pipelines: Vec<Pipeline>, page_info: PageInfo) {
+        self.pipelines.set_items(pipelines);
+        self.pipelines_page_info = page_info;
+    }
+
+    /// 現在ページでパイプライン一覧を再取得する（`r` キー）。
+    fn reload_pipelines(&mut self) -> Command {
+        self.load_pipelines_page(self.pipelines_page_info.page)
+    }
+
+    /// 現在ページのパイプライン一覧を静かに再取得する（自動ポーリング・stop/re-run 後用・
+    /// Loading 表示なし）。ページ移動中に古いページの tick 結果で上書きしないよう、常に
+    /// `self.pipelines_page_info.page`（＝現在表示中のページ）を対象にする。
     fn refresh_pipelines_silent(&mut self) -> Command {
         let Some((client, workspace, repo)) = self.review_context() else {
             return Command::None;
@@ -2757,6 +2834,7 @@ impl App {
             client,
             workspace,
             repo,
+            page: self.pipelines_page_info.page,
         }
     }
 
@@ -2768,7 +2846,7 @@ impl App {
                 Command::None
             }
             KeyCode::Esc => {
-                self.screen = Screen::Repositories;
+                self.screen = self.browse_return;
                 self.status = Status::Idle;
                 Command::None
             }
@@ -2788,6 +2866,9 @@ impl App {
                 self.pipelines.select_prev_by(10);
                 Command::None
             }
+            KeyCode::Char('[') => self.prev_page(),
+            KeyCode::Char(']') => self.next_page(),
+            KeyCode::Char('g') => self.open_page_jump(),
             KeyCode::Char('r') => self.reload_pipelines(),
             KeyCode::Char('a') => self.toggle_auto_refresh(),
             KeyCode::Char('S') => {
@@ -4790,6 +4871,7 @@ diff --git a/two.txt b/two.txt\n\
                 make_pipeline("{p1}", 1, "IN_PROGRESS", None),
                 make_pipeline("{p2}", 2, "COMPLETED", Some("SUCCESSFUL")),
             ],
+            page_info: single_page(),
         });
         assert_eq!(app.pipelines.items.len(), 2);
         assert_eq!(app.pipelines.state.selected(), Some(0));
@@ -4802,6 +4884,7 @@ diff --git a/two.txt b/two.txt\n\
         app.update(Msg::PipelinesLoaded {
             repo: "other".to_string(),
             pipelines: vec![make_pipeline("{p1}", 1, "IN_PROGRESS", None)],
+            page_info: single_page(),
         });
         assert!(app.pipelines.items.is_empty());
     }
@@ -4823,6 +4906,7 @@ diff --git a/two.txt b/two.txt\n\
                 make_pipeline("{p1}", 1, "COMPLETED", Some("SUCCESSFUL")),
                 make_pipeline("{p2}", 2, "IN_PROGRESS", None),
             ],
+            page_info: single_page(),
         });
         assert_eq!(app.pipelines.state.selected(), Some(1));
     }
@@ -5060,6 +5144,190 @@ diff --git a/two.txt b/two.txt\n\
         assert!(!app.auto_refresh);
         app.update(Msg::Key(key(KeyCode::Char('a'))));
         assert!(app.auto_refresh);
+    }
+
+    // ---- Pipelines のサーバサイド・ページネーション ----
+
+    #[test]
+    fn pipelines_next_page_dispatches_load_pipelines_with_incremented_page() {
+        let mut app = review_app();
+        app.screen = Screen::Pipelines;
+        app.pipelines_page_info = page_info(1, Some(3), true);
+        let cmd = app.update(Msg::Key(key(KeyCode::Char(']'))));
+        match cmd {
+            Command::LoadPipelines { page, .. } => assert_eq!(page, 2),
+            other => panic!("expected LoadPipelines, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipelines_prev_page_does_nothing_on_first_page() {
+        let mut app = review_app();
+        app.screen = Screen::Pipelines;
+        app.pipelines_page_info = page_info(1, Some(3), true);
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('['))));
+        assert!(matches!(cmd, Command::None));
+    }
+
+    #[test]
+    fn pipelines_page_jump_navigates_clamped_to_total_pages() {
+        let mut app = review_app();
+        app.screen = Screen::Pipelines;
+        app.pipelines_page_info = page_info(1, Some(3), true);
+        app.update(Msg::Key(key(KeyCode::Char('g'))));
+        for ch in "99".chars() {
+            app.update(Msg::Key(key(KeyCode::Char(ch))));
+        }
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+        assert!(app.page_jump.is_none());
+        match cmd {
+            // 総ページ数(3)でクランプされる。
+            Command::LoadPipelines { page, .. } => assert_eq!(page, 3),
+            other => panic!("expected LoadPipelines, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipelines_loaded_ignored_when_page_does_not_match_current_request() {
+        let mut app = review_app();
+        app.screen = Screen::Pipelines;
+        app.pipelines_page_info = page_info(2, None, false);
+        app.update(Msg::PipelinesLoaded {
+            repo: "widget".to_string(),
+            pipelines: vec![make_pipeline("{stale}", 1, "IN_PROGRESS", None)],
+            page_info: page_info(1, None, true),
+        });
+        assert!(app.pipelines.items.is_empty());
+    }
+
+    #[test]
+    fn pipelines_cache_is_keyed_by_page_and_does_not_leak_across_pages() {
+        let mut app = review_app();
+        app.screen = Screen::Pipelines;
+        app.update(Msg::PipelinesLoaded {
+            repo: "widget".to_string(),
+            pipelines: vec![make_pipeline("{p1}", 1, "COMPLETED", Some("SUCCESSFUL"))],
+            page_info: page_info(1, Some(2), true),
+        });
+
+        // 2 ページ目へ移動: 未キャッシュなので一覧クリア + Loading。
+        let cmd = app.update(Msg::Key(key(KeyCode::Char(']'))));
+        assert!(app.pipelines.items.is_empty());
+        assert!(matches!(app.status, Status::Loading(_)));
+        assert!(matches!(cmd, Command::LoadPipelines { .. }));
+
+        app.update(Msg::PipelinesLoaded {
+            repo: "widget".to_string(),
+            pipelines: vec![make_pipeline("{p2}", 2, "COMPLETED", Some("FAILED"))],
+            page_info: page_info(2, Some(2), false),
+        });
+        assert_eq!(app.pipelines.items[0].uuid, "{p2}");
+
+        // 1 ページ目へ戻る: キャッシュ命中で即座に表示（Loading にならない）。
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('['))));
+        assert_eq!(app.pipelines.items[0].uuid, "{p1}");
+        assert_eq!(app.status, Status::Idle);
+        assert!(matches!(cmd, Command::LoadPipelines { .. }));
+    }
+
+    #[test]
+    fn opening_pipelines_from_repositories_starts_at_page_one() {
+        let mut app = review_app();
+        app.selected_repo = None;
+        app.screen = Screen::Repositories;
+        app.repositories
+            .set_items(vec![make_repo("acme/widget", None)]);
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('p'))));
+        assert_eq!(app.screen, Screen::Pipelines);
+        match cmd {
+            Command::LoadPipelines { page, .. } => assert_eq!(page, 1),
+            other => panic!("expected LoadPipelines, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reloading_pipelines_reuses_current_page_not_page_one() {
+        let mut app = review_app();
+        app.screen = Screen::Pipelines;
+        app.pipelines_page_info = page_info(2, Some(5), true);
+
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('r'))));
+        match cmd {
+            Command::LoadPipelines { page, .. } => assert_eq!(page, 2),
+            other => panic!("expected LoadPipelines, got {other:?}"),
+        }
+    }
+
+    /// 自動ポーリングの tick は「現在表示中のページ」を対象にする（全集約には戻らない）。
+    #[test]
+    fn tick_refreshes_current_page_not_page_one() {
+        let mut app = review_app();
+        app.screen = Screen::Pipelines;
+        app.pipelines_page_info = page_info(3, Some(5), true);
+        app.pipelines
+            .set_items(vec![make_pipeline("{p1}", 1, "IN_PROGRESS", None)]);
+        match app.update(Msg::Tick) {
+            Command::LoadPipelines { page, .. } => assert_eq!(page, 3),
+            other => panic!("expected LoadPipelines, got {other:?}"),
+        }
+    }
+
+    /// ページ移動中に古いページ（tick 発行時点のページ）の結果が届いても、現在表示中の
+    /// 新しいページを上書きしない（文脈ガード）。
+    #[test]
+    fn tick_result_for_page_navigated_away_from_is_ignored() {
+        let mut app = review_app();
+        app.screen = Screen::Pipelines;
+        app.pipelines_page_info = page_info(1, Some(2), true);
+        app.pipelines
+            .set_items(vec![make_pipeline("{p1}", 1, "IN_PROGRESS", None)]);
+
+        // tick が 1 ページ目のリフレッシュを発行した直後に、ユーザーが 2 ページ目へ移動した
+        // 状況を模す（tick の応答はまだ届いていない）。
+        let tick_cmd = app.update(Msg::Tick);
+        assert!(matches!(tick_cmd, Command::LoadPipelines { .. }));
+        app.update(Msg::Key(key(KeyCode::Char(']'))));
+        assert_eq!(app.pipelines_page_info.page, 2);
+
+        // 遅れて届いた 1 ページ目（tick 由来）の応答は無視され、2 ページ目の表示を上書きしない。
+        app.update(Msg::PipelinesLoaded {
+            repo: "widget".to_string(),
+            pipelines: vec![make_pipeline("{stale}", 1, "COMPLETED", Some("SUCCESSFUL"))],
+            page_info: page_info(1, Some(2), true),
+        });
+        assert_eq!(app.pipelines_page_info.page, 2);
+        assert!(
+            app.pipelines
+                .items
+                .iter()
+                .all(|pipeline| pipeline.uuid != "{stale}")
+        );
+    }
+
+    // ---- Pipelines の戻り先（入って来た画面へ Esc で戻る） ----
+
+    #[test]
+    fn pipelines_esc_returns_to_repositories_when_opened_from_repositories() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        app.repositories
+            .set_items(vec![make_repo("acme/widget", None)]);
+        app.update(Msg::Key(key(KeyCode::Char('p'))));
+        assert_eq!(app.screen, Screen::Pipelines);
+
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        assert_eq!(app.screen, Screen::Repositories);
+    }
+
+    #[test]
+    fn pipelines_esc_returns_to_pull_requests_when_opened_from_pull_requests() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.update(Msg::Key(key(KeyCode::Char('P'))));
+        assert_eq!(app.screen, Screen::Pipelines);
+
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        assert_eq!(app.screen, Screen::PullRequests);
     }
 
     // ---- M3: リポジトリブラウズ ----

@@ -300,8 +300,8 @@ fn count_label<T>(list: &SelectList<T>) -> String {
     }
 }
 
-/// 一覧本体とページャ行（下端 1 行）に分割する。4 画面（Workspaces/Repositories/
-/// PullRequests/Branches）共通のレイアウト。
+/// 一覧本体とページャ行（下端 1 行）に分割する。5 画面（Workspaces/Repositories/
+/// PullRequests/Pipelines/Branches）共通のレイアウト。
 fn split_list_and_pager(area: Rect) -> (Rect, Rect) {
     let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
     (rows[0], rows[1])
@@ -1075,22 +1075,32 @@ fn pipeline_status_span(status: PipelineStatus, label: String, theme: &Theme) ->
 fn render_pipelines(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = app.theme;
     let auto = if app.auto_refresh { "on" } else { "off" };
+    let (list_area, pager_area) = split_list_and_pager(area);
+
     if app.pipelines.items.is_empty() {
-        render_placeholder(frame, area, &app.status, "パイプラインがありません", &theme);
-        return;
+        render_placeholder(
+            frame,
+            list_area,
+            &app.status,
+            "パイプラインがありません",
+            &theme,
+        );
+    } else {
+        let items: Vec<ListItem> = app
+            .pipelines
+            .items
+            .iter()
+            .map(|pipeline| ListItem::new(pipeline_row(pipeline, &theme)))
+            .collect();
+        let title = format!(
+            " パイプライン ({}) [auto:{auto}] ",
+            app.pipelines.items.len()
+        );
+        let list = list_widget(&theme, items, title);
+        frame.render_stateful_widget(list, list_area, &mut app.pipelines.state);
     }
-    let items: Vec<ListItem> = app
-        .pipelines
-        .items
-        .iter()
-        .map(|pipeline| ListItem::new(pipeline_row(pipeline, &theme)))
-        .collect();
-    let title = format!(
-        " パイプライン ({}) [auto:{auto}] ",
-        app.pipelines.items.len()
-    );
-    let list = list_widget(&theme, items, title);
-    frame.render_stateful_widget(list, area, &mut app.pipelines.state);
+
+    render_pager(frame, pager_area, app.pipelines_page_info, &theme);
 }
 
 fn pipeline_row(pipeline: &Pipeline, theme: &Theme) -> Line<'static> {
@@ -1725,6 +1735,8 @@ fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("a", "自動更新"),
             ("S", "停止"),
             ("R", "再実行"),
+            ("[/]", "前/次ページ"),
+            ("g", "ページ番号ジャンプ"),
             ("Esc", "戻る"),
         ],
         Screen::PipelineDetail => vec![
@@ -1993,11 +2005,14 @@ fn render_help(frame: &mut Frame, screen: Screen, theme: &Theme) {
         ],
         Screen::Pipelines => &[
             "Enter          パイプライン詳細を開く",
-            "r              一覧を再読込",
+            "r              一覧を再読込（現在ページ）",
             "a              自動更新の ON/OFF",
             "S              停止（進行中のみ・確認モーダル: Enter 実行 / Esc 取消）",
             "R              再実行（確認モーダル: Enter 実行 / Esc 取消）",
             "Shift+J / K    10 件下 / 上へ移動",
+            "[ / ]          前 / 次ページ（1 ページ 40 件）",
+            "g              ページ番号ジャンプ（数字入力 + Enter, Esc で取消）",
+            "Esc            戻る（Repositories/PullRequests のうち入って来た画面へ）",
         ],
         Screen::PipelineDetail => &[
             "↑↓ / j k       ステップ選択",
@@ -3023,6 +3038,27 @@ mod tests {
             .expect("draw succeeds even with empty list");
         let content = buffer_text(terminal.backend().buffer());
         assert!(content.contains("page 3"));
+    }
+
+    #[test]
+    fn render_pipelines_with_pager_does_not_panic_and_shows_page_label() {
+        let mut app = App::new(crate::config::Config::default(), None);
+        app.pipelines.set_items(vec![]);
+        app.pipelines_page_info = PageInfo {
+            page: 2,
+            total_pages: None,
+            has_next: true,
+        };
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_pipelines(frame, area, &mut app);
+            })
+            .expect("draw succeeds even with empty list");
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("page 2"));
     }
 
     #[test]
