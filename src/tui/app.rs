@@ -1833,7 +1833,7 @@ impl App {
     /// 再検証結果は `Msg::RepositoriesLoaded` 側で選択を保持したまま部分更新する）。
     ///
     /// 検索フィルタは（`SelectList::set_items` により）ここで必ずクリアされる。ページが変われば
-    /// 表示される 20 件が入れ替わるため、前ページのフィルタを引き継がない設計判断。
+    /// 表示される 40 件が入れ替わるため、前ページのフィルタを引き継がない設計判断。
     fn apply_repositories(&mut self, repos: Vec<Repository>, page_info: PageInfo) {
         self.repositories.set_items(repos);
         self.repositories_page_info = page_info;
@@ -2002,7 +2002,7 @@ impl App {
     /// 部分更新する）。
     ///
     /// 検索フィルタは（`SelectList::set_items` により）ここで必ずクリアされる。ページが変われば
-    /// 表示される 20 件が入れ替わるため、前ページのフィルタを引き継がない設計判断。
+    /// 表示される 40 件が入れ替わるため、前ページのフィルタを引き継がない設計判断。
     fn apply_pull_requests(&mut self, prs: Vec<PullRequest>, page_info: PageInfo) {
         self.pull_requests.set_items(prs);
         self.pull_requests_page_info = page_info;
@@ -2117,7 +2117,7 @@ impl App {
     /// 取得結果を `workspaces` へ反映する（ページ状態の更新を含む）。新規取得
     /// （`Msg::WorkspacesLoaded`）とキャッシュからの即時表示（[`App::load_workspaces_page`]）の
     /// 両方から呼ぶ共通経路。検索フィルタは（`SelectList::set_items` により）ここで必ずクリア
-    /// される（ページが変われば表示される 20 件が入れ替わるため）。
+    /// される（ページが変われば表示される 40 件が入れ替わるため）。
     fn apply_workspaces(&mut self, workspaces: Vec<Workspace>, page_info: PageInfo) {
         self.workspaces.set_items(workspaces);
         self.workspaces_page_info = page_info;
@@ -6690,7 +6690,7 @@ diff --git a/two.txt b/two.txt\n\
         assert!(matches!(cmd, Command::LoadPullRequests { .. }));
     }
 
-    // ---- サーバサイド・ページネーション（1 ページ 20 件） ----
+    // ---- サーバサイド・ページネーション（1 ページ 40 件） ----
 
     #[test]
     fn repositories_next_page_dispatches_load_with_incremented_page() {
@@ -6990,7 +6990,7 @@ diff --git a/two.txt b/two.txt\n\
         app.update(Msg::Key(key(KeyCode::Enter))); // 検索確定（Enter 後もフィルタは維持される）。
         assert_eq!(app.repositories.filter, "f");
 
-        // ページ移動: 表示される 20 件が入れ替わるため、前ページの検索フィルタは引き継がない。
+        // ページ移動: 表示される 40 件が入れ替わるため、前ページの検索フィルタは引き継がない。
         app.update(Msg::Key(key(KeyCode::Char(']'))));
         assert!(app.repositories.filter.is_empty());
     }

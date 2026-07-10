@@ -1932,7 +1932,7 @@ fn render_help(frame: &mut Frame, screen: Screen, theme: &Theme) {
             "S              並び替え（更新が新しい順→古い順→作成が新しい順→古い順の巡回。",
             "               タイトルに現在のソートを表示）",
             "Shift+J / K    10 件下 / 上へ移動",
-            "[ / ]          前 / 次ページ（1 ページ 20 件）",
+            "[ / ]          前 / 次ページ（1 ページ 40 件）",
             "g              ページ番号ジャンプ（数字入力 + Enter, Esc で取消）",
         ],
         Screen::PullRequestDetail => &[
@@ -1963,7 +1963,7 @@ fn render_help(frame: &mut Frame, screen: Screen, theme: &Theme) {
             "S              並び替え（更新が新しい順→古い順→作成が新しい順→古い順の巡回。",
             "               タイトルに現在のソートを表示）",
             "Shift+J / K    10 件下 / 上へ移動",
-            "[ / ]          前 / 次ページ（1 ページ 20 件）",
+            "[ / ]          前 / 次ページ（1 ページ 40 件）",
             "g              ページ番号ジャンプ（数字入力 + Enter, Esc で取消）",
         ],
         Screen::Pipelines => &[
@@ -1994,7 +1994,7 @@ fn render_help(frame: &mut Frame, screen: Screen, theme: &Theme) {
             "s              そのブランチのソースルート",
             "r              一覧を再読込",
             "Shift+J / K    10 件下 / 上へ移動",
-            "[ / ]          前 / 次ページ（1 ページ 20 件）",
+            "[ / ]          前 / 次ページ（1 ページ 40 件）",
             "g              ページ番号ジャンプ（数字入力 + Enter, Esc で取消）",
             "Esc            戻る（Repositories/PullRequests のうち入って来た画面へ）",
         ],
@@ -2023,7 +2023,7 @@ fn render_help(frame: &mut Frame, screen: Screen, theme: &Theme) {
         ],
         Screen::Workspaces => &[
             "Shift+J / K    10 件下 / 上へ移動",
-            "[ / ]          前 / 次ページ（1 ページ 20 件）",
+            "[ / ]          前 / 次ページ（1 ページ 40 件）",
             "g              ページ番号ジャンプ（数字入力 + Enter, Esc で取消）",
         ],
     };

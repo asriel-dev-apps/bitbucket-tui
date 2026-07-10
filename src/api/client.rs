@@ -28,9 +28,9 @@ const MAX_PAGES: usize = 20;
 /// 1 ページあたりの件数。
 ///
 /// 従来の `get_paged`（`next` を最大 [`MAX_PAGES`] ページ直列取得して集約）は、全ページ揃うまで
-/// 一覧が表示されず初回取得が遅くなるため、この 4 画面は 1 ページ（20 件）のみを取得して
+/// 一覧が表示されず初回取得が遅くなるため、この 4 画面は 1 ページ（40 件）のみを取得して
 /// 即座に表示し、ページャ UI（`tui::app`）でページ間を移動する方式に変更した。
-pub const PAGE_SIZE: u32 = 20;
+pub const PAGE_SIZE: u32 = 40;
 
 /// `User-Agent` ヘッダ値。
 const USER_AGENT: &str = concat!("bitbucket-tui/", env!("CARGO_PKG_VERSION"));
@@ -868,7 +868,7 @@ mod tests {
             vec![
                 ("sort".to_string(), "-target.date".to_string()),
                 ("page".to_string(), "2".to_string()),
-                ("pagelen".to_string(), "20".to_string()),
+                ("pagelen".to_string(), "40".to_string()),
             ]
         );
     }
@@ -882,7 +882,7 @@ mod tests {
                 ("role".to_string(), "member".to_string()),
                 ("sort".to_string(), "-updated_on".to_string()),
                 ("page".to_string(), "3".to_string()),
-                ("pagelen".to_string(), "20".to_string()),
+                ("pagelen".to_string(), "40".to_string()),
             ]
         );
     }
@@ -894,14 +894,14 @@ mod tests {
             query,
             vec![
                 ("page".to_string(), "1".to_string()),
-                ("pagelen".to_string(), "20".to_string()),
+                ("pagelen".to_string(), "40".to_string()),
             ]
         );
     }
 
     #[test]
-    fn page_size_constant_is_twenty() {
-        assert_eq!(PAGE_SIZE, 20);
+    fn page_size_constant_is_forty() {
+        assert_eq!(PAGE_SIZE, 40);
     }
 
     #[test]
