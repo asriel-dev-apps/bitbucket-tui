@@ -3,7 +3,6 @@
 //! 保存先は `ProjectDirs::from("dev", "", "bitbucket-tui")` の config ディレクトリ配下
 //! `config.toml`。**token は含めない**（token は Keychain のみ）。email は平文で保存してよい。
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -26,10 +25,6 @@ pub struct Config {
     /// 未設定/未知の値は既定テーマ（Catppuccin Mocha）にフォールバックする。
     #[serde(default)]
     pub theme: Option<String>,
-    /// ワークスペース/リポジトリの使用回数（頻度ソート・ジャンプパレットの並び順に使う）。
-    /// キーはワークスペースが `slug`、リポジトリが `full_name`（`workspace/repo`）。
-    #[serde(default)]
-    pub usage: HashMap<String, u32>,
 }
 
 /// このアプリの `ProjectDirs` を返す。

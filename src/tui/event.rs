@@ -120,13 +120,15 @@ fn dispatch(command: Command, api_tx: &mpsc::Sender<Msg>) -> bool {
         Command::LoadRepositories {
             client,
             workspace,
+            sort,
             page,
         } => {
             let tx = api_tx.clone();
             tokio::spawn(async move {
-                let msg = match client.get_repositories_page(&workspace, page).await {
+                let msg = match client.get_repositories_page(&workspace, sort, page).await {
                     Ok(result) => Msg::RepositoriesLoaded {
                         workspace,
+                        sort,
                         repos: result.values,
                         page_info: result.info,
                     },
@@ -141,17 +143,19 @@ fn dispatch(command: Command, api_tx: &mpsc::Sender<Msg>) -> bool {
             workspace,
             repo,
             filter,
+            sort,
             page,
         } => {
             let tx = api_tx.clone();
             tokio::spawn(async move {
                 let msg = match client
-                    .get_pull_requests_page(&workspace, &repo, filter.states(), page)
+                    .get_pull_requests_page(&workspace, &repo, filter.states(), sort, page)
                     .await
                 {
                     Ok(result) => Msg::PullRequestsLoaded {
                         repo,
                         filter,
+                        sort,
                         prs: result.values,
                         page_info: result.info,
                     },

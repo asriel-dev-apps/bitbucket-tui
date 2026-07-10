@@ -13,7 +13,7 @@ use serde::de::DeserializeOwned;
 
 use crate::api::error::{ApiError, classify_error};
 use crate::api::models::{
-    Branch, Comment, Commit, DiffStatEntry, MergeParams, PageInfo, Paginated, Pipeline,
+    Branch, Comment, Commit, DiffStatEntry, ListSort, MergeParams, PageInfo, Paginated, Pipeline,
     PipelineStep, PipelineTarget, PullRequest, Repository, SrcEntry, User, Workspace,
     WorkspaceMembership,
 };
@@ -100,17 +100,17 @@ impl BitbucketClient {
         Ok(Page { values, info })
     }
 
-    /// 指定ワークスペースで閲覧可能なリポジトリ一覧（更新日時降順）の指定ページを取得する
+    /// 指定ワークスペースで閲覧可能なリポジトリ一覧の指定ページを、指定ソート順で取得する
     /// （`pagelen` 固定 [`PAGE_SIZE`]）。
     pub async fn get_repositories_page(
         &self,
         workspace: &str,
+        sort: ListSort,
         page: u32,
     ) -> Result<Page<Repository>, ApiError> {
         let path = format!("/repositories/{workspace}");
-        let paginated: Paginated<Repository> = self
-            .fetch_single_page(&path, &[("role", "member"), ("sort", "-updated_on")], page)
-            .await?;
+        let query = repositories_query(sort);
+        let paginated: Paginated<Repository> = self.fetch_single_page(&path, &query, page).await?;
         let info = PageInfo::from_paginated(&paginated, page, PAGE_SIZE);
         Ok(Page {
             values: paginated.values,
@@ -118,7 +118,7 @@ impl BitbucketClient {
         })
     }
 
-    /// PR 一覧（更新日時降順）の指定ページを取得する（`pagelen` 固定 [`PAGE_SIZE`]）。
+    /// PR 一覧の指定ページを、指定ソート順で取得する（`pagelen` 固定 [`PAGE_SIZE`]）。
     ///
     /// `states` は繰り返し `state` クエリとして送る（例: `["OPEN","MERGED"]`）。空の場合は
     /// Bitbucket 既定（OPEN のみ）になる。
@@ -127,11 +127,11 @@ impl BitbucketClient {
         workspace: &str,
         repo: &str,
         states: &[&str],
+        sort: ListSort,
         page: u32,
     ) -> Result<Page<PullRequest>, ApiError> {
         let path = format!("/repositories/{workspace}/{repo}/pullrequests");
-        let mut query: Vec<(&str, &str)> = states.iter().map(|state| ("state", *state)).collect();
-        query.push(("sort", "-updated_on"));
+        let query = pull_requests_query(states, sort);
         let paginated: Paginated<PullRequest> = self.fetch_single_page(&path, &query, page).await?;
         let info = PageInfo::from_paginated(&paginated, page, PAGE_SIZE);
         Ok(Page {
@@ -581,6 +581,19 @@ pub struct Page<T> {
     pub info: PageInfo,
 }
 
+/// リポジトリ一覧取得の追加クエリ（`role=member` 固定 + 現在のソート）。ネットワークを
+/// 介さずに検証できるよう純粋関数として切り出している（[`page_query`] と同じ狙い）。
+fn repositories_query(sort: ListSort) -> [(&'static str, &'static str); 2] {
+    [("role", "member"), ("sort", sort.query_value())]
+}
+
+/// PR 一覧取得の追加クエリ（state フィルタの繰り返し + 現在のソート）。
+fn pull_requests_query<'a>(states: &'a [&'a str], sort: ListSort) -> Vec<(&'a str, &'a str)> {
+    let mut query: Vec<(&str, &str)> = states.iter().map(|state| ("state", *state)).collect();
+    query.push(("sort", sort.query_value()));
+    query
+}
+
 /// 単一ページ取得のクエリを組み立てる。`extra` の後ろに `page`/`pagelen`（固定 [`PAGE_SIZE`]）
 /// を追加する。ネットワークを介さずに検証できるよう、実際のリクエスト送信
 /// （[`BitbucketClient::fetch_single_page`]）から切り出した純粋関数にしている。
@@ -789,6 +802,38 @@ mod tests {
 
         // 3 ページ分だけ取得して打ち切る。
         assert_eq!(result, vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn repositories_query_includes_role_member_and_selected_sort() {
+        assert_eq!(
+            repositories_query(ListSort::RecentlyUpdated),
+            [("role", "member"), ("sort", "-updated_on")]
+        );
+        assert_eq!(
+            repositories_query(ListSort::Oldest),
+            [("role", "member"), ("sort", "created_on")]
+        );
+    }
+
+    #[test]
+    fn pull_requests_query_repeats_state_and_appends_selected_sort() {
+        assert_eq!(
+            pull_requests_query(&["OPEN", "MERGED"], ListSort::Newest),
+            vec![
+                ("state", "OPEN"),
+                ("state", "MERGED"),
+                ("sort", "-created_on"),
+            ]
+        );
+    }
+
+    #[test]
+    fn pull_requests_query_with_no_states_only_has_sort() {
+        assert_eq!(
+            pull_requests_query(&[], ListSort::LeastRecentlyUpdated),
+            vec![("sort", "updated_on")]
+        );
     }
 
     #[test]

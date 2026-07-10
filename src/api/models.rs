@@ -71,6 +71,55 @@ impl PageInfo {
     }
 }
 
+/// Repositories / PullRequests 一覧のサーバサイドソート順（`S` キーで巡回する）。
+///
+/// Bitbucket のブラウザ版と同じ 4 種類を提供する。クライアント側での並び替えはせず、
+/// `sort` クエリとしてそのままサーバへ渡す（[`ListSort::query_value`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ListSort {
+    /// 更新が新しい順（`sort=-updated_on`）。既定。
+    #[default]
+    RecentlyUpdated,
+    /// 更新が古い順（`sort=updated_on`）。
+    LeastRecentlyUpdated,
+    /// 作成が新しい順（`sort=-created_on`）。
+    Newest,
+    /// 作成が古い順（`sort=created_on`）。
+    Oldest,
+}
+
+impl ListSort {
+    /// 次のソートへ巡回する（末尾の次は先頭に戻る）。
+    pub fn next(self) -> ListSort {
+        match self {
+            ListSort::RecentlyUpdated => ListSort::LeastRecentlyUpdated,
+            ListSort::LeastRecentlyUpdated => ListSort::Newest,
+            ListSort::Newest => ListSort::Oldest,
+            ListSort::Oldest => ListSort::RecentlyUpdated,
+        }
+    }
+
+    /// API へ渡す `sort` クエリ値。
+    pub fn query_value(self) -> &'static str {
+        match self {
+            ListSort::RecentlyUpdated => "-updated_on",
+            ListSort::LeastRecentlyUpdated => "updated_on",
+            ListSort::Newest => "-created_on",
+            ListSort::Oldest => "created_on",
+        }
+    }
+
+    /// UI 表示ラベル。
+    pub fn label(self) -> &'static str {
+        match self {
+            ListSort::RecentlyUpdated => "更新が新しい順",
+            ListSort::LeastRecentlyUpdated => "更新が古い順",
+            ListSort::Newest => "作成が新しい順",
+            ListSort::Oldest => "作成が古い順",
+        }
+    }
+}
+
 /// `GET /2.0/user` の応答（認証検証に使用）。
 ///
 /// M0 では `display_name` のみ使用。他フィールドは後続で利用予定のため保持する。
@@ -1045,6 +1094,31 @@ mod tests {
         // ceil(40 / 20) = 2 ちょうど（余りによる +1 が発生しない）。
         assert_eq!(info.total_pages, Some(2));
         assert!(!info.has_next);
+    }
+
+    #[test]
+    fn list_sort_default_is_recently_updated() {
+        assert_eq!(ListSort::default(), ListSort::RecentlyUpdated);
+    }
+
+    #[test]
+    fn list_sort_next_cycles_through_all_four_and_wraps() {
+        assert_eq!(
+            ListSort::RecentlyUpdated.next(),
+            ListSort::LeastRecentlyUpdated
+        );
+        assert_eq!(ListSort::LeastRecentlyUpdated.next(), ListSort::Newest);
+        assert_eq!(ListSort::Newest.next(), ListSort::Oldest);
+        // 末尾の次は先頭に戻る。
+        assert_eq!(ListSort::Oldest.next(), ListSort::RecentlyUpdated);
+    }
+
+    #[test]
+    fn list_sort_query_value_matches_bitbucket_browser_presets() {
+        assert_eq!(ListSort::RecentlyUpdated.query_value(), "-updated_on");
+        assert_eq!(ListSort::LeastRecentlyUpdated.query_value(), "updated_on");
+        assert_eq!(ListSort::Newest.query_value(), "-created_on");
+        assert_eq!(ListSort::Oldest.query_value(), "created_on");
     }
 
     #[test]

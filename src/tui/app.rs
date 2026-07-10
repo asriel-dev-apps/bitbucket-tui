@@ -3,7 +3,6 @@
 //! bubbletea の `Model`/`Msg`/`Cmd` に相当する構造。`update()` は状態を更新し、副作用を
 //! [`Command`] として返す。実際の非同期実行（API 呼び出しの spawn）は `event` モジュールが行う。
 
-use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -11,9 +10,9 @@ use ratatui::text::Line;
 use ratatui::widgets::ListState;
 
 use crate::api::{
-    ApiError, BitbucketClient, Branch, Comment, Commit, DiffStatEntry, MergeParams, MergeStrategy,
-    PageInfo, Pipeline, PipelineStep, PipelineTarget, PullRequest, Repository, SrcEntry, User,
-    Workspace,
+    ApiError, BitbucketClient, Branch, Comment, Commit, DiffStatEntry, ListSort, MergeParams,
+    MergeStrategy, PageInfo, Pipeline, PipelineStep, PipelineTarget, PullRequest, Repository,
+    SrcEntry, User, Workspace,
 };
 use crate::auth;
 use crate::config::Config;
@@ -352,6 +351,8 @@ pub enum Msg {
     /// リポジトリ一覧（1 ページ分）の取得完了。
     RepositoriesLoaded {
         workspace: String,
+        /// リクエスト時に指定していたソート順（ステイル判定・キャッシュキーに使う）。
+        sort: ListSort,
         repos: Vec<Repository>,
         page_info: PageInfo,
     },
@@ -361,6 +362,8 @@ pub enum Msg {
     PullRequestsLoaded {
         repo: String,
         filter: PrStateFilter,
+        /// リクエスト時に指定していたソート順（ステイル判定・キャッシュキーに使う）。
+        sort: ListSort,
         prs: Vec<PullRequest>,
         page_info: PageInfo,
     },
@@ -441,18 +444,20 @@ pub enum Command {
     ValidateAuth { email: String, token: String },
     /// ワークスペース一覧の指定ページを取得する（1 ページ = [`crate::api::client::PAGE_SIZE`] 件）。
     LoadWorkspaces { client: BitbucketClient, page: u32 },
-    /// 指定ワークスペースのリポジトリ一覧の指定ページを取得する。
+    /// 指定ワークスペースのリポジトリ一覧の指定ページを、指定ソート順で取得する。
     LoadRepositories {
         client: BitbucketClient,
         workspace: String,
+        sort: ListSort,
         page: u32,
     },
-    /// PR 一覧の指定ページを取得する。
+    /// PR 一覧の指定ページを、指定ソート順で取得する。
     LoadPullRequests {
         client: BitbucketClient,
         workspace: String,
         repo: String,
         filter: PrStateFilter,
+        sort: ListSort,
         page: u32,
     },
     /// PR 詳細を取得する。
@@ -660,6 +665,34 @@ impl<T> SelectList<T> {
         self.items = items;
     }
 
+    /// 要素を差し替えつつ、`key_fn` で選択中要素と一致するものを新しい一覧から探して選択する
+    /// （見つからなければ現在のインデックスを新件数にクランプする＝`set_items_keep_selection`
+    /// と同じフォールバック）。
+    ///
+    /// 同一文脈（同じ画面/フィルタ/ページ/ソート）の再検証結果が届いたときに使う。並び順が
+    /// 変わり得る場合（サーバソート下で他者の更新により順序が変動する等）でも、識別子
+    /// （slug/full_name/PR id 等）で同一アイテムを追従できるため、単純なインデックス維持より
+    /// 頑健。検索を使わない画面専用（`set_items_keep_selection` と同じ制約）。
+    pub fn set_items_keep_selection_by<F, K>(&mut self, items: Vec<T>, key_fn: F)
+    where
+        F: Fn(&T) -> K,
+        K: PartialEq,
+    {
+        let current_key = self.selected().map(&key_fn);
+        self.matches = (0..items.len()).collect();
+        let selection = current_key
+            .and_then(|key| items.iter().position(|item| key_fn(item) == key))
+            .or_else(|| {
+                if items.is_empty() {
+                    None
+                } else {
+                    Some(self.state.selected().unwrap_or(0).min(items.len() - 1))
+                }
+            });
+        self.state.select(selection);
+        self.items = items;
+    }
+
     /// 検索フィルタ文字列を更新し、`key_fn` が返す文字列（大文字小文字は無視）に対する
     /// 部分一致で `matches` を再計算する。選択位置は新しい `matches` の範囲にクランプする。
     pub fn set_filter<F>(&mut self, filter: String, key_fn: F)
@@ -667,15 +700,6 @@ impl<T> SelectList<T> {
         F: Fn(&T) -> String,
     {
         self.filter = filter;
-        self.recompute_matches(key_fn);
-    }
-
-    /// 現在のフィルタを保ったまま要素の並びを差し替える（ソート適用に使う）。
-    pub fn reorder<F>(&mut self, items: Vec<T>, key_fn: F)
-    where
-        F: Fn(&T) -> String,
-    {
-        self.items = items;
         self.recompute_matches(key_fn);
     }
 
@@ -733,6 +757,30 @@ impl<T> SelectList<T> {
         self.state.select(Some(prev));
     }
 
+    /// 選択を `amount` 件下へ（末尾でクランプ）。`Shift+J` の 10 件移動に使う。
+    pub fn select_next_by(&mut self, amount: usize) {
+        if self.matches.is_empty() {
+            return;
+        }
+        let next = match self.state.selected() {
+            Some(index) => (index + amount).min(self.matches.len() - 1),
+            None => 0,
+        };
+        self.state.select(Some(next));
+    }
+
+    /// 選択を `amount` 件上へ（先頭でクランプ）。`Shift+K` の 10 件移動に使う。
+    pub fn select_prev_by(&mut self, amount: usize) {
+        if self.matches.is_empty() {
+            return;
+        }
+        let prev = match self.state.selected() {
+            Some(index) => index.saturating_sub(amount),
+            None => 0,
+        };
+        self.state.select(Some(prev));
+    }
+
     /// 現在選択中の要素（`matches` 上の位置を `items` のインデックスへ変換して引く）。
     pub fn selected(&self) -> Option<&T> {
         let position = self.state.selected()?;
@@ -743,47 +791,6 @@ impl<T> SelectList<T> {
     /// 表示順（フィルタ適用後）で要素を辿るイテレータ。`ui` の一覧描画に使う。
     pub fn visible(&self) -> impl Iterator<Item = &T> + '_ {
         self.matches.iter().map(move |&index| &self.items[index])
-    }
-}
-
-/// Repositories / PullRequests 画面の一覧ソートモード（`S` キーで巡回）。
-///
-/// 「取得順に戻せる」ことを要件とするため、常に `Fetched` を起点に巡回できる。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SortMode {
-    /// API から取得した順（updated_on 降順で取得済み）。
-    #[default]
-    Fetched,
-    /// 名前（リポジトリ名 / PR タイトル）昇順。
-    NameAsc,
-    /// 更新日時（`updated_on`）降順。
-    UpdatedDesc,
-    /// 使用頻度（`Config::usage`）降順。
-    ///
-    /// PR には使用頻度の概念が無いため、PullRequests 画面ではこのモードは `Fetched` と
-    /// 同じ（並び替えなしのパススルー）になる。
-    UsageDesc,
-}
-
-impl SortMode {
-    /// 次のソートモードへ巡回する（末尾の次は先頭の `Fetched` に戻る）。
-    pub fn next(self) -> SortMode {
-        match self {
-            SortMode::Fetched => SortMode::NameAsc,
-            SortMode::NameAsc => SortMode::UpdatedDesc,
-            SortMode::UpdatedDesc => SortMode::UsageDesc,
-            SortMode::UsageDesc => SortMode::Fetched,
-        }
-    }
-
-    /// ステータス表示・一覧タイトル用のラベル。
-    pub fn label(self) -> &'static str {
-        match self {
-            SortMode::Fetched => "取得順",
-            SortMode::NameAsc => "名前昇順",
-            SortMode::UpdatedDesc => "更新日時降順",
-            SortMode::UsageDesc => "使用頻度降順",
-        }
     }
 }
 
@@ -926,6 +933,13 @@ pub struct PrDetailCache {
     pub comments: Vec<Comment>,
 }
 
+/// PR 一覧の再訪キャッシュの型（[`App::pull_requests_cache`]）。
+///
+/// キー（repo slug, state フィルタ, ソート, ページ番号）のタプルが 4 要素になり
+/// `clippy::type_complexity` に抵触するため、型エイリアスへ切り出している。
+type PullRequestsCache =
+    RevisitCache<(String, PrStateFilter, ListSort, u32), (Vec<PullRequest>, PageInfo)>;
+
 /// アプリ全体の状態。
 pub struct App {
     pub screen: Screen,
@@ -946,35 +960,30 @@ pub struct App {
     /// （stale-while-revalidate）。
     pub workspaces_cache: RevisitCache<u32, (Vec<Workspace>, PageInfo)>,
     pub repositories: SelectList<Repository>,
-    /// Repositories 一覧の現在のソートモード（`S` キーで巡回）。
-    pub repositories_sort: SortMode,
-    /// Repositories の取得順スナップショット（`SortMode::Fetched` に戻すための元データ）。
-    /// ページ単位（現在ページの 20 件以内）でのみ有効。
-    pub repositories_fetch_order: Vec<Repository>,
+    /// Repositories 一覧の現在のサーバソート順（`S` キーで巡回。Bitbucket ブラウザ版と同じ
+    /// 4 種類）。切り替え時は 1 ページ目から再取得する（[`App::cycle_repositories_sort`]）。
+    pub repositories_sort: ListSort,
     /// Repositories 一覧のページ状態。
     pub repositories_page_info: PageInfo,
-    /// リポジトリ一覧の再訪キャッシュ（キー = (workspace slug, ページ番号)）。
+    /// リポジトリ一覧の再訪キャッシュ（キー = (workspace slug, ソート, ページ番号)）。
     /// [`App::load_repositories_page`] が再訪時に即表示するために使い、`Msg::RepositoriesLoaded`
     /// 受信のたびに最新化する（stale-while-revalidate）。
-    pub repositories_cache: RevisitCache<(String, u32), (Vec<Repository>, PageInfo)>,
+    pub repositories_cache: RevisitCache<(String, ListSort, u32), (Vec<Repository>, PageInfo)>,
     pub selected_workspace: Option<String>,
     pub selected_repo: Option<String>,
     /// 選択リポジトリの既定ブランチ名（`mainbranch.name`）。Source ルートに使う。
     pub repo_main_branch: Option<String>,
     pub pull_requests: SelectList<PullRequest>,
-    /// PullRequests 一覧の現在のソートモード（`S` キーで巡回）。
-    pub pull_requests_sort: SortMode,
-    /// PullRequests の取得順スナップショット（`SortMode::Fetched` に戻すための元データ）。
-    /// ページ単位（現在ページの 20 件以内）でのみ有効。
-    pub pull_requests_fetch_order: Vec<PullRequest>,
+    /// PullRequests 一覧の現在のサーバソート順（`S` キーで巡回）。切り替え時は 1 ページ目から
+    /// 再取得する（[`App::cycle_pull_requests_sort`]）。
+    pub pull_requests_sort: ListSort,
     /// PullRequests 一覧のページ状態。
     pub pull_requests_page_info: PageInfo,
-    /// PR 一覧の再訪キャッシュ（キー = (repo slug, state フィルタ, ページ番号)）。
+    /// PR 一覧の再訪キャッシュ（キー = (repo slug, state フィルタ, ソート, ページ番号)）。
     /// `repo` は `Msg::PullRequestsLoaded` が運ぶ値（`review_context()` 由来の repo slug）に
     /// 合わせており、既存のステイル判定ガード（`repo_slug()` 一致チェック）と精度を揃えている
     /// （workspace をまたいだ同名 repo slug の衝突は既存ガードと同じ既知の制約）。
-    pub pull_requests_cache:
-        RevisitCache<(String, PrStateFilter, u32), (Vec<PullRequest>, PageInfo)>,
+    pub pull_requests_cache: PullRequestsCache,
     pub pr_state_filter: PrStateFilter,
     pub current_pr: Option<PullRequest>,
     /// PR 詳細の再訪キャッシュ（キー = (repo full_name, PR id)）。
@@ -1001,6 +1010,11 @@ pub struct App {
     pub auto_refresh: bool,
     /// Diff 画面から `Esc` で戻る先（PR 詳細 or コミット詳細）。
     pub diff_return: Screen,
+    /// Branches/Source を `Repositories`/`PullRequests` から開いたときの「戻り先」画面。
+    /// 各画面での `b`/`s` キー押下時に記録し、Branches 画面の `Esc`・Source 画面のルートでの
+    /// `Esc`/`Backspace`（親が無い＝これ以上遡れない）がこの戻り先を使う。Branches 経由で
+    /// Source を開いた場合（Branches 画面の `s`）は更新しない（最初に入って来た画面を保つ）。
+    pub browse_return: Screen,
     pub branches: SelectList<Branch>,
     pub commits: SelectList<Commit>,
     /// Commits 画面が表示中の revision（ブランチ名/ハッシュ、既定は `None`）。
@@ -1079,16 +1093,14 @@ impl App {
             workspaces_page_info: PageInfo::default(),
             workspaces_cache: RevisitCache::default(),
             repositories: SelectList::default(),
-            repositories_sort: SortMode::default(),
-            repositories_fetch_order: Vec::new(),
+            repositories_sort: ListSort::default(),
             repositories_page_info: PageInfo::default(),
             repositories_cache: RevisitCache::default(),
             selected_workspace: None,
             selected_repo: None,
             repo_main_branch: None,
             pull_requests: SelectList::default(),
-            pull_requests_sort: SortMode::default(),
-            pull_requests_fetch_order: Vec::new(),
+            pull_requests_sort: ListSort::default(),
             pull_requests_page_info: PageInfo::default(),
             pull_requests_cache: RevisitCache::default(),
             pr_state_filter: PrStateFilter::Open,
@@ -1109,6 +1121,7 @@ impl App {
             confirm_modal: None,
             auto_refresh: true,
             diff_return: Screen::PullRequestDetail,
+            browse_return: Screen::Repositories,
             branches: SelectList::default(),
             commits: SelectList::default(),
             commits_revision: None,
@@ -1159,27 +1172,38 @@ impl App {
                 // 取得中に別ページへ移動していた場合（要求ページと不一致）は画面反映のみ破棄。
                 if self.workspaces_page_info.page == page_info.page {
                     self.status = Status::Idle;
-                    self.apply_workspaces(workspaces, page_info);
+                    // 同一文脈（同じページ）への再検証: 選択位置は識別子（slug）で追従し、
+                    // 見つからなければインデックスをクランプする（先頭へは戻さない）。
+                    self.workspaces
+                        .set_items_keep_selection_by(workspaces, |workspace| {
+                            workspace.slug.clone()
+                        });
+                    self.workspaces_page_info = page_info;
                 }
                 Command::None
             }
             Msg::RepositoriesLoaded {
                 workspace,
+                sort,
                 repos,
                 page_info,
             } => {
                 // 表示中かどうかに関わらずキャッシュは最新化する（裏で他ワークスペース/ページへ
                 // 切り替えていても、その結果は次回再訪時に活かす）。
                 self.repositories_cache.insert(
-                    (workspace.clone(), page_info.page),
+                    (workspace.clone(), sort, page_info.page),
                     (repos.clone(), page_info),
                 );
-                // 取得中に別ワークスペース/ページへ切り替えていた場合は画面反映のみ破棄。
+                // 取得中に別ワークスペース/ページ/ソートへ切り替えていた場合は画面反映のみ破棄。
                 if self.selected_workspace.as_deref() == Some(workspace.as_str())
+                    && self.repositories_sort == sort
                     && self.repositories_page_info.page == page_info.page
                 {
                     self.status = Status::Idle;
-                    self.apply_repositories(repos, page_info);
+                    // 同一文脈への再検証: 選択位置は識別子（full_name）で追従する。
+                    self.repositories
+                        .set_items_keep_selection_by(repos, |repo| repo.full_name.clone());
+                    self.repositories_page_info = page_info;
                 }
                 Command::None
             }
@@ -1190,21 +1214,26 @@ impl App {
             Msg::PullRequestsLoaded {
                 repo,
                 filter,
+                sort,
                 prs,
                 page_info,
             } => {
                 // 表示中かどうかに関わらずキャッシュは最新化する（他 repo/フィルタ/ページへ
                 // 切り替えていても、その結果は次回再訪時に活かす）。
                 self.pull_requests_cache.insert(
-                    (repo.clone(), filter, page_info.page),
+                    (repo.clone(), filter, sort, page_info.page),
                     (prs.clone(), page_info),
                 );
                 if self.repo_slug().as_deref() == Some(repo.as_str())
                     && self.pr_state_filter == filter
+                    && self.pull_requests_sort == sort
                     && self.pull_requests_page_info.page == page_info.page
                 {
                     self.status = Status::Idle;
-                    self.apply_pull_requests(prs, page_info);
+                    // 同一文脈への再検証: 選択位置は識別子（PR id）で追従する。
+                    self.pull_requests
+                        .set_items_keep_selection_by(prs, |pr| pr.id);
+                    self.pull_requests_page_info = page_info;
                 }
                 Command::None
             }
@@ -1682,6 +1711,14 @@ impl App {
                 self.workspaces.select_prev();
                 Command::None
             }
+            KeyCode::Char('J') => {
+                self.workspaces.select_next_by(10);
+                Command::None
+            }
+            KeyCode::Char('K') => {
+                self.workspaces.select_prev_by(10);
+                Command::None
+            }
             KeyCode::Char('[') => self.prev_page(),
             KeyCode::Char(']') => self.next_page(),
             KeyCode::Char('g') => self.open_page_jump(),
@@ -1699,15 +1736,14 @@ impl App {
         self.jump_to_workspace(slug)
     }
 
-    /// 指定ワークスペースへ入る（既定ワークスペースの保存・使用頻度カウント・
-    /// リポジトリ 1 ページ目の取得開始まで行う）。一覧での選択決定
-    /// （[`App::enter_workspace`]）とジャンプパレットの双方から呼ぶ共通経路。
+    /// 指定ワークスペースへ入る（既定ワークスペースの保存・リポジトリ 1 ページ目の取得開始
+    /// まで行う）。一覧での選択決定（[`App::enter_workspace`]）とジャンプパレットの双方から
+    /// 呼ぶ共通経路。
     fn jump_to_workspace(&mut self, slug: String) -> Command {
         self.selected_workspace = Some(slug.clone());
-        self.config.default_workspace = Some(slug.clone());
-        self.bump_usage(slug);
+        self.config.default_workspace = Some(slug);
         if let Err(error) = self.config.save() {
-            tracing::warn!(%error, "既定ワークスペース/使用頻度の保存に失敗しました");
+            tracing::warn!(%error, "既定ワークスペースの保存に失敗しました");
         }
 
         self.screen = Screen::Repositories;
@@ -1716,18 +1752,19 @@ impl App {
 
     /// リポジトリ一覧の指定ページを読み込む。
     ///
-    /// キャッシュ（[`App::repositories_cache`]、キー = (workspace slug, ページ番号)）があれば
-    /// 即座に一覧を表示しつつ、裏で `Command::LoadRepositories` を発行して最新化する
+    /// キャッシュ（[`App::repositories_cache`]、キー = (workspace slug, ソート, ページ番号)）が
+    /// あれば即座に一覧を表示しつつ、裏で `Command::LoadRepositories` を発行して最新化する
     /// （stale-while-revalidate）。キャッシュが無ければ一覧をクリアして Loading 表示を出す。
-    /// [`App::jump_to_workspace`]（新規入場は 1 ページ目から）と `[`/`]`/`g`（ページ移動）の
-    /// 双方から呼ぶ共通経路。
+    /// [`App::jump_to_workspace`]（新規入場は 1 ページ目から）・`[`/`]`/`g`（ページ移動）・
+    /// `S`（ソート変更、1 ページ目から）の共通経路。
     fn load_repositories_page(&mut self, page: u32) -> Command {
         let Some(workspace) = self.selected_workspace.clone() else {
             self.status = Status::Error("ワークスペースが未選択です".to_string());
             return Command::None;
         };
+        let sort = self.repositories_sort;
 
-        let cache_key = (workspace.clone(), page);
+        let cache_key = (workspace.clone(), sort, page);
         match self.repositories_cache.get(&cache_key).cloned() {
             Some((cached, info)) => {
                 self.apply_repositories(cached, info);
@@ -1741,7 +1778,8 @@ impl App {
                     has_next: false,
                 };
                 self.status = Status::Loading(format!(
-                    "{workspace} のリポジトリを取得中…（{page} ページ目）"
+                    "{workspace} のリポジトリを取得中…（{} ・{page} ページ目）",
+                    sort.label()
                 ));
             }
         }
@@ -1750,6 +1788,7 @@ impl App {
             Some(client) => Command::LoadRepositories {
                 client: client.clone(),
                 workspace,
+                sort,
                 page,
             },
             None => {
@@ -1759,22 +1798,16 @@ impl App {
         }
     }
 
-    /// 取得結果を `repositories` へ反映する（取得順スナップショット・ソートモード・
-    /// ページ状態のリセットを含む）。新規取得（`Msg::RepositoriesLoaded`）とキャッシュからの
-    /// 即時表示（[`App::load_repositories_page`]）の両方から呼ぶ共通経路。
+    /// 取得結果を `repositories` へ反映する（ページ状態の更新を含む）。新規ナビゲーション
+    /// （ワークスペース変更・ページ変更・ソート変更）はここで選択を先頭にリセットする
+    /// （キャッシュヒットによる即時表示（[`App::load_repositories_page`]）専用。バックグラウンド
+    /// 再検証結果は `Msg::RepositoriesLoaded` 側で選択を保持したまま部分更新する）。
     ///
     /// 検索フィルタは（`SelectList::set_items` により）ここで必ずクリアされる。ページが変われば
     /// 表示される 20 件が入れ替わるため、前ページのフィルタを引き継がない設計判断。
     fn apply_repositories(&mut self, repos: Vec<Repository>, page_info: PageInfo) {
-        self.repositories_fetch_order = repos.clone();
-        self.repositories_sort = SortMode::Fetched;
         self.repositories.set_items(repos);
         self.repositories_page_info = page_info;
-    }
-
-    /// `config.usage` のカウンタを 1 増やす（保存は呼び出し側の責務）。
-    fn bump_usage(&mut self, key: String) {
-        *self.config.usage.entry(key).or_insert(0) += 1;
     }
 
     fn on_key_repositories(&mut self, key: KeyEvent) -> Command {
@@ -1802,6 +1835,14 @@ impl App {
                 self.repositories.select_prev();
                 Command::None
             }
+            KeyCode::Char('J') => {
+                self.repositories.select_next_by(10);
+                Command::None
+            }
+            KeyCode::Char('K') => {
+                self.repositories.select_prev_by(10);
+                Command::None
+            }
             KeyCode::Char('[') => self.prev_page(),
             KeyCode::Char(']') => self.next_page(),
             KeyCode::Char('g') => self.open_page_jump(),
@@ -1823,6 +1864,7 @@ impl App {
                     return Command::None;
                 };
                 self.select_repo(&repo);
+                self.browse_return = Screen::Repositories;
                 self.open_branches()
             }
             KeyCode::Char('s') => {
@@ -1830,6 +1872,7 @@ impl App {
                     return Command::None;
                 };
                 self.select_repo(&repo);
+                self.browse_return = Screen::Repositories;
                 let branch = self.default_source_ref();
                 self.open_source_root(branch)
             }
@@ -1837,14 +1880,10 @@ impl App {
         }
     }
 
-    /// 選択リポジトリを確定する（`ws/repo` と既定ブランチを保持し、使用頻度を加算する）。
+    /// 選択リポジトリを確定する（`ws/repo` と既定ブランチを保持する）。
     fn select_repo(&mut self, repo: &Repository) {
         self.selected_repo = Some(repo.full_name.clone());
         self.repo_main_branch = repo.main_branch_name().map(str::to_string);
-        self.bump_usage(repo.full_name.clone());
-        if let Err(error) = self.config.save() {
-            tracing::warn!(%error, "使用頻度の保存に失敗しました");
-        }
     }
 
     /// リポジトリを選択して PR 一覧へ入る。一覧での決定（Enter）とジャンプパレットの
@@ -1861,35 +1900,11 @@ impl App {
             .unwrap_or_else(|| "main".to_string())
     }
 
-    /// Repositories 一覧のソートモードを次へ巡回し、適用する。
+    /// Repositories 一覧のサーバソートを次へ巡回し、1 ページ目から再取得する
+    /// （Bitbucket ブラウザ版と同じ 4 種類。[`ListSort`]）。
     fn cycle_repositories_sort(&mut self) -> Command {
         self.repositories_sort = self.repositories_sort.next();
-        self.apply_repositories_sort();
-        self.status = Status::Success(format!("並び替え: {}", self.repositories_sort.label()));
-        Command::None
-    }
-
-    /// `repositories_fetch_order`（取得順スナップショット）から現在のソートモードで
-    /// 並び替え、フィルタを保ったまま `repositories` へ反映する。
-    fn apply_repositories_sort(&mut self) {
-        let mut items = self.repositories_fetch_order.clone();
-        match self.repositories_sort {
-            SortMode::Fetched => {}
-            SortMode::NameAsc => {
-                items.sort_by_key(|repo| repo.name.to_lowercase());
-            }
-            SortMode::UpdatedDesc => items.sort_by(|a, b| {
-                cmp_updated_on_desc(a.updated_on.as_deref(), b.updated_on.as_deref())
-            }),
-            SortMode::UsageDesc => {
-                let usage = self.config.usage.clone();
-                items.sort_by(|a, b| {
-                    usage_of(&usage, &b.full_name).cmp(&usage_of(&usage, &a.full_name))
-                });
-            }
-        }
-        self.repositories
-            .reorder(items, |repo| format!("{} {}", repo.full_name, repo.name));
+        self.load_repositories_page(1)
     }
 
     /// PR 一覧画面へ遷移し、OPEN の一覧の 1 ページ目取得を開始する。
@@ -1902,18 +1917,20 @@ impl App {
 
     /// PR 一覧の指定ページを読み込む。
     ///
-    /// キャッシュ（[`App::pull_requests_cache`]、キー = (repo slug, state フィルタ,
+    /// キャッシュ（[`App::pull_requests_cache`]、キー = (repo slug, state フィルタ, ソート,
     /// ページ番号)）があれば即座に一覧を表示しつつ、裏で `Command::LoadPullRequests` を
     /// 発行して最新化する（stale-while-revalidate）。キャッシュが無ければ一覧をクリアして
-    /// Loading 表示を出す。リポジトリへの新規入場・フィルタ切り替え（いずれも 1 ページ目から）・
-    /// ページ移動（`[`/`]`/`g`）・手動リロード（`r`、現在ページを再取得）の共通経路。
+    /// Loading 表示を出す。リポジトリへの新規入場・フィルタ切り替え・ソート変更（いずれも
+    /// 1 ページ目から）・ページ移動（`[`/`]`/`g`）・手動リロード（`r`、現在ページを再取得）の
+    /// 共通経路。
     fn load_pull_requests_page(&mut self, page: u32) -> Command {
         let Some((client, workspace, repo)) = self.review_context() else {
             self.status = Status::Error("認証クライアントが未初期化です".to_string());
             return Command::None;
         };
+        let sort = self.pull_requests_sort;
 
-        let cache_key = (repo.clone(), self.pr_state_filter, page);
+        let cache_key = (repo.clone(), self.pr_state_filter, sort, page);
         match self.pull_requests_cache.get(&cache_key).cloned() {
             Some((cached, info)) => {
                 self.apply_pull_requests(cached, info);
@@ -1927,8 +1944,9 @@ impl App {
                     has_next: false,
                 };
                 self.status = Status::Loading(format!(
-                    "PR 一覧を取得中…（{}・{page} ページ目）",
-                    self.pr_state_filter.label()
+                    "PR 一覧を取得中…（{}・{}・{page} ページ目）",
+                    self.pr_state_filter.label(),
+                    sort.label()
                 ));
             }
         }
@@ -1938,6 +1956,7 @@ impl App {
             workspace,
             repo,
             filter: self.pr_state_filter,
+            sort,
             page,
         }
     }
@@ -1947,15 +1966,15 @@ impl App {
         self.load_pull_requests_page(self.pull_requests_page_info.page)
     }
 
-    /// 取得結果を `pull_requests` へ反映する（取得順スナップショット・ソートモード・
-    /// ページ状態のリセットを含む）。新規取得（`Msg::PullRequestsLoaded`）とキャッシュからの
-    /// 即時表示（[`App::load_pull_requests_page`]）の両方から呼ぶ共通経路。
+    /// 取得結果を `pull_requests` へ反映する（ページ状態の更新を含む）。新規ナビゲーション
+    /// （リポジトリ変更・フィルタ変更・ページ変更・ソート変更）はここで選択を先頭にリセット
+    /// する（キャッシュヒットによる即時表示（[`App::load_pull_requests_page`]）専用。
+    /// バックグラウンド再検証結果は `Msg::PullRequestsLoaded` 側で選択を保持したまま
+    /// 部分更新する）。
     ///
     /// 検索フィルタは（`SelectList::set_items` により）ここで必ずクリアされる。ページが変われば
     /// 表示される 20 件が入れ替わるため、前ページのフィルタを引き継がない設計判断。
     fn apply_pull_requests(&mut self, prs: Vec<PullRequest>, page_info: PageInfo) {
-        self.pull_requests_fetch_order = prs.clone();
-        self.pull_requests_sort = SortMode::Fetched;
         self.pull_requests.set_items(prs);
         self.pull_requests_page_info = page_info;
     }
@@ -1985,6 +2004,14 @@ impl App {
                 self.pull_requests.select_prev();
                 Command::None
             }
+            KeyCode::Char('J') => {
+                self.pull_requests.select_next_by(10);
+                Command::None
+            }
+            KeyCode::Char('K') => {
+                self.pull_requests.select_prev_by(10);
+                Command::None
+            }
             KeyCode::Char('[') => self.prev_page(),
             KeyCode::Char(']') => self.next_page(),
             KeyCode::Char('g') => self.open_page_jump(),
@@ -1994,8 +2021,12 @@ impl App {
             KeyCode::Char('a') => self.set_pr_filter(PrStateFilter::All),
             KeyCode::Char('r') => self.reload_pull_requests(),
             KeyCode::Char('P') => self.open_pipelines(),
-            KeyCode::Char('b') => self.open_branches(),
+            KeyCode::Char('b') => {
+                self.browse_return = Screen::PullRequests;
+                self.open_branches()
+            }
             KeyCode::Char('s') => {
+                self.browse_return = Screen::PullRequests;
                 let branch = self.default_source_ref();
                 self.open_source_root(branch)
             }
@@ -2010,30 +2041,10 @@ impl App {
         self.load_pull_requests_page(1)
     }
 
-    /// PullRequests 一覧のソートモードを次へ巡回し、適用する。
+    /// PullRequests 一覧のサーバソートを次へ巡回し、1 ページ目から再取得する。
     fn cycle_pull_requests_sort(&mut self) -> Command {
         self.pull_requests_sort = self.pull_requests_sort.next();
-        self.apply_pull_requests_sort();
-        self.status = Status::Success(format!("並び替え: {}", self.pull_requests_sort.label()));
-        Command::None
-    }
-
-    /// `pull_requests_fetch_order` から現在のソートモードで並び替え、フィルタを保ったまま
-    /// `pull_requests` へ反映する。PR には使用頻度の概念が無いため `UsageDesc` は
-    /// `Fetched` と同じ（並び替えなし）になる。
-    fn apply_pull_requests_sort(&mut self) {
-        let mut items = self.pull_requests_fetch_order.clone();
-        match self.pull_requests_sort {
-            SortMode::Fetched | SortMode::UsageDesc => {}
-            SortMode::NameAsc => {
-                items.sort_by_key(|pr| pr.title_str().to_lowercase());
-            }
-            SortMode::UpdatedDesc => items.sort_by(|a, b| {
-                cmp_updated_on_desc(a.updated_on.as_deref(), b.updated_on.as_deref())
-            }),
-        }
-        self.pull_requests
-            .reorder(items, |pr| format!("{} #{}", pr.title_str(), pr.id));
+        self.load_pull_requests_page(1)
     }
 
     // ---- サーバサイド・ページネーション（Workspaces/Repositories/PullRequests 共通） ----
@@ -2361,6 +2372,15 @@ impl App {
                 self.detail_scroll = self.detail_scroll.saturating_sub(5);
                 Command::None
             }
+            KeyCode::Char('J') => {
+                self.detail_scroll = self.detail_scroll.saturating_add(10);
+                self.clamp_detail_scroll();
+                Command::None
+            }
+            KeyCode::Char('K') => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(10);
+                Command::None
+            }
             KeyCode::Char('d') => self.open_diff(),
             KeyCode::Char('c') => {
                 self.comment_editor = Some(CommentEditor::default());
@@ -2660,6 +2680,8 @@ impl App {
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => diff.scroll_down(1),
             KeyCode::Up | KeyCode::Char('k') => diff.scroll_up(1),
+            KeyCode::Char('J') => diff.scroll_down(10),
+            KeyCode::Char('K') => diff.scroll_up(10),
             KeyCode::PageDown | KeyCode::Char('f') => diff.scroll_down(page),
             KeyCode::PageUp | KeyCode::Char('b') => diff.scroll_up(page),
             KeyCode::Char('g') | KeyCode::Home => diff.scroll_to_top(),
@@ -2725,6 +2747,14 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.pipelines.select_prev();
+                Command::None
+            }
+            KeyCode::Char('J') => {
+                self.pipelines.select_next_by(10);
+                Command::None
+            }
+            KeyCode::Char('K') => {
+                self.pipelines.select_prev_by(10);
                 Command::None
             }
             KeyCode::Char('r') => self.reload_pipelines(),
@@ -2831,6 +2861,14 @@ impl App {
                 self.pipeline_steps.select_prev();
                 Command::None
             }
+            KeyCode::Char('J') => {
+                self.pipeline_steps.select_next_by(10);
+                Command::None
+            }
+            KeyCode::Char('K') => {
+                self.pipeline_steps.select_prev_by(10);
+                Command::None
+            }
             KeyCode::Char('r') => self.reload_pipeline_detail(),
             KeyCode::Char('a') => self.toggle_auto_refresh(),
             KeyCode::Char('S') => {
@@ -2918,6 +2956,8 @@ impl App {
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => log.scroll_down(1),
             KeyCode::Up | KeyCode::Char('k') => log.scroll_up(1),
+            KeyCode::Char('J') => log.scroll_down(10),
+            KeyCode::Char('K') => log.scroll_up(10),
             KeyCode::PageDown | KeyCode::Char('f') => log.scroll_down(page),
             KeyCode::PageUp | KeyCode::Char('b') => log.scroll_up(page),
             KeyCode::Char('g') | KeyCode::Home => log.scroll_to_top(),
@@ -3123,7 +3163,7 @@ impl App {
                 Command::None
             }
             KeyCode::Esc => {
-                self.screen = Screen::Repositories;
+                self.screen = self.browse_return;
                 self.status = Status::Idle;
                 Command::None
             }
@@ -3133,6 +3173,14 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.branches.select_prev();
+                Command::None
+            }
+            KeyCode::Char('J') => {
+                self.branches.select_next_by(10);
+                Command::None
+            }
+            KeyCode::Char('K') => {
+                self.branches.select_prev_by(10);
                 Command::None
             }
             KeyCode::Char('r') => self.reload_branches(),
@@ -3203,6 +3251,14 @@ impl App {
                 self.commits.select_prev();
                 Command::None
             }
+            KeyCode::Char('J') => {
+                self.commits.select_next_by(10);
+                Command::None
+            }
+            KeyCode::Char('K') => {
+                self.commits.select_prev_by(10);
+                Command::None
+            }
             KeyCode::Char('r') => self.reload_commits(),
             KeyCode::Enter => self.open_commit_detail(),
             _ => Command::None,
@@ -3262,6 +3318,14 @@ impl App {
             }
             KeyCode::PageUp => {
                 self.commit_scroll = self.commit_scroll.saturating_sub(5);
+                Command::None
+            }
+            KeyCode::Char('J') => {
+                self.commit_scroll = self.commit_scroll.saturating_add(10);
+                Command::None
+            }
+            KeyCode::Char('K') => {
+                self.commit_scroll = self.commit_scroll.saturating_sub(10);
                 Command::None
             }
             KeyCode::Char('d') => self.open_commit_diff(),
@@ -3361,6 +3425,18 @@ impl App {
                 }
                 Command::None
             }
+            KeyCode::Char('J') => {
+                if let Some(source) = self.source.as_mut() {
+                    source.entries.select_next_by(10);
+                }
+                Command::None
+            }
+            KeyCode::Char('K') => {
+                if let Some(source) = self.source.as_mut() {
+                    source.entries.select_prev_by(10);
+                }
+                Command::None
+            }
             KeyCode::Char('r') => self.reload_source(),
             KeyCode::Enter => self.source_enter(),
             _ => Command::None,
@@ -3385,7 +3461,7 @@ impl App {
         }
     }
 
-    /// 親ディレクトリへ戻る（ルートなら Repositories へ）。
+    /// 親ディレクトリへ戻る（ルートなら「ブラウズの戻り先」画面へ）。
     fn source_up(&mut self) -> Command {
         let parent = self.source.as_ref().and_then(|source| {
             parent_dir(&source.path).map(|parent| (source.reference.clone(), parent))
@@ -3394,7 +3470,7 @@ impl App {
             Some((reference, path)) => self.open_source(reference, path),
             None => {
                 self.source = None;
-                self.screen = Screen::Repositories;
+                self.screen = self.browse_return;
                 self.status = Status::Idle;
                 Command::None
             }
@@ -3444,6 +3520,8 @@ impl App {
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => view.scroll_down(1),
             KeyCode::Up | KeyCode::Char('k') => view.scroll_up(1),
+            KeyCode::Char('J') => view.scroll_down(10),
+            KeyCode::Char('K') => view.scroll_up(10),
             KeyCode::PageDown | KeyCode::Char('f') => view.scroll_down(page),
             KeyCode::PageUp | KeyCode::Char('b') => view.scroll_up(page),
             KeyCode::Char('g') | KeyCode::Home => view.scroll_to_top(),
@@ -3520,14 +3598,14 @@ impl App {
     /// 掲載フィルタ（マージで OPEN→MERGED 等）を厳密に差分更新するより、対象 repo の
     /// キャッシュをまとめて削除して次回表示を必ず再取得（キャッシュミス）させる方が単純で
     /// 確実なため、この方式を採る。
-    /// 現在の repo のキャッシュを、フィルタ・ページ番号を問わずすべて無効化する
+    /// 現在の repo のキャッシュを、フィルタ・ソート・ページ番号を問わずすべて無効化する
     /// （承認/変更要求/コメント投稿/マージ後、一覧のバッジ・掲載フィルタが変わり得るため）。
     fn invalidate_pull_requests_cache_for_current_repo(&mut self) {
         let Some(repo) = self.repo_slug() else {
             return;
         };
         self.pull_requests_cache
-            .retain(|(cached_repo, _filter, _page)| cached_repo != &repo);
+            .retain(|(cached_repo, _filter, _sort, _page)| cached_repo != &repo);
     }
 
     /// 自分が現在この PR を承認しているか（participant を自分と照合）。
@@ -3650,8 +3728,8 @@ impl App {
     }
 
     /// ジャンプパレットの候補を、保持済みデータ（ワークスペース/リポジトリ/直近開いた PR）と
-    /// 画面ジャンプから組み立てる。ワークスペース/リポジトリは使用頻度（`config.usage`）降順、
-    /// PR は開いた順（新しい順）で並べる。
+    /// 画面ジャンプから組み立てる。ワークスペース/リポジトリは現在保持している順（画面の
+    /// 一覧と同じ順序）、PR は開いた順（新しい順）で並べる。
     fn build_jump_entries(&self) -> Vec<JumpEntry> {
         let mut entries = Vec::new();
 
@@ -3675,11 +3753,7 @@ impl App {
             });
         }
 
-        let mut workspaces = self.workspaces.items.clone();
-        workspaces.sort_by(|a, b| {
-            usage_of(&self.config.usage, &b.slug).cmp(&usage_of(&self.config.usage, &a.slug))
-        });
-        for workspace in workspaces {
+        for workspace in self.workspaces.items.iter().cloned() {
             entries.push(JumpEntry {
                 label: format!("WS: {} ({})", workspace.display_name(), workspace.slug),
                 search_key: format!("{} {}", workspace.display_name(), workspace.slug),
@@ -3687,12 +3761,7 @@ impl App {
             });
         }
 
-        let mut repos = self.repositories.items.clone();
-        repos.sort_by(|a, b| {
-            usage_of(&self.config.usage, &b.full_name)
-                .cmp(&usage_of(&self.config.usage, &a.full_name))
-        });
-        for repo in repos {
+        for repo in self.repositories.items.iter().cloned() {
             entries.push(JumpEntry {
                 label: format!("Repo: {}", repo.full_name),
                 search_key: format!("{} {}", repo.full_name, repo.name),
@@ -3828,22 +3897,6 @@ fn sort_src_entries(entries: &mut [SrcEntry]) {
 /// hash 文字列の短縮形（先頭 8 文字）。
 fn short_hash_str(hash: &str) -> String {
     hash.chars().take(8).collect()
-}
-
-/// `config.usage` からキーの使用回数を引く（未登録なら 0）。
-fn usage_of(usage: &HashMap<String, u32>, key: &str) -> u32 {
-    usage.get(key).copied().unwrap_or(0)
-}
-
-/// ISO8601 の `updated_on` 文字列同士を降順比較する（`None` は常に末尾）。
-/// ISO8601 は辞書式順序がそのまま時系列順になるため、文字列比較のみで求められる。
-fn cmp_updated_on_desc(a: Option<&str>, b: Option<&str>) -> Ordering {
-    match (a, b) {
-        (Some(x), Some(y)) => y.cmp(x),
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => Ordering::Equal,
-    }
 }
 
 #[cfg(test)]
@@ -4110,6 +4163,7 @@ mod tests {
         let mut app = app();
         app.selected_workspace = Some("current".to_string());
         app.update(Msg::RepositoriesLoaded {
+            sort: ListSort::RecentlyUpdated,
             workspace: "stale".to_string(),
             repos: vec![make_repo("x/y", None)],
             page_info: single_page(),
@@ -4123,6 +4177,7 @@ mod tests {
         app.selected_repo = None;
         app.screen = Screen::Repositories;
         app.update(Msg::RepositoriesLoaded {
+            sort: ListSort::RecentlyUpdated,
             workspace: "acme".to_string(),
             repos: vec![make_repo("acme/widget", None)],
             page_info: single_page(),
@@ -4151,6 +4206,7 @@ mod tests {
         app.screen = Screen::PullRequests;
         app.pr_state_filter = PrStateFilter::Open;
         app.update(Msg::PullRequestsLoaded {
+            sort: ListSort::RecentlyUpdated,
             repo: "widget".to_string(),
             filter: PrStateFilter::Open,
             prs: vec![make_pr(1, "OPEN"), make_pr(2, "OPEN")],
@@ -4165,6 +4221,7 @@ mod tests {
         let mut app = review_app();
         app.pr_state_filter = PrStateFilter::Open;
         app.update(Msg::PullRequestsLoaded {
+            sort: ListSort::RecentlyUpdated,
             repo: "widget".to_string(),
             filter: PrStateFilter::Merged,
             prs: vec![make_pr(1, "MERGED")],
@@ -5006,6 +5063,103 @@ diff --git a/two.txt b/two.txt\n\
         }
     }
 
+    // ---- ブラウズの戻り先（B: Branches/Source が「入って来た画面」へ戻る） ----
+
+    #[test]
+    fn branches_esc_returns_to_repositories_when_opened_from_repositories() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        app.repositories
+            .set_items(vec![make_repo("acme/widget", Some("main"))]);
+        app.update(Msg::Key(key(KeyCode::Char('b'))));
+        assert_eq!(app.screen, Screen::Branches);
+
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        assert_eq!(app.screen, Screen::Repositories);
+    }
+
+    #[test]
+    fn branches_esc_returns_to_pull_requests_when_opened_from_pull_requests() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.update(Msg::Key(key(KeyCode::Char('b'))));
+        assert_eq!(app.screen, Screen::Branches);
+
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        assert_eq!(app.screen, Screen::PullRequests);
+    }
+
+    #[test]
+    fn source_root_esc_returns_to_repositories_when_opened_from_repositories() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        app.repositories
+            .set_items(vec![make_repo("acme/widget", Some("main"))]);
+        app.update(Msg::Key(key(KeyCode::Char('s'))));
+        assert_eq!(app.screen, Screen::Source);
+
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        assert_eq!(app.screen, Screen::Repositories);
+        assert!(app.source.is_none());
+    }
+
+    #[test]
+    fn source_root_esc_returns_to_pull_requests_when_opened_from_pull_requests() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.repo_main_branch = Some("trunk".to_string());
+        app.update(Msg::Key(key(KeyCode::Char('s'))));
+        assert_eq!(app.screen, Screen::Source);
+
+        // ルートでの Backspace も Esc と同じ経路（`source_up`）を通る。
+        app.update(Msg::Key(key(KeyCode::Backspace)));
+        assert_eq!(app.screen, Screen::PullRequests);
+    }
+
+    #[test]
+    fn source_opened_from_branches_keeps_original_browse_origin() {
+        // Branches の `s` は「ブラウズの戻り先」を更新しない（最初に入って来た画面のままにする）。
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.update(Msg::Key(key(KeyCode::Char('b'))));
+        assert_eq!(app.screen, Screen::Branches);
+        app.branches.set_items(vec![make_branch("dev", "aaaa1111")]);
+
+        app.update(Msg::Key(key(KeyCode::Char('s'))));
+        assert_eq!(app.screen, Screen::Source);
+
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        // Branches ではなく、最初にブラウズへ入った PullRequests へ戻る。
+        assert_eq!(app.screen, Screen::PullRequests);
+    }
+
+    #[test]
+    fn branches_to_commits_to_commit_detail_esc_steps_one_level_at_a_time() {
+        // Branches→Commits→CommitDetail の途中段は「戻り先」を使わず、常に 1 段ずつ戻る。
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.update(Msg::Key(key(KeyCode::Char('b'))));
+        assert_eq!(app.screen, Screen::Branches);
+        app.branches.set_items(vec![make_branch("dev", "aaaa1111")]);
+
+        app.update(Msg::Key(key(KeyCode::Enter)));
+        assert_eq!(app.screen, Screen::Commits);
+        app.commits.set_items(vec![make_commit("bbbb2222", "msg")]);
+
+        app.update(Msg::Key(key(KeyCode::Enter)));
+        assert_eq!(app.screen, Screen::CommitDetail);
+
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        assert_eq!(app.screen, Screen::Commits);
+
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        assert_eq!(app.screen, Screen::Branches);
+
+        // ここでようやく「ブラウズの戻り先」（PullRequests）が使われる。
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        assert_eq!(app.screen, Screen::PullRequests);
+    }
+
     #[test]
     fn branches_loaded_sets_items_for_matching_repo() {
         let mut app = review_app();
@@ -5430,6 +5584,108 @@ diff --git a/two.txt b/two.txt\n\
         assert_eq!(list.selected(), Some(&20));
     }
 
+    // ---- Shift+J/K（10 件/10 行移動、#D） ----
+
+    #[test]
+    fn select_list_select_next_by_moves_ten_and_clamps_at_end() {
+        let mut list: SelectList<i32> = SelectList::default();
+        list.set_items((0..25).collect());
+        list.select_next_by(10);
+        assert_eq!(list.state.selected(), Some(10));
+        list.select_next_by(10);
+        assert_eq!(list.state.selected(), Some(20));
+        // 末尾（インデックス 24）でクランプする。
+        list.select_next_by(10);
+        assert_eq!(list.state.selected(), Some(24));
+    }
+
+    #[test]
+    fn select_list_select_prev_by_moves_ten_and_clamps_at_start() {
+        let mut list: SelectList<i32> = SelectList::default();
+        list.set_items((0..25).collect());
+        list.state.select(Some(15));
+        list.select_prev_by(10);
+        assert_eq!(list.state.selected(), Some(5));
+        // 先頭でクランプする（負にはならない）。
+        list.select_prev_by(10);
+        assert_eq!(list.state.selected(), Some(0));
+    }
+
+    #[test]
+    fn select_list_select_next_by_respects_filter_matches() {
+        let mut list: SelectList<&str> = SelectList::default();
+        list.set_items(vec!["a1", "b1", "a2", "b2", "a3"]);
+        list.set_filter("a".to_string(), |s: &&str| s.to_string());
+        assert_eq!(list.matches, vec![0, 2, 4]);
+        list.select_next_by(10);
+        // フィルタ後は 3 件しかないため末尾（"a3"）でクランプする。
+        assert_eq!(list.selected(), Some(&"a3"));
+    }
+
+    #[test]
+    fn select_list_select_next_prev_by_are_noop_on_empty_list() {
+        let mut list: SelectList<i32> = SelectList::default();
+        list.select_next_by(10);
+        assert_eq!(list.state.selected(), None);
+        list.select_prev_by(10);
+        assert_eq!(list.state.selected(), None);
+    }
+
+    #[test]
+    fn repositories_shift_j_k_move_by_ten_and_clamp() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        let repos: Vec<Repository> = (0..25)
+            .map(|i| make_repo(&format!("acme/repo{i}"), None))
+            .collect();
+        app.repositories.set_items(repos);
+
+        app.update(Msg::Key(key(KeyCode::Char('J'))));
+        assert_eq!(app.repositories.state.selected(), Some(10));
+        app.update(Msg::Key(key(KeyCode::Char('K'))));
+        assert_eq!(app.repositories.state.selected(), Some(0));
+    }
+
+    #[test]
+    fn pull_request_detail_shift_j_moves_ten_and_clamps_to_body_end() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequestDetail;
+        // 本文なし PR: ヘッダ 4 行 + 本文プレースホルダ 1 行 = 5 行。viewport=1 なら上限は 4。
+        app.detail_viewport = 1;
+        app.current_pr = Some(make_pr(1, "OPEN"));
+        app.detail_scroll = 0;
+
+        app.update(Msg::Key(key(KeyCode::Char('J'))));
+        assert_eq!(app.detail_scroll, 4);
+        app.update(Msg::Key(key(KeyCode::Char('K'))));
+        assert_eq!(app.detail_scroll, 0);
+    }
+
+    #[test]
+    fn diff_shift_j_k_scroll_body_by_ten() {
+        let mut app = review_app();
+        app.screen = Screen::Diff;
+        let lines = (0..50)
+            .map(|i| format!("+line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = format!("diff --git a/x b/x\n@@ -1,1 +1,50 @@\n{lines}\n");
+        app.diff = Some(DiffState {
+            parsed: parse_diff(&text),
+            scroll: 0,
+            viewport: 5,
+            title: "#1".to_string(),
+            rendered_lines: None,
+            file_index: 0,
+            focus: DiffFocus::Body,
+        });
+
+        app.update(Msg::Key(key(KeyCode::Char('J'))));
+        assert_eq!(app.diff.as_ref().expect("diff").scroll, 10);
+        app.update(Msg::Key(key(KeyCode::Char('K'))));
+        assert_eq!(app.diff.as_ref().expect("diff").scroll, 0);
+    }
+
     // ---- インクリメンタル検索（App 統合・#1） ----
 
     #[test]
@@ -5498,91 +5754,290 @@ diff --git a/two.txt b/two.txt\n\
         assert_eq!(app.workspaces.filter, "a");
     }
 
-    // ---- ソート（#1） ----
+    // ---- ソート（サーバサイド、#1） ----
 
     #[test]
-    fn cycle_repositories_sort_reorders_and_returns_to_fetched() {
+    fn repositories_and_pull_requests_sort_default_to_recently_updated() {
+        let app = review_app();
+        assert_eq!(app.repositories_sort, ListSort::RecentlyUpdated);
+        assert_eq!(app.pull_requests_sort, ListSort::RecentlyUpdated);
+    }
+
+    #[test]
+    fn cycle_repositories_sort_cycles_through_all_four_and_reloads_page_one() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        // 3 ページ目にいても、ソート変更は常に 1 ページ目から取得し直す。
+        app.repositories_page_info = page_info(3, Some(5), true);
+
+        let expected = [
+            ListSort::LeastRecentlyUpdated,
+            ListSort::Newest,
+            ListSort::Oldest,
+            ListSort::RecentlyUpdated,
+        ];
+        for sort in expected {
+            let cmd = app.update(Msg::Key(key(KeyCode::Char('S'))));
+            assert_eq!(app.repositories_sort, sort);
+            match cmd {
+                Command::LoadRepositories {
+                    sort: cmd_sort,
+                    page,
+                    ..
+                } => {
+                    assert_eq!(cmd_sort, sort);
+                    assert_eq!(page, 1);
+                }
+                other => panic!("expected LoadRepositories, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn cycle_pull_requests_sort_reloads_page_one_preserving_filter() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.pr_state_filter = PrStateFilter::Merged;
+        app.pull_requests_page_info = page_info(4, Some(5), true);
+
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('S'))));
+        assert_eq!(app.pull_requests_sort, ListSort::LeastRecentlyUpdated);
+        match cmd {
+            Command::LoadPullRequests {
+                sort, page, filter, ..
+            } => {
+                assert_eq!(sort, ListSort::LeastRecentlyUpdated);
+                assert_eq!(page, 1);
+                assert_eq!(filter, PrStateFilter::Merged);
+            }
+            other => panic!("expected LoadPullRequests, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repositories_cache_is_keyed_by_sort_and_does_not_leak_across_sorts() {
         let mut app = review_app();
         app.screen = Screen::Repositories;
         app.update(Msg::RepositoriesLoaded {
             workspace: "acme".to_string(),
-            repos: vec![make_repo("acme/zeta", None), make_repo("acme/alpha", None)],
+            sort: ListSort::RecentlyUpdated,
+            repos: vec![make_repo("acme/zeta", None)],
             page_info: single_page(),
         });
-        assert_eq!(app.repositories_sort, SortMode::Fetched);
         assert_eq!(app.repositories.items[0].name, "zeta");
 
-        app.update(Msg::Key(key(KeyCode::Char('S'))));
-        assert_eq!(app.repositories_sort, SortMode::NameAsc);
+        // ソート変更: 別ソートの 1 ページ目はキャッシュ未命中 → Loading（一覧クリア）。
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('S'))));
+        assert!(app.repositories.items.is_empty());
+        assert!(matches!(app.status, Status::Loading(_)));
+        assert!(matches!(cmd, Command::LoadRepositories { .. }));
+
+        app.update(Msg::RepositoriesLoaded {
+            workspace: "acme".to_string(),
+            sort: ListSort::LeastRecentlyUpdated,
+            repos: vec![make_repo("acme/alpha", None)],
+            page_info: single_page(),
+        });
         assert_eq!(app.repositories.items[0].name, "alpha");
 
-        app.update(Msg::Key(key(KeyCode::Char('S')))); // UpdatedDesc
-        app.update(Msg::Key(key(KeyCode::Char('S')))); // UsageDesc
-        app.update(Msg::Key(key(KeyCode::Char('S')))); // 取得順(Fetched)に戻る
-        assert_eq!(app.repositories_sort, SortMode::Fetched);
+        // 元のソートへ戻す（4 回巡回して一周）とキャッシュ命中で即時表示される。
+        for _ in 0..3 {
+            app.update(Msg::Key(key(KeyCode::Char('S'))));
+        }
+        assert_eq!(app.repositories_sort, ListSort::RecentlyUpdated);
         assert_eq!(app.repositories.items[0].name, "zeta");
+        assert_eq!(app.status, Status::Idle);
     }
 
+    // ---- 選択位置の保持（E: j/k 移動中に stale-while-revalidate で先頭へ戻るバグの修正） ----
+
     #[test]
-    fn cycle_pull_requests_sort_orders_by_title() {
+    fn workspaces_loaded_same_context_revalidation_preserves_selection_by_identity() {
         let mut app = review_app();
-        app.screen = Screen::PullRequests;
-        app.update(Msg::PullRequestsLoaded {
-            repo: "widget".to_string(),
-            filter: PrStateFilter::Open,
-            prs: vec![make_pr(9, "OPEN"), make_pr(2, "OPEN")],
+        app.screen = Screen::Workspaces;
+        app.update(Msg::WorkspacesLoaded {
+            workspaces: vec![
+                Workspace {
+                    slug: "alpha".to_string(),
+                    name: None,
+                    uuid: None,
+                },
+                Workspace {
+                    slug: "beta".to_string(),
+                    name: None,
+                    uuid: None,
+                },
+            ],
             page_info: single_page(),
         });
-        // タイトルは "PR {id}" なので文字列としては "PR 2" < "PR 9"。
-        app.update(Msg::Key(key(KeyCode::Char('S'))));
-        assert_eq!(app.pull_requests_sort, SortMode::NameAsc);
-        assert_eq!(app.pull_requests.items[0].id, 2);
+        // ユーザーが 2 番目（"beta"）を選択した状態で j/k 移動中とみなす。
+        app.workspaces.state.select(Some(1));
+
+        // 裏側の再検証（同一ページ）が同じ内容で届く。
+        app.update(Msg::WorkspacesLoaded {
+            workspaces: vec![
+                Workspace {
+                    slug: "alpha".to_string(),
+                    name: None,
+                    uuid: None,
+                },
+                Workspace {
+                    slug: "beta".to_string(),
+                    name: None,
+                    uuid: None,
+                },
+            ],
+            page_info: single_page(),
+        });
+
+        // 選択位置が先頭へリセットされず、"beta" のまま維持される。
+        assert_eq!(
+            app.workspaces.selected().map(|w| w.slug.as_str()),
+            Some("beta")
+        );
     }
 
     #[test]
-    fn select_repo_increments_usage_and_usage_desc_sort_reflects_it() {
+    fn repositories_loaded_same_context_revalidation_preserves_selection_by_identity() {
         let mut app = review_app();
         app.screen = Screen::Repositories;
         app.update(Msg::RepositoriesLoaded {
             workspace: "acme".to_string(),
-            repos: vec![make_repo("acme/foo", None), make_repo("acme/bar", None)],
+            sort: ListSort::RecentlyUpdated,
+            repos: vec![
+                make_repo("acme/alpha", None),
+                make_repo("acme/beta", None),
+                make_repo("acme/gamma", None),
+            ],
+            page_info: single_page(),
+        });
+        // ユーザーが 2 番目（"beta"）を選択した状態で j/k 移動中とみなす。
+        app.repositories.state.select(Some(1));
+
+        // 裏側の再検証（同一 workspace/sort/page）が同じ内容で届く。
+        app.update(Msg::RepositoriesLoaded {
+            workspace: "acme".to_string(),
+            sort: ListSort::RecentlyUpdated,
+            repos: vec![
+                make_repo("acme/alpha", None),
+                make_repo("acme/beta", None),
+                make_repo("acme/gamma", None),
+            ],
             page_info: single_page(),
         });
 
-        // "bar" を 2 回選択して使用回数を稼ぐ。
-        app.repositories.state.select(Some(1));
-        app.update(Msg::Key(key(KeyCode::Enter)));
-        app.screen = Screen::Repositories;
-        app.repositories.state.select(Some(1));
-        app.update(Msg::Key(key(KeyCode::Enter)));
-
-        assert_eq!(app.config.usage.get("acme/bar").copied(), Some(2));
-
-        app.screen = Screen::Repositories;
-        app.update(Msg::Key(key(KeyCode::Char('S')))); // NameAsc
-        app.update(Msg::Key(key(KeyCode::Char('S')))); // UpdatedDesc
-        app.update(Msg::Key(key(KeyCode::Char('S')))); // UsageDesc
-        assert_eq!(app.repositories_sort, SortMode::UsageDesc);
-        assert_eq!(app.repositories.items[0].full_name, "acme/bar");
+        // 選択位置が先頭へリセットされず、"beta" のまま維持される。
+        assert_eq!(
+            app.repositories.selected().map(|r| r.full_name.as_str()),
+            Some("acme/beta")
+        );
     }
 
     #[test]
-    fn pull_requests_usage_desc_sort_is_a_passthrough_of_fetched_order() {
-        // PR には使用頻度の概念が無いため、UsageDesc は取得順のパススルーになる（設計判断）。
+    fn repositories_loaded_same_context_revalidation_follows_identity_even_if_order_changes() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        app.update(Msg::RepositoriesLoaded {
+            workspace: "acme".to_string(),
+            sort: ListSort::RecentlyUpdated,
+            repos: vec![make_repo("acme/alpha", None), make_repo("acme/beta", None)],
+            page_info: single_page(),
+        });
+        app.repositories.state.select(Some(1)); // "beta" を選択中。
+
+        // 再検証結果で並び順が入れ替わっても（サーバソート下で他者の更新により順序が変動する
+        // ことを想定）、識別子（full_name）で "beta" を追従する。
+        app.update(Msg::RepositoriesLoaded {
+            workspace: "acme".to_string(),
+            sort: ListSort::RecentlyUpdated,
+            repos: vec![make_repo("acme/beta", None), make_repo("acme/alpha", None)],
+            page_info: single_page(),
+        });
+
+        assert_eq!(
+            app.repositories.selected().map(|r| r.full_name.as_str()),
+            Some("acme/beta")
+        );
+        assert_eq!(app.repositories.state.selected(), Some(0)); // "beta" は新しい並びで先頭。
+    }
+
+    #[test]
+    fn repositories_context_change_resets_selection_to_top() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        app.update(Msg::RepositoriesLoaded {
+            workspace: "acme".to_string(),
+            sort: ListSort::RecentlyUpdated,
+            repos: vec![make_repo("acme/alpha", None), make_repo("acme/beta", None)],
+            page_info: page_info(1, Some(2), true),
+        });
+        app.repositories.state.select(Some(1));
+
+        // 別ページへ移動（新しい文脈）: 先頭へリセットされる。
+        app.update(Msg::Key(key(KeyCode::Char(']'))));
+        app.update(Msg::RepositoriesLoaded {
+            workspace: "acme".to_string(),
+            sort: ListSort::RecentlyUpdated,
+            repos: vec![make_repo("acme/gamma", None)],
+            page_info: page_info(2, Some(2), false),
+        });
+
+        assert_eq!(app.repositories.state.selected(), Some(0));
+    }
+
+    #[test]
+    fn pull_requests_loaded_same_context_revalidation_preserves_selection_by_identity() {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
+        app.pr_state_filter = PrStateFilter::Open;
         app.update(Msg::PullRequestsLoaded {
             repo: "widget".to_string(),
             filter: PrStateFilter::Open,
-            prs: vec![make_pr(9, "OPEN"), make_pr(2, "OPEN")],
+            sort: ListSort::RecentlyUpdated,
+            prs: vec![make_pr(1, "OPEN"), make_pr(2, "OPEN"), make_pr(3, "OPEN")],
             page_info: single_page(),
         });
-        app.update(Msg::Key(key(KeyCode::Char('S')))); // NameAsc
-        app.update(Msg::Key(key(KeyCode::Char('S')))); // UpdatedDesc
-        app.update(Msg::Key(key(KeyCode::Char('S')))); // UsageDesc
-        assert_eq!(app.pull_requests_sort, SortMode::UsageDesc);
-        assert_eq!(app.pull_requests.items[0].id, 9);
-        assert_eq!(app.pull_requests.items[1].id, 2);
+        // ユーザーが PR #2 を選択した状態で j/k 移動中とみなす。
+        app.pull_requests.state.select(Some(1));
+
+        // 裏側の再検証（同一 repo/filter/sort/page）が同じ内容で届く。
+        app.update(Msg::PullRequestsLoaded {
+            repo: "widget".to_string(),
+            filter: PrStateFilter::Open,
+            sort: ListSort::RecentlyUpdated,
+            prs: vec![make_pr(1, "OPEN"), make_pr(2, "OPEN"), make_pr(3, "OPEN")],
+            page_info: single_page(),
+        });
+
+        // 選択位置が先頭へリセットされず、PR #2 のまま維持される。
+        assert_eq!(app.pull_requests.selected().map(|pr| pr.id), Some(2));
+    }
+
+    #[test]
+    fn pull_requests_context_change_resets_selection_to_top() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.pr_state_filter = PrStateFilter::Open;
+        app.update(Msg::PullRequestsLoaded {
+            repo: "widget".to_string(),
+            filter: PrStateFilter::Open,
+            sort: ListSort::RecentlyUpdated,
+            prs: vec![make_pr(1, "OPEN"), make_pr(2, "OPEN")],
+            page_info: single_page(),
+        });
+        app.pull_requests.state.select(Some(1));
+
+        // フィルタ切替（新しい文脈）: 先頭へリセットされる。
+        app.update(Msg::Key(key(KeyCode::Char('m'))));
+        app.update(Msg::PullRequestsLoaded {
+            repo: "widget".to_string(),
+            filter: PrStateFilter::Merged,
+            sort: ListSort::RecentlyUpdated,
+            prs: vec![make_pr(9, "MERGED")],
+            page_info: single_page(),
+        });
+
+        assert_eq!(app.pull_requests.state.selected(), Some(0));
     }
 
     // ---- ジャンプパレット（#2） ----
@@ -5891,6 +6346,7 @@ diff --git a/two.txt b/two.txt\n\
         assert!(matches!(cmd, Command::LoadRepositories { .. }));
 
         app.update(Msg::RepositoriesLoaded {
+            sort: ListSort::RecentlyUpdated,
             workspace: "acme".to_string(),
             repos: vec![make_repo("acme/widget", None)],
             page_info: single_page(),
@@ -5909,7 +6365,7 @@ diff --git a/two.txt b/two.txt\n\
     }
 
     #[test]
-    fn revisiting_workspace_from_cache_resets_sort_and_fetch_order_like_fresh_load() {
+    fn revisiting_workspace_keeps_current_sort_setting_and_shows_cached_data_for_it() {
         let mut app = review_app();
         app.screen = Screen::Workspaces;
         app.workspaces.set_items(vec![Workspace {
@@ -5920,23 +6376,31 @@ diff --git a/two.txt b/two.txt\n\
         app.update(Msg::Key(key(KeyCode::Enter)));
         app.update(Msg::RepositoriesLoaded {
             workspace: "acme".to_string(),
-            repos: vec![make_repo("acme/zeta", None), make_repo("acme/alpha", None)],
+            sort: ListSort::RecentlyUpdated,
+            repos: vec![make_repo("acme/zeta", None)],
             page_info: single_page(),
         });
 
+        // ソートを変更（サーバソートなので新しい問い合わせが必要＝キャッシュ未命中）。
         app.update(Msg::Key(key(KeyCode::Char('S'))));
-        assert_eq!(app.repositories_sort, SortMode::NameAsc);
+        assert_eq!(app.repositories_sort, ListSort::LeastRecentlyUpdated);
+        app.update(Msg::RepositoriesLoaded {
+            workspace: "acme".to_string(),
+            sort: ListSort::LeastRecentlyUpdated,
+            repos: vec![make_repo("acme/alpha", None)],
+            page_info: single_page(),
+        });
         assert_eq!(app.repositories.items[0].name, "alpha");
 
-        // 別画面 → 再訪（キャッシュ命中）。
+        // 別画面 → 再訪: サーバソートは「取得順」のようなクライアント側概念ではなく明示的な
+        // 選択なので、再訪してもリセットされず維持される。維持されたソートのキャッシュに
+        // 命中して即座に表示される。
         app.screen = Screen::Workspaces;
         app.update(Msg::Key(key(KeyCode::Enter)));
 
-        // キャッシュ復元でも fetch_order スナップショットが張り直され、ソートモードは
-        // 新規取得時と同じく Fetched にリセットされる。
-        assert_eq!(app.repositories_sort, SortMode::Fetched);
-        assert_eq!(app.repositories.items[0].name, "zeta");
-        assert_eq!(app.repositories_fetch_order.len(), 2);
+        assert_eq!(app.repositories_sort, ListSort::LeastRecentlyUpdated);
+        assert_eq!(app.repositories.items[0].name, "alpha");
+        assert_eq!(app.status, Status::Idle);
     }
 
     #[test]
@@ -5953,6 +6417,7 @@ diff --git a/two.txt b/two.txt\n\
         assert!(matches!(cmd, Command::LoadPullRequests { .. }));
 
         app.update(Msg::PullRequestsLoaded {
+            sort: ListSort::RecentlyUpdated,
             repo: "widget".to_string(),
             filter: PrStateFilter::Open,
             prs: vec![make_pr(1, "OPEN")],
@@ -5976,6 +6441,7 @@ diff --git a/two.txt b/two.txt\n\
         app.screen = Screen::PullRequests;
         app.pr_state_filter = PrStateFilter::Open;
         app.update(Msg::PullRequestsLoaded {
+            sort: ListSort::RecentlyUpdated,
             repo: "widget".to_string(),
             filter: PrStateFilter::Open,
             prs: vec![make_pr(1, "OPEN")],
@@ -5995,26 +6461,34 @@ diff --git a/two.txt b/two.txt\n\
     }
 
     #[test]
-    fn pull_requests_cache_restore_resets_sort_and_fetch_order_like_fresh_load() {
+    fn pull_requests_cache_restore_keeps_current_sort_setting() {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
         app.update(Msg::PullRequestsLoaded {
             repo: "widget".to_string(),
             filter: PrStateFilter::Open,
-            prs: vec![make_pr(9, "OPEN"), make_pr(2, "OPEN")],
+            sort: ListSort::RecentlyUpdated,
+            prs: vec![make_pr(9, "OPEN")],
             page_info: single_page(),
         });
-        app.update(Msg::Key(key(KeyCode::Char('S')))); // NameAsc
-        assert_eq!(app.pull_requests_sort, SortMode::NameAsc);
+        app.update(Msg::Key(key(KeyCode::Char('S')))); // LeastRecentlyUpdated へ。
+        assert_eq!(app.pull_requests_sort, ListSort::LeastRecentlyUpdated);
+        app.update(Msg::PullRequestsLoaded {
+            repo: "widget".to_string(),
+            filter: PrStateFilter::Open,
+            sort: ListSort::LeastRecentlyUpdated,
+            prs: vec![make_pr(2, "OPEN")],
+            page_info: single_page(),
+        });
         assert_eq!(app.pull_requests.items[0].id, 2);
 
-        // 別画面 → 再訪（手動リロードでもキャッシュ命中の経路を通る）。
+        // 別画面 → 再訪（手動リロードでもキャッシュ命中の経路を通る）。ソート設定は維持される。
         app.screen = Screen::Repositories;
         app.screen = Screen::PullRequests;
         app.update(Msg::Key(key(KeyCode::Char('r'))));
 
-        assert_eq!(app.pull_requests_sort, SortMode::Fetched);
-        assert_eq!(app.pull_requests.items[0].id, 9);
+        assert_eq!(app.pull_requests_sort, ListSort::LeastRecentlyUpdated);
+        assert_eq!(app.pull_requests.items[0].id, 2);
     }
 
     #[test]
@@ -6068,6 +6542,7 @@ diff --git a/two.txt b/two.txt\n\
         app.screen = Screen::PullRequests;
         app.pr_state_filter = PrStateFilter::Open;
         app.update(Msg::PullRequestsLoaded {
+            sort: ListSort::RecentlyUpdated,
             repo: "widget".to_string(),
             filter: PrStateFilter::Open,
             prs: vec![make_pr(1, "OPEN")],
@@ -6100,6 +6575,7 @@ diff --git a/two.txt b/two.txt\n\
         app.screen = Screen::PullRequests;
         app.pr_state_filter = PrStateFilter::Open;
         app.update(Msg::PullRequestsLoaded {
+            sort: ListSort::RecentlyUpdated,
             repo: "widget".to_string(),
             filter: PrStateFilter::Open,
             prs: vec![make_pr(3, "OPEN")],
@@ -6123,6 +6599,7 @@ diff --git a/two.txt b/two.txt\n\
         app.screen = Screen::PullRequests;
         app.pr_state_filter = PrStateFilter::Open;
         app.update(Msg::PullRequestsLoaded {
+            sort: ListSort::RecentlyUpdated,
             repo: "widget".to_string(),
             filter: PrStateFilter::Open,
             prs: vec![make_pr(5, "OPEN")],
@@ -6335,6 +6812,7 @@ diff --git a/two.txt b/two.txt\n\
         app.screen = Screen::Repositories;
         app.repositories_page_info = page_info(2, None, false);
         app.update(Msg::RepositoriesLoaded {
+            sort: ListSort::RecentlyUpdated,
             workspace: "acme".to_string(),
             repos: vec![make_repo("acme/stale", None)],
             page_info: page_info(1, None, true),
@@ -6349,6 +6827,7 @@ diff --git a/two.txt b/two.txt\n\
         app.pr_state_filter = PrStateFilter::Open;
         app.pull_requests_page_info = page_info(2, None, false);
         app.update(Msg::PullRequestsLoaded {
+            sort: ListSort::RecentlyUpdated,
             repo: "widget".to_string(),
             filter: PrStateFilter::Open,
             prs: vec![make_pr(1, "OPEN")],
@@ -6362,6 +6841,7 @@ diff --git a/two.txt b/two.txt\n\
         let mut app = review_app();
         app.screen = Screen::Repositories;
         app.update(Msg::RepositoriesLoaded {
+            sort: ListSort::RecentlyUpdated,
             workspace: "acme".to_string(),
             repos: vec![make_repo("acme/foo", None)],
             page_info: page_info(1, Some(2), true),
@@ -6374,6 +6854,7 @@ diff --git a/two.txt b/two.txt\n\
         assert!(matches!(cmd, Command::LoadRepositories { .. }));
 
         app.update(Msg::RepositoriesLoaded {
+            sort: ListSort::RecentlyUpdated,
             workspace: "acme".to_string(),
             repos: vec![make_repo("acme/bar", None)],
             page_info: page_info(2, Some(2), false),
@@ -6393,6 +6874,7 @@ diff --git a/two.txt b/two.txt\n\
         app.screen = Screen::PullRequests;
         app.pr_state_filter = PrStateFilter::Open;
         app.update(Msg::PullRequestsLoaded {
+            sort: ListSort::RecentlyUpdated,
             repo: "widget".to_string(),
             filter: PrStateFilter::Open,
             prs: vec![make_pr(1, "OPEN")],
@@ -6405,6 +6887,7 @@ diff --git a/two.txt b/two.txt\n\
         assert!(matches!(cmd, Command::LoadPullRequests { .. }));
 
         app.update(Msg::PullRequestsLoaded {
+            sort: ListSort::RecentlyUpdated,
             repo: "widget".to_string(),
             filter: PrStateFilter::Open,
             prs: vec![make_pr(2, "OPEN")],
@@ -6423,6 +6906,7 @@ diff --git a/two.txt b/two.txt\n\
         let mut app = review_app();
         app.screen = Screen::Repositories;
         app.update(Msg::RepositoriesLoaded {
+            sort: ListSort::RecentlyUpdated,
             workspace: "acme".to_string(),
             repos: vec![make_repo("acme/foo", None), make_repo("acme/bar", None)],
             page_info: page_info(1, Some(2), true),
@@ -6439,25 +6923,41 @@ diff --git a/two.txt b/two.txt\n\
     }
 
     #[test]
-    fn changing_page_resets_sort_to_fetched_once_new_page_data_arrives() {
+    fn changing_page_preserves_current_sort_setting() {
         let mut app = review_app();
         app.screen = Screen::Repositories;
         app.update(Msg::RepositoriesLoaded {
             workspace: "acme".to_string(),
-            repos: vec![make_repo("acme/zeta", None), make_repo("acme/alpha", None)],
+            sort: ListSort::RecentlyUpdated,
+            repos: vec![make_repo("acme/zeta", None)],
             page_info: page_info(1, Some(2), true),
         });
-        app.update(Msg::Key(key(KeyCode::Char('S')))); // NameAsc
-        assert_eq!(app.repositories_sort, SortMode::NameAsc);
-
-        app.update(Msg::Key(key(KeyCode::Char(']')))); // 2 ページ目へ（未キャッシュ）
+        app.update(Msg::Key(key(KeyCode::Char('S')))); // LeastRecentlyUpdated へ（1 ページ目に戻る）。
+        assert_eq!(app.repositories_sort, ListSort::LeastRecentlyUpdated);
         app.update(Msg::RepositoriesLoaded {
             workspace: "acme".to_string(),
+            sort: ListSort::LeastRecentlyUpdated,
+            repos: vec![make_repo("acme/alpha", None)],
+            page_info: page_info(1, Some(2), true),
+        });
+
+        // ページ移動（`]`）はソートを変えない。次ページの取得も同じソートで発行される。
+        let cmd = app.update(Msg::Key(key(KeyCode::Char(']'))));
+        match cmd {
+            Command::LoadRepositories { sort, page, .. } => {
+                assert_eq!(sort, ListSort::LeastRecentlyUpdated);
+                assert_eq!(page, 2);
+            }
+            other => panic!("expected LoadRepositories, got {other:?}"),
+        }
+        app.update(Msg::RepositoriesLoaded {
+            workspace: "acme".to_string(),
+            sort: ListSort::LeastRecentlyUpdated,
             repos: vec![make_repo("acme/gamma", None)],
             page_info: page_info(2, Some(2), false),
         });
 
-        assert_eq!(app.repositories_sort, SortMode::Fetched);
+        assert_eq!(app.repositories_sort, ListSort::LeastRecentlyUpdated);
         assert_eq!(app.repositories_page_info.page, 2);
     }
 
