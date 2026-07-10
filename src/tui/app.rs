@@ -14,7 +14,7 @@ use crate::auth;
 use crate::config::Config;
 use crate::tui::diff::{ParsedDiff, parse as parse_diff};
 use crate::tui::logview::LogView;
-use crate::tui::onboarding::{Field, OnboardingState};
+use crate::tui::onboarding::{Field, OnboardingState, TextInput};
 
 /// 画面種別。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -652,7 +652,7 @@ impl App {
     pub fn new(config: Config, client: Option<BitbucketClient>) -> Self {
         let mut onboarding = OnboardingState::default();
         if let Some(email) = &config.email {
-            onboarding.email = email.clone();
+            onboarding.email = TextInput::from_str(email);
             onboarding.field.0 = Field::Token;
         }
         let me = Me {
@@ -1033,6 +1033,7 @@ impl App {
     }
 
     fn on_key_onboarding(&mut self, key: KeyEvent) -> Command {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => {
                 self.onboarding.error = None;
@@ -1042,17 +1043,76 @@ impl App {
                 self.onboarding.toggle_field();
                 Command::None
             }
+            KeyCode::Enter => self.submit_onboarding(),
             KeyCode::Backspace => {
                 self.onboarding.backspace();
                 Command::None
             }
-            KeyCode::Enter => self.submit_onboarding(),
+            KeyCode::Delete => {
+                self.onboarding.delete();
+                Command::None
+            }
+            // カーソル移動（矢印 / Home / End、および emacs 風 Ctrl+A/E/B/F）。
+            KeyCode::Left => {
+                self.onboarding.move_left();
+                Command::None
+            }
+            KeyCode::Right => {
+                self.onboarding.move_right();
+                Command::None
+            }
+            KeyCode::Home => {
+                self.onboarding.move_home();
+                Command::None
+            }
+            KeyCode::End => {
+                self.onboarding.move_end();
+                Command::None
+            }
+            // 行/語削除（Ctrl+U 先頭まで / Ctrl+K 末尾まで / Ctrl+W 直前の語）。
+            KeyCode::Char('u') if ctrl => {
+                self.onboarding.kill_to_start();
+                Command::None
+            }
+            KeyCode::Char('k') if ctrl => {
+                self.onboarding.kill_to_end();
+                Command::None
+            }
+            KeyCode::Char('w') if ctrl => {
+                self.onboarding.kill_word_before();
+                Command::None
+            }
+            KeyCode::Char('a') if ctrl => {
+                self.onboarding.move_home();
+                Command::None
+            }
+            KeyCode::Char('e') if ctrl => {
+                self.onboarding.move_end();
+                Command::None
+            }
+            KeyCode::Char('b') if ctrl => {
+                self.onboarding.move_left();
+                Command::None
+            }
+            KeyCode::Char('f') if ctrl => {
+                self.onboarding.move_right();
+                Command::None
+            }
+            KeyCode::Char('d') if ctrl => {
+                self.onboarding.delete();
+                Command::None
+            }
+            KeyCode::Char('h') if ctrl => {
+                self.onboarding.backspace();
+                Command::None
+            }
+            // 通常文字の入力（Ctrl/Alt 修飾は上で処理済みなので除外）。
             KeyCode::Char(ch)
                 if !key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                self.onboarding.push_char(ch);
+                self.onboarding.insert_char(ch);
                 Command::None
             }
             _ => Command::None,
@@ -1076,8 +1136,8 @@ impl App {
         self.onboarding.validating = true;
         self.onboarding.error = None;
         Command::ValidateAuth {
-            email: self.onboarding.email.trim().to_string(),
-            token: self.onboarding.token.clone(),
+            email: self.onboarding.email.value().trim().to_string(),
+            token: self.onboarding.token.value(),
         }
     }
 
@@ -2610,11 +2670,11 @@ mod tests {
         let mut app = app();
         app.update(Msg::Key(key(KeyCode::Char('a'))));
         app.update(Msg::Key(key(KeyCode::Char('@'))));
-        assert_eq!(app.onboarding.email, "a@");
+        assert_eq!(app.onboarding.email.value(), "a@");
         app.update(Msg::Key(key(KeyCode::Enter)));
         assert_eq!(app.onboarding.field.0, Field::Token);
         app.update(Msg::Key(key(KeyCode::Char('t'))));
-        assert_eq!(app.onboarding.token, "t");
+        assert_eq!(app.onboarding.token.value(), "t");
     }
 
     #[test]
@@ -2629,8 +2689,8 @@ mod tests {
     #[test]
     fn onboarding_submit_emits_validate_command() {
         let mut app = app();
-        app.onboarding.email = "user@example.com".to_string();
-        app.onboarding.token = "secret".to_string();
+        app.onboarding.email = TextInput::from_str("user@example.com");
+        app.onboarding.token = TextInput::from_str("secret");
         app.onboarding.field.0 = Field::Token;
         let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
         match cmd {
@@ -2659,12 +2719,12 @@ mod tests {
         app.update(Msg::WorkspacesLoaded(vec![
             Workspace {
                 slug: "a".to_string(),
-                name: "A".to_string(),
+                name: Some("A".to_string()),
                 uuid: None,
             },
             Workspace {
                 slug: "b".to_string(),
-                name: "B".to_string(),
+                name: None,
                 uuid: None,
             },
         ]));

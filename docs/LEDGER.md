@@ -62,6 +62,8 @@
 - 認証は HTTP Basic、**username = Atlassianアカウントのメール / password = API token(スコープ付き)**。Bitbucketユーザー名・トークン名では通らない(出典: Atlassian support "Using API tokens" / 401 KB)。
 - App Password は 2026-06-09〜07-27 ブラウンアウト、**2026-07-28 完全廃止**。新規は API token 一択。
 - ページングは `{ values, next, page, size, pagelen }` 形式。`next` URL を追跡。
+- **実 API 検証済み (2026-07-10)**: `GET /2.0/workspaces` は **`CHANGE-2770` で廃止**され、`{"type":"error","error":{"message":"...has been deprecated"}}` を返す（一覧が空になる原因はこれ）。後継は **`GET /2.0/user/workspaces`**。応答は `values[].workspace` にネスト（`workspace_base`: `slug`/`uuid`/`links` のみで **`name` を持たない**）。→ `list_workspaces()` を後継に変更し、`WorkspaceMembership{workspace}` で取り出し・`Workspace.name` を `Option` 化・表示は `display_name()`（`name` 無ければ `slug`）に修正。
+- **API token のスコープ体系 (2026-07-10)**: `id.atlassian.com` の "Create API token **with scopes**" が使うのは**粒度スコープ**（`read:user:bitbucket` / `read:workspace:bitbucket` / `read:repository:bitbucket` / `read:pullrequest:bitbucket` / `write:pullrequest:bitbucket` / `read:pipeline:bitbucket` / `write:pipeline:bitbucket`）。旧 `account`/`repository`/`pullrequest:write` 等は App password/OAuth 用で**別体系**。**write は read を含意しない**ため read/write 両方が必要。merge は `write:pullrequest:bitbucket` に含まれ `write:repository` 不要。
 - ツールチェーン: `cargo 1.96.1` / edition 2024。cargo は PATH 外。**`rustup run stable cargo <sub>` は `cargo vendor`/`build` で `rustc` を見失い失敗する**。必ず toolchain bin を PATH 前置して直接呼ぶ: `export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"` → `cargo <sub> --offline`。
 - **vendored offline**: 全依存を `cargo vendor vendor` 済み、`.cargo/config.toml`(vendored-sources)配置。`cargo build/clippy/test/run --offline` が green。`vendor/`・`.cargo/config.toml` は `.gitignore`(再生成は `cargo vendor`)。**依存は凍結: `cargo add`/`update`/`vendor` はネットワーク不可**(feature 追加が要るときは再 vendor が必要)。
 - **ネットワーク制約 → vendored で解決済み**: ビルド環境から crates.io へ到達できない。`cargo vendor vendor` で全依存を vendor 化し、`.cargo/config.toml`(vendored-sources) を配置。以降 `cargo build/clippy/test --offline` が green。`vendor/` と `.cargo/config.toml` は `.gitignore` 済み(再生成は `cargo vendor`)。
@@ -71,8 +73,8 @@
 
 ## 未検証の仮定
 
-- 必要スコープ名(`account`/`repository`/`pullrequest`/`pullrequest:write`/`pipeline`)の正確さ — 実際の 200/403 応答で確定させる。
-- `GET /2.0/workspaces` と `GET /2.0/repositories/{workspace}?role=member` のパラメータ挙動 — 実データで確認。
+- 必要スコープの**粒度スコープ名**は確定済み（上の「検証済みの事実」参照）。残るは各エンドポイントでの 200/403 実挙動の確認のみ。
+- `GET /2.0/repositories/{workspace}?role=member` のパラメータ挙動 — 実データで確認。
 - **(M1) PR/Comment/DiffStat の serde フィールド**: 仕様書の推定名で実装(`PullRequest.participants[].{approved,state,role}`、`DiffStatEntry.{status,lines_added,lines_removed,old.path,new.path}`、`Comment.{content.raw,inline.{path,from,to},deleted}` 等)。実 API 初回応答で有無/名称/値(特に `participant.state` の `changes_requested` 表記、`status` の `modified/added/removed/renamed`、PR `state` の `OPEN/MERGED/DECLINED/SUPERSEDED`)を確定し、モデルとフィルタ判定を補正する。
 - **(M1) participant の自己識別フィールド**: uuid/account_id/display_name のどれが participant.user に含まれるか未確定。承認トグルの POST/DELETE 判定に使用。
 - **(M1) merge の非同期応答(202)**: 大きな merge は 202 + タスクポーリングになり得る。現状は成功ステータス扱いで「マージしました」を表示し PR を再取得するのみ(ポーリング未実装)。実挙動を確認して要否を判断。

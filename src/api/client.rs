@@ -13,7 +13,7 @@ use serde::de::DeserializeOwned;
 use crate::api::error::{ApiError, classify_error};
 use crate::api::models::{
     Branch, Comment, Commit, DiffStatEntry, MergeParams, Paginated, Pipeline, PipelineStep,
-    PipelineTarget, PullRequest, Repository, SrcEntry, User, Workspace,
+    PipelineTarget, PullRequest, Repository, SrcEntry, User, Workspace, WorkspaceMembership,
 };
 
 /// API のベース URL（Bitbucket Cloud）。
@@ -68,8 +68,14 @@ impl BitbucketClient {
     }
 
     /// 参加しているワークスペース一覧を取得する。
+    ///
+    /// 旧 `/2.0/workspaces` は `CHANGE-2770` で廃止されたため `/2.0/user/workspaces` を使う。
+    /// 各要素はメンバーシップ（`{ "workspace": {..} }`）なので `workspace` を取り出す。
     pub async fn list_workspaces(&self) -> Result<Vec<Workspace>, ApiError> {
-        self.get_paged("/workspaces", &[("pagelen", "50")]).await
+        let memberships: Vec<WorkspaceMembership> = self
+            .get_paged("/user/workspaces", &[("pagelen", "50")])
+            .await?;
+        Ok(memberships.into_iter().map(|m| m.workspace).collect())
     }
 
     /// 指定ワークスペースで閲覧可能なリポジトリ一覧を更新日時降順で取得する。

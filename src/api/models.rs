@@ -46,14 +46,34 @@ pub struct User {
     pub nickname: Option<String>,
 }
 
-/// `GET /2.0/workspaces` の要素。
+/// ワークスペース。`GET /2.0/user/workspaces` の各要素が内包する `workspace`。
+///
+/// 旧 `GET /2.0/workspaces` は `name` 付きだったが、`CHANGE-2770` で廃止された。後継の
+/// `/2.0/user/workspaces` が返す `workspace_base` は `slug`/`uuid` のみで `name` を持たない。
+/// そのため `name` は任意扱いとし、表示は `display_name()`（`name` が無ければ `slug`）で行う。
 #[derive(Debug, Clone, Deserialize)]
 pub struct Workspace {
     pub slug: String,
-    pub name: String,
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     #[allow(dead_code, reason = "M1 以降の識別で使用予定")]
     pub uuid: Option<String>,
+}
+
+impl Workspace {
+    /// 表示名。`name` があればそれを、無ければ `slug` を返す。
+    pub fn display_name(&self) -> &str {
+        self.name.as_deref().unwrap_or(&self.slug)
+    }
+}
+
+/// `GET /2.0/user/workspaces` の要素（ワークスペースメンバーシップ）。
+///
+/// 実体のワークスペースは `workspace` に入る（`{ "type": "workspace_access", "workspace": {..} }`）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkspaceMembership {
+    pub workspace: Workspace,
 }
 
 /// `GET /2.0/repositories/{workspace}` の要素。
@@ -877,6 +897,31 @@ mod tests {
         let page: Paginated<Repository> = serde_json::from_str(json).expect("valid json");
         assert!(page.values.is_empty());
         assert!(page.next.is_none());
+    }
+
+    #[test]
+    fn deserializes_user_workspaces_membership() {
+        // `GET /2.0/user/workspaces`（`/2.0/workspaces` の後継）の実レスポンス形。
+        // ワークスペースは `workspace` にネストし、`workspace_base` は `name` を持たない。
+        let json = r#"{
+            "values": [{
+                "type": "workspace_access",
+                "administrator": false,
+                "workspace": {
+                    "type": "workspace_base",
+                    "uuid": "{00000000-0000-0000-0000-000000000000}",
+                    "slug": "acme",
+                    "links": { "self": { "href": "https://api.bitbucket.org/2.0/workspaces/acme" } }
+                }
+            }]
+        }"#;
+        let page: Paginated<WorkspaceMembership> = serde_json::from_str(json).expect("valid json");
+        assert_eq!(page.values.len(), 1);
+        let ws = &page.values[0].workspace;
+        assert_eq!(ws.slug, "acme");
+        assert!(ws.name.is_none());
+        // name が無いときは slug を表示名に使う。
+        assert_eq!(ws.display_name(), "acme");
     }
 
     #[test]

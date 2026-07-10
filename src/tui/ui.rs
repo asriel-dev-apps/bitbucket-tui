@@ -21,7 +21,7 @@ use crate::tui::diff::DiffLineKind;
 use crate::tui::onboarding::Field;
 
 /// API token 発行に関する常時ヒント。
-const TOKEN_HINT: &str = "API token は Atlassian アカウント設定 > Security で発行。必要スコープ: account, repository, pullrequest, pullrequest:write, pipeline, pipeline:write";
+const TOKEN_HINT: &str = "API token は Atlassian アカウント設定 > Security の「Create API token with scopes」で発行。必要スコープ: read:user:bitbucket, read:workspace:bitbucket, read:repository:bitbucket, read:pullrequest:bitbucket, write:pullrequest:bitbucket, read:pipeline:bitbucket, write:pipeline:bitbucket";
 
 /// 画面全体を描画する。
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -106,22 +106,27 @@ fn render_header(frame: &mut Frame, area: Rect, screen: Screen) {
 
 fn render_onboarding(frame: &mut Frame, area: Rect, app: &App) {
     let active = app.onboarding.field.0;
-    let masked_token: String = "•".repeat(app.onboarding.token.chars().count());
 
-    let email_value = if app.onboarding.email.is_empty() {
-        Span::styled("（メールアドレスを入力）", Style::new().dim())
-    } else {
-        Span::raw(app.onboarding.email.clone())
-    };
-    let token_value = if masked_token.is_empty() {
-        Span::styled("（API token を入力・マスク表示）", Style::new().dim())
-    } else {
-        Span::raw(masked_token)
-    };
+    // email は実文字、token は文字数ぶんの `•` でマスク。カーソルは各フィールドが保持する。
+    let email_chars: Vec<char> = app.onboarding.email.chars().to_vec();
+    let token_chars: Vec<char> = vec!['•'; app.onboarding.token.len()];
+
+    let email_spans = input_spans(
+        &email_chars,
+        app.onboarding.email.cursor(),
+        active == Field::Email,
+        "（メールアドレスを入力）",
+    );
+    let token_spans = input_spans(
+        &token_chars,
+        app.onboarding.token.cursor(),
+        active == Field::Token,
+        "（API token を入力・マスク表示）",
+    );
 
     let mut lines = vec![
-        field_line("Email", email_value, active == Field::Email),
-        field_line("Token", token_value, active == Field::Token),
+        field_line("Email", email_spans, active == Field::Email),
+        field_line("Token", token_spans, active == Field::Token),
         Line::raw(""),
     ];
 
@@ -152,18 +157,58 @@ fn render_onboarding(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-fn field_line<'a>(label: &'a str, value: Span<'a>, active: bool) -> Line<'a> {
+fn field_line<'a>(label: &'a str, value_spans: Vec<Span<'a>>, active: bool) -> Line<'a> {
     let marker = if active { "▶ " } else { "  " };
     let label_style = if active {
         Style::new().fg(Color::Cyan).bold()
     } else {
         Style::new()
     };
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(marker, Style::new().fg(Color::Cyan)),
         Span::styled(format!("{label:<6}: "), label_style),
-        value,
-    ])
+    ];
+    spans.extend(value_spans);
+    Line::from(spans)
+}
+
+/// 入力フィールドの表示スパンを作る。
+///
+/// `active` のときはカーソル位置を反転表示する（末尾では反転した空白を1つ置く）。空のときは
+/// プレースホルダを淡色で表示する。`chars` は表示用の文字列（token はマスク済みの `•` 列）。
+fn input_spans<'a>(
+    chars: &[char],
+    cursor: usize,
+    active: bool,
+    placeholder: &'a str,
+) -> Vec<Span<'a>> {
+    if chars.is_empty() {
+        let mut spans = Vec::new();
+        if active {
+            spans.push(Span::styled(" ", Style::new().reversed()));
+        }
+        spans.push(Span::styled(placeholder, Style::new().dim()));
+        return spans;
+    }
+    if !active {
+        return vec![Span::raw(chars.iter().collect::<String>())];
+    }
+    let cursor = cursor.min(chars.len());
+    let before: String = chars[..cursor].iter().collect();
+    if cursor < chars.len() {
+        let at = chars[cursor].to_string();
+        let after: String = chars[cursor + 1..].iter().collect();
+        vec![
+            Span::raw(before),
+            Span::styled(at, Style::new().reversed()),
+            Span::raw(after),
+        ]
+    } else {
+        vec![
+            Span::raw(before),
+            Span::styled(" ", Style::new().reversed()),
+        ]
+    }
 }
 
 fn render_workspaces(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -182,7 +227,7 @@ fn render_workspaces(frame: &mut Frame, area: Rect, app: &mut App) {
         .iter()
         .map(|workspace| {
             ListItem::new(Line::from(vec![
-                Span::raw(workspace.name.clone()),
+                Span::raw(workspace.display_name().to_string()),
                 Span::styled(format!("  ({})", workspace.slug), Style::new().dim()),
             ]))
         })
