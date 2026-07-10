@@ -4,6 +4,7 @@
 //! [`Command`] として返す。実際の非同期実行（API 呼び出しの spawn）は `event` モジュールが行う。
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::text::Line;
 use ratatui::widgets::ListState;
 
 use crate::api::{
@@ -182,6 +183,12 @@ pub struct DiffState {
     pub viewport: usize,
     /// 見出し（例: `#12`）。
     pub title: String,
+    /// 着色済み行（`ratatui::text::Line`）の遅延キャッシュ。
+    ///
+    /// `parsed` から毎フレーム再構築すると全行ぶんのヒープ確保が走るため、初回描画時に
+    /// `ui` 側が一度だけ構築して書き戻す。新しい diff をロードした際は `DiffState` 自体を
+    /// 作り直す（`rendered_lines: None` で始まる）ため、別途の無効化ロジックは不要。
+    pub rendered_lines: Option<Vec<Line<'static>>>,
 }
 
 impl DiffState {
@@ -613,6 +620,9 @@ pub struct App {
     pub diffstat: SelectList<DiffStatEntry>,
     pub comments: Vec<Comment>,
     pub detail_scroll: u16,
+    /// 直近描画時の PR 詳細本文のビューポート高さ（`detail_scroll` の上限計算に使う。
+    /// `ui` が毎フレーム更新する。`DiffState::viewport` / `LogView::viewport` と同じ役割）。
+    pub detail_viewport: usize,
     pub diff: Option<DiffState>,
     pub comment_editor: Option<CommentEditor>,
     pub merge_modal: Option<MergeModal>,
@@ -643,6 +653,11 @@ pub struct App {
     pub status: Status,
     pub show_help: bool,
 }
+
+/// PR 詳細本文の固定ヘッダ行数（`ui::render_pr_meta_body` が積む先頭 4 行:
+/// タイトル / 状態・ブランチ / author 情報 / 空行）。`detail_scroll` の上限計算に使う。
+/// `ui::render_pr_meta_body` のヘッダ構成を変えたらここも合わせて更新すること。
+const PR_DETAIL_HEADER_LINES: usize = 4;
 
 impl App {
     /// 設定と（あれば）認証済みクライアントから初期状態を作る。
@@ -676,6 +691,7 @@ impl App {
             diffstat: SelectList::default(),
             comments: Vec::new(),
             detail_scroll: 0,
+            detail_viewport: 0,
             diff: None,
             comment_editor: None,
             merge_modal: None,
@@ -782,6 +798,7 @@ impl App {
                         scroll: 0,
                         viewport: 0,
                         title: format!("#{id}"),
+                        rendered_lines: None,
                     });
                 }
                 Command::None
@@ -910,6 +927,7 @@ impl App {
                         scroll: 0,
                         viewport: 0,
                         title: short_hash_str(&spec),
+                        rendered_lines: None,
                     });
                 }
                 Command::None
@@ -1325,6 +1343,35 @@ impl App {
         self.reload_pull_requests()
     }
 
+    /// PR 詳細本文の表示行数（ヘッダ 4 行 + 本文行数。本文が無い場合はプレースホルダの 1 行）。
+    ///
+    /// `ui::render_pr_meta_body` が積む行と対応する（折り返し前の行数。`Wrap` による折り返しは
+    /// 数えないため、狭い端末では厳密な末尾より手前でクランプされ得るが、無制限スクロールという
+    /// バグを防ぐには十分）。
+    fn detail_body_line_count(&self) -> usize {
+        let Some(pr) = self.current_pr.as_ref() else {
+            return 0;
+        };
+        let body_lines = pr.body().map_or(1, |body| body.lines().count().max(1));
+        PR_DETAIL_HEADER_LINES + body_lines
+    }
+
+    /// `detail_scroll` の上限（本文が直近描画のビューポートに収まる位置）。
+    fn detail_max_scroll(&self) -> u16 {
+        let total = self.detail_body_line_count();
+        let viewport = self.detail_viewport.max(1);
+        total.saturating_sub(viewport).min(u16::MAX as usize) as u16
+    }
+
+    /// `detail_scroll` をビューポートに合わせてクランプする（`DiffState::max_scroll` /
+    /// `LogView::clamp_scroll` と同じパターン）。`ui` が毎フレーム再クランプに使うため `pub`。
+    pub fn clamp_detail_scroll(&mut self) {
+        let max = self.detail_max_scroll();
+        if self.detail_scroll > max {
+            self.detail_scroll = max;
+        }
+    }
+
     /// 選択中の PR の詳細画面へ遷移し、詳細/diffstat/コメントの取得を開始する。
     fn open_pr_detail(&mut self) -> Command {
         let Some(pr) = self.pull_requests.selected().cloned() else {
@@ -1387,6 +1434,7 @@ impl App {
             }
             KeyCode::PageDown => {
                 self.detail_scroll = self.detail_scroll.saturating_add(5);
+                self.clamp_detail_scroll();
                 Command::None
             }
             KeyCode::PageUp => {
@@ -2838,6 +2886,59 @@ mod tests {
         let cmd = app.update(Msg::Key(key(KeyCode::Char('d'))));
         assert_eq!(app.screen, Screen::Diff);
         assert!(matches!(cmd, Command::LoadDiff { id: 9, .. }));
+    }
+
+    #[test]
+    fn detail_scroll_page_down_clamps_to_body_end() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequestDetail;
+        // 本文なし PR: ヘッダ 4 行 + プレースホルダ 1 行 = 5 行。viewport 2 → 上限 3。
+        app.current_pr = Some(make_pr(11, "OPEN"));
+        app.detail_viewport = 2;
+
+        for _ in 0..10 {
+            app.update(Msg::Key(key(KeyCode::PageDown)));
+        }
+        assert_eq!(app.detail_scroll, 3);
+    }
+
+    #[test]
+    fn detail_scroll_page_up_stops_at_zero() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequestDetail;
+        app.current_pr = Some(make_pr(12, "OPEN"));
+        app.detail_viewport = 2;
+
+        app.update(Msg::Key(key(KeyCode::PageUp)));
+        assert_eq!(app.detail_scroll, 0);
+    }
+
+    #[test]
+    fn clamp_detail_scroll_limits_to_body_line_count() {
+        let mut app = review_app();
+        app.current_pr = Some(make_pr(14, "OPEN"));
+        app.detail_viewport = 2;
+        app.detail_scroll = 999;
+
+        app.clamp_detail_scroll();
+
+        // 5 行（ヘッダ 4 + プレースホルダ 1） - viewport 2 = 上限 3。
+        assert_eq!(app.detail_scroll, 3);
+    }
+
+    #[test]
+    fn clamp_detail_scroll_accounts_for_multiline_body() {
+        let mut app = review_app();
+        let json = r#"{ "id": 15, "state": "OPEN", "description": "line1\nline2\nline3",
+            "participants": [] }"#;
+        app.current_pr = Some(serde_json::from_str(json).expect("valid pr json"));
+        app.detail_viewport = 2;
+        app.detail_scroll = 999;
+
+        app.clamp_detail_scroll();
+
+        // ヘッダ 4 行 + 本文 3 行 = 7 行 - viewport 2 = 上限 5。
+        assert_eq!(app.detail_scroll, 5);
     }
 
     #[test]

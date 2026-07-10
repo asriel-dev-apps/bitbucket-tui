@@ -334,6 +334,11 @@ fn render_pull_request_detail(frame: &mut Frame, area: Rect, app: &mut App) {
     let rows =
         Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).split(area);
 
+    // 枠線ぶんを差し引いたビューポート高さを保持し、リサイズ等で末尾を超えていれば
+    // 再クランプする（`DiffState`/`LogView` と同じパターン）。
+    app.detail_viewport = rows[0].height.saturating_sub(2) as usize;
+    app.clamp_detail_scroll();
+
     match app.current_pr.as_ref() {
         Some(pr) => render_pr_meta_body(frame, rows[0], pr, app.detail_scroll),
         None => render_placeholder(frame, rows[0], &app.status, "PR を選択してください"),
@@ -526,17 +531,36 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
     render_diff_body(frame, area, diff);
 }
 
-fn render_diff_body(frame: &mut Frame, area: Rect, diff: &DiffState) {
-    let lines: Vec<Line> = diff
-        .parsed
-        .lines
-        .iter()
-        .map(|line| Line::from(Span::styled(line.text.clone(), diff_line_style(line.kind))))
-        .collect();
-    let title = format!(" diff {} ({} 行) ", diff.title, diff.parsed.len());
-    let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .scroll((diff.scroll.min(u16::MAX as usize) as u16, 0));
+/// 差分の可視範囲 `[start, end)` を計算する。
+///
+/// `scroll`/`viewport`/総行数のどんな組み合わせでも `start <= end <= len` を保証する
+/// （`viewport` が総行数を超える／`scroll` が末尾を超える場合を含む）。
+fn diff_visible_range(scroll: usize, viewport: usize, len: usize) -> (usize, usize) {
+    let start = scroll.min(len);
+    let end = start.saturating_add(viewport).min(len);
+    (start, end)
+}
+
+fn render_diff_body(frame: &mut Frame, area: Rect, diff: &mut DiffState) {
+    // 着色済み行は diff ロード時（新しい `DiffState`）ごとに一度だけ構築し、以降は使い回す。
+    // 毎フレーム全行を `Span::styled` で作り直すと diff が大きいほど描画コストが線形に増える。
+    let total = diff.parsed.len();
+    let title = format!(" diff {} ({total} 行) ", diff.title);
+    let lines = diff.rendered_lines.get_or_insert_with(|| {
+        diff.parsed
+            .lines
+            .iter()
+            .map(|line| Line::from(Span::styled(line.text.clone(), diff_line_style(line.kind))))
+            .collect()
+    });
+
+    // per-frame のコストを O(viewport) に抑えるため、可視範囲だけを切り出して渡す
+    // （`.scroll()` はここでは使わない。全行を Paragraph に渡すのを避けるのが目的）。
+    let (start, end) = diff_visible_range(diff.scroll, diff.viewport, lines.len());
+    let visible: Vec<Line> = lines[start..end].to_vec();
+
+    let paragraph =
+        Paragraph::new(visible).block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(paragraph, area);
 }
 
@@ -1334,6 +1358,152 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
+    use crate::tui::diff::parse as parse_diff;
+
+    /// `line_count` 行のダミー diff（すべて文脈行）から `DiffState` を作る。
+    fn make_diff_state(line_count: usize) -> DiffState {
+        let mut text = String::new();
+        for index in 0..line_count {
+            text.push_str(&format!(" context line {index}\n"));
+        }
+        DiffState {
+            parsed: parse_diff(&text),
+            scroll: 0,
+            viewport: 0,
+            title: "#1".to_string(),
+            rendered_lines: None,
+        }
+    }
+
+    fn buffer_text(buffer: &Buffer) -> String {
+        buffer
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    #[test]
+    fn diff_visible_range_slices_from_scroll_offset() {
+        assert_eq!(diff_visible_range(5, 10, 20), (5, 15));
+    }
+
+    #[test]
+    fn diff_visible_range_covers_full_when_viewport_exceeds_len() {
+        assert_eq!(diff_visible_range(0, 100, 10), (0, 10));
+    }
+
+    #[test]
+    fn diff_visible_range_clamps_at_tail() {
+        assert_eq!(diff_visible_range(15, 10, 20), (15, 20));
+    }
+
+    #[test]
+    fn diff_visible_range_handles_zero_viewport() {
+        assert_eq!(diff_visible_range(3, 0, 20), (3, 3));
+    }
+
+    #[test]
+    fn diff_visible_range_handles_empty_diff() {
+        assert_eq!(diff_visible_range(0, 10, 0), (0, 0));
+    }
+
+    #[test]
+    fn diff_visible_range_never_panics_when_scroll_exceeds_len() {
+        // 通常は呼び出し側（`render_diff`）が事前にクランプするが、万一 scroll が総行数を
+        // 超えて渡されても範囲が破綻しないことを確認する。
+        assert_eq!(diff_visible_range(50, 10, 20), (20, 20));
+    }
+
+    #[test]
+    fn render_diff_body_caches_lines_and_reuses_allocation_across_frames() {
+        let mut diff = make_diff_state(300);
+        diff.viewport = 15;
+        diff.scroll = 0;
+
+        let backend = TestBackend::new(40, 17);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_diff_body(frame, area, &mut diff);
+            })
+            .expect("first draw succeeds");
+
+        let cached = diff
+            .rendered_lines
+            .as_ref()
+            .expect("cache built on first render");
+        assert_eq!(cached.len(), diff.parsed.len());
+        let first_ptr = cached.as_ptr();
+
+        // scroll を変えて再描画してもキャッシュは再構築されず、同じアロケーションを使い回す。
+        diff.scroll = 200;
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_diff_body(frame, area, &mut diff);
+            })
+            .expect("second draw succeeds");
+        let second_ptr = diff
+            .rendered_lines
+            .as_ref()
+            .expect("cache still present")
+            .as_ptr();
+        assert_eq!(
+            first_ptr, second_ptr,
+            "diff の着色済み行キャッシュは一度だけ構築され、以後は再利用されるべき"
+        );
+    }
+
+    #[test]
+    fn render_diff_body_only_draws_viewport_worth_of_lines() {
+        let mut diff = make_diff_state(50);
+        diff.viewport = 5;
+        diff.scroll = 3;
+
+        // 幅十分・高さ = 可視 5 行 + 上下ボーダー。
+        let backend = TestBackend::new(30, 7);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_diff_body(frame, area, &mut diff);
+            })
+            .expect("draw succeeds");
+
+        let content = buffer_text(terminal.backend().buffer());
+        // scroll=3, viewport=5 → 表示されるのは行 3..8。
+        assert!(content.contains("context line 3"));
+        assert!(content.contains("context line 7"));
+        // 範囲外（viewport を超える行）は表示されない。
+        assert!(!content.contains("context line 8"));
+        assert!(!content.contains("context line 2"));
+    }
+
+    #[test]
+    fn render_diff_body_handles_viewport_larger_than_diff() {
+        let mut diff = make_diff_state(3);
+        diff.viewport = 100;
+        diff.scroll = 0;
+
+        let backend = TestBackend::new(30, 102);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_diff_body(frame, area, &mut diff);
+            })
+            .expect("draw succeeds");
+
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("context line 0"));
+        assert!(content.contains("context line 2"));
+    }
 
     #[test]
     fn pipeline_status_colors_map_to_spec() {
