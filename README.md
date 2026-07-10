@@ -22,7 +22,19 @@ username / password ではなく、**Atlassian アカウントのメールアド
 
 起動後のログイン画面で **Email**（Atlassian アカウントのメール）と **Token** を入力する。token は **OS Keychain** にのみ保存し、平文ファイルには書かない（email と表示名は `config.toml` に保存）。
 
-## ビルドと起動
+## インストール
+
+Rust ツールチェーンがあれば、clone せず1コマンドで導入できる（`~/.cargo/bin/bitbucket-tui` に入る）。
+
+```sh
+cargo install --git https://github.com/asriel-dev-apps/bitbucket-tui.git
+```
+
+更新は同じコマンドに `--force` を付けて再実行する。
+
+> 現状は macOS 向け（token 保存に macOS Keychain / `keyring` の `apple-native` を使用）。
+
+### ソースからビルド
 
 ```sh
 cargo run                    # ビルドして起動
@@ -30,8 +42,6 @@ cargo run                    # ビルドして起動
 cargo build --release
 ./target/release/bitbucket-tui
 ```
-
-> 現状は macOS 向け（token 保存に macOS Keychain / `keyring` の `apple-native` を使用）。
 
 ### CLI
 
