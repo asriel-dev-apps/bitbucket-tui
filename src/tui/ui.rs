@@ -484,15 +484,15 @@ fn render_pr_meta_body(
                 Style::new().dim(),
             ),
         ]),
-        Line::raw(""),
     ];
 
+    // 承認/変更要求パネル（`app::participant_panel_line_count` と行数を対応させること。
+    // どちらも無ければ 0 行のまま追加しない）。
+    lines.extend(participant_panel_lines(pr, theme));
+    lines.push(Line::raw(""));
+
     match pr.body() {
-        Some(body) => {
-            for raw in body.lines() {
-                lines.push(Line::raw(raw.to_string()));
-            }
-        }
+        Some(body) => lines.extend(render_markdown_lines(body, theme)),
         None => lines.push(Line::from(Span::styled("（本文なし）", Style::new().dim()))),
     }
 
@@ -503,6 +503,166 @@ fn render_pr_meta_body(
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     frame.render_widget(paragraph, area);
+}
+
+/// 承認/変更要求パネル（承認者・変更要求者の表示名を 1 行ずつ）。
+///
+/// どちらも参加者がいなければ空（`app::participant_panel_line_count` の行数計算と
+/// 一致させること）。
+fn participant_panel_lines(pr: &PullRequest, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let approved = pr.approved_names();
+    if !approved.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("承認: ", Style::new().fg(theme.success)),
+            Span::raw(approved.join(", ")),
+        ]));
+    }
+    let changes_requested = pr.changes_requested_names();
+    if !changes_requested.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("変更要求: ", Style::new().fg(theme.danger)),
+            Span::raw(changes_requested.join(", ")),
+        ]));
+    }
+    lines
+}
+
+/// PR 本文の簡易 Markdown 整形（フルパーサ不要・行頭記号ベース）。
+///
+/// - 見出し（`#`〜`######` + 半角スペース）: `theme.accent` 太字。
+/// - 箇条書き（`-`/`*` + 半角スペース、インデント可）: 記号のみ `theme.accent`。
+/// - コードフェンス（\`\`\`）で囲まれた行・インライン `` `code` ``: `theme.muted`。
+/// - 画像記法 `![alt](url)`: TUI では表示できないため `[画像: alt]（o でブラウザ表示）`
+///   という代替テキストに置換する（画像本体は非対応）。
+///
+/// 1 入力行 = 1 出力行を維持する（`App::detail_body_line_count` の行数計算と対応させるため、
+/// 行の増減を伴う変換はしない）。
+fn render_markdown_lines(body: &str, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut in_code_block = false;
+    for raw in body.lines() {
+        let trimmed_start = raw.trim_start();
+        if trimmed_start.starts_with("```") {
+            in_code_block = !in_code_block;
+            lines.push(Line::from(Span::styled(
+                raw.to_string(),
+                Style::new().fg(theme.muted),
+            )));
+            continue;
+        }
+        if in_code_block {
+            lines.push(Line::from(Span::styled(
+                raw.to_string(),
+                Style::new().fg(theme.muted),
+            )));
+            continue;
+        }
+
+        let replaced = replace_image_syntax(raw);
+
+        if is_heading_line(&replaced) {
+            lines.push(Line::from(Span::styled(
+                replaced,
+                Style::new().fg(theme.accent).bold(),
+            )));
+            continue;
+        }
+
+        if let Some((prefix, rest)) = split_bullet_prefix(&replaced) {
+            let mut spans = vec![Span::styled(prefix, Style::new().fg(theme.accent))];
+            spans.extend(inline_code_spans(&rest, theme));
+            lines.push(Line::from(spans));
+            continue;
+        }
+
+        lines.push(Line::from(inline_code_spans(&replaced, theme)));
+    }
+    lines
+}
+
+/// 見出し行か（行頭の空白を除き `#`〜`######` の後に半角スペースまたは行末が続く）。
+fn is_heading_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let hashes = trimmed.chars().take_while(|&c| c == '#').count();
+    if hashes == 0 || hashes > 6 {
+        return false;
+    }
+    matches!(trimmed.as_bytes().get(hashes), None | Some(b' '))
+}
+
+/// 箇条書き行を `(先頭の空白+記号+空白, 残りの本文)` に分解する（`-`/`*` のみ対応）。
+fn split_bullet_prefix(line: &str) -> Option<(String, String)> {
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = &line[..indent_len];
+    let rest = &line[indent_len..];
+    if let Some(after) = rest.strip_prefix("- ") {
+        Some((format!("{indent}- "), after.to_string()))
+    } else {
+        rest.strip_prefix("* ")
+            .map(|after| (format!("{indent}* "), after.to_string()))
+    }
+}
+
+/// インライン `` `code` `` を分割して色分けする（バッククォートの対応が崩れていても
+/// パニックせず、単純な交互トグルとしてフェイルソフトに扱う）。
+fn inline_code_spans(line: &str, theme: &Theme) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut in_code = false;
+    for (index, part) in line.split('`').enumerate() {
+        if index > 0 {
+            in_code = !in_code;
+        }
+        if part.is_empty() {
+            continue;
+        }
+        if in_code {
+            spans.push(Span::styled(part.to_string(), Style::new().fg(theme.muted)));
+        } else {
+            spans.push(Span::raw(part.to_string()));
+        }
+    }
+    if spans.is_empty() {
+        spans.push(Span::raw(String::new()));
+    }
+    spans
+}
+
+/// 画像記法 `![alt](url)` を TUI 向けの代替テキストへ置換する。
+///
+/// TUI では画像を表示できないため、`[画像: alt]（o でブラウザ表示）` という代替テキストに
+/// 差し替える（画像本体の表示は非対応）。厳密な Markdown 解釈は行わず、`![` `]` `(` `)` の
+/// 並びのみを見る簡易版（記法が崩れている場合は元のテキストをそのまま残す）。
+fn replace_image_syntax(line: &str) -> String {
+    let mut result = String::new();
+    let mut rest = line;
+    while let Some(start) = rest.find("![") {
+        result.push_str(&rest[..start]);
+        let after_bang = &rest[start + 2..];
+        let Some(close_bracket) = after_bang.find(']') else {
+            // 閉じ `]` が無ければ画像記法とみなさず、残りをそのまま出力して終了。
+            result.push_str(&rest[start..]);
+            return result;
+        };
+        let alt = &after_bang[..close_bracket];
+        let after_alt = &after_bang[close_bracket + 1..];
+        match after_alt
+            .strip_prefix('(')
+            .and_then(|paren_rest| paren_rest.find(')').map(|end| (paren_rest, end)))
+        {
+            Some((paren_rest, close_paren)) => {
+                result.push_str(&format!("[画像: {alt}]（o でブラウザ表示）"));
+                rest = &paren_rest[close_paren + 1..];
+            }
+            None => {
+                // `(url)` が続かない場合は画像記法とみなさず、`![` をそのまま出力して続行。
+                result.push_str("![");
+                rest = &rest[start + 2..];
+            }
+        }
+    }
+    result.push_str(rest);
+    result
 }
 
 fn render_diffstat_list(
@@ -576,10 +736,18 @@ fn render_comments(frame: &mut Frame, area: Rect, comments: &[Comment], theme: &
     }
     let mut lines = Vec::new();
     for comment in comments {
-        let mut header = vec![Span::styled(
+        // 返信（`parent` あり）は 1 段インデントして表示する（スレッドの厳密な木構造化は
+        // せず、一覧の並び順のまま返信であることが分かる程度の簡易表示）。
+        let is_reply = comment.parent.is_some();
+        let indent = if is_reply { "  " } else { "" };
+        let mut header = vec![Span::raw(indent)];
+        if is_reply {
+            header.push(Span::styled("↳ ", Style::new().fg(theme.muted)));
+        }
+        header.push(Span::styled(
             comment.author_name().to_string(),
             Style::new().fg(theme.accent).bold(),
-        )];
+        ));
         if let Some(created) = comment.created_on.as_deref() {
             header.push(Span::styled(
                 format!("  {}", created.chars().take(10).collect::<String>()),
@@ -594,7 +762,7 @@ fn render_comments(frame: &mut Frame, area: Rect, comments: &[Comment], theme: &
         }
         lines.push(Line::from(header));
         for raw in comment.raw().lines() {
-            lines.push(Line::raw(format!("  {raw}")));
+            lines.push(Line::raw(format!("  {indent}{raw}")));
         }
         lines.push(Line::raw(""));
     }
@@ -1382,6 +1550,7 @@ fn hint_entries(screen: Screen) -> &'static [(&'static str, &'static str)] {
             ("a", "承認"),
             ("x", "変更要求"),
             ("M", "マージ"),
+            ("o", "ブラウザで開く"),
             ("↑↓", "ファイル"),
             ("Esc", "戻る"),
         ],
@@ -1609,6 +1778,7 @@ fn render_help(frame: &mut Frame, screen: Screen, theme: &Theme) {
             "a              approve / unapprove トグル",
             "x              request-changes / 取消 トグル",
             "M              マージ（確認モーダル）",
+            "o              ブラウザで開く（`open` コマンドで既定ブラウザに開く）",
             "↑↓             変更ファイル選択  PgUp/PgDn: 本文スクロール",
         ],
         Screen::Diff => &[
@@ -2011,6 +2181,226 @@ mod tests {
     #[test]
     fn truncate_file_name_never_panics_on_zero_width() {
         assert_eq!(truncate_file_name("file.rs", 0), "…");
+    }
+
+    #[test]
+    fn replace_image_syntax_replaces_full_line_image() {
+        let replaced = replace_image_syntax("![Screenshot](https://example.com/img.png)");
+        assert_eq!(replaced, "[画像: Screenshot]（o でブラウザ表示）");
+    }
+
+    #[test]
+    fn replace_image_syntax_replaces_inline_image_and_keeps_surrounding_text() {
+        let replaced = replace_image_syntax("見て: ![図](https://example.com/a.png) です");
+        assert_eq!(replaced, "見て: [画像: 図]（o でブラウザ表示） です");
+    }
+
+    #[test]
+    fn replace_image_syntax_leaves_plain_text_untouched() {
+        let replaced = replace_image_syntax("普通のテキストです");
+        assert_eq!(replaced, "普通のテキストです");
+    }
+
+    #[test]
+    fn replace_image_syntax_tolerates_malformed_syntax() {
+        // `(url)` が続かない壊れた記法はそのまま残す（フェイルソフト）。
+        let replaced = replace_image_syntax("![alt without parens");
+        assert_eq!(replaced, "![alt without parens");
+    }
+
+    #[test]
+    fn replace_image_syntax_handles_multiple_images_in_one_line() {
+        let replaced = replace_image_syntax("![a](u1) と ![b](u2)");
+        assert_eq!(
+            replaced,
+            "[画像: a]（o でブラウザ表示） と [画像: b]（o でブラウザ表示）"
+        );
+    }
+
+    #[test]
+    fn is_heading_line_detects_hash_headings() {
+        assert!(is_heading_line("# Title"));
+        assert!(is_heading_line("## Subtitle"));
+        assert!(is_heading_line("###### Deep"));
+        assert!(is_heading_line("#"));
+        assert!(!is_heading_line("#no-space"));
+        assert!(!is_heading_line("normal text"));
+        assert!(!is_heading_line("####### too many"));
+    }
+
+    #[test]
+    fn split_bullet_prefix_splits_dash_and_star_bullets() {
+        let (prefix, rest) = split_bullet_prefix("- item one").expect("bullet");
+        assert_eq!(prefix, "- ");
+        assert_eq!(rest, "item one");
+
+        let (prefix, rest) = split_bullet_prefix("* item two").expect("bullet");
+        assert_eq!(prefix, "* ");
+        assert_eq!(rest, "item two");
+    }
+
+    #[test]
+    fn split_bullet_prefix_preserves_leading_indent() {
+        let (prefix, rest) = split_bullet_prefix("  - nested").expect("bullet");
+        assert_eq!(prefix, "  - ");
+        assert_eq!(rest, "nested");
+    }
+
+    #[test]
+    fn split_bullet_prefix_returns_none_for_non_bullet_lines() {
+        assert!(split_bullet_prefix("plain text").is_none());
+        assert!(split_bullet_prefix("-no space after dash").is_none());
+    }
+
+    #[test]
+    fn inline_code_spans_highlights_backtick_segments() {
+        let theme = Theme::default();
+        let spans = inline_code_spans("use `foo` here", &theme);
+        assert_eq!(
+            spans,
+            vec![
+                Span::raw("use ".to_string()),
+                Span::styled("foo".to_string(), Style::new().fg(theme.muted)),
+                Span::raw(" here".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn inline_code_spans_without_backticks_is_plain_raw() {
+        let theme = Theme::default();
+        let spans = inline_code_spans("plain text", &theme);
+        assert_eq!(spans, vec![Span::raw("plain text".to_string())]);
+    }
+
+    #[test]
+    fn render_markdown_lines_styles_heading_bullet_and_image() {
+        let theme = Theme::default();
+        let body = "# Heading\n- item `code`\n![alt](https://example.com/x.png)\nplain";
+        let lines = render_markdown_lines(body, &theme);
+        assert_eq!(lines.len(), 4);
+        assert_eq!(
+            lines[0],
+            Line::from(Span::styled(
+                "# Heading".to_string(),
+                Style::new().fg(theme.accent).bold()
+            ))
+        );
+        assert_eq!(
+            lines[1],
+            Line::from(vec![
+                Span::styled("- ".to_string(), Style::new().fg(theme.accent)),
+                Span::raw("item ".to_string()),
+                Span::styled("code".to_string(), Style::new().fg(theme.muted)),
+            ])
+        );
+        assert_eq!(
+            lines[2],
+            Line::from(vec![Span::raw(
+                "[画像: alt]（o でブラウザ表示）".to_string()
+            )])
+        );
+        assert_eq!(lines[3], Line::from(vec![Span::raw("plain".to_string())]));
+    }
+
+    #[test]
+    fn render_markdown_lines_dims_code_fence_block() {
+        let theme = Theme::default();
+        let body = "before\n```\nlet x = 1;\n```\nafter";
+        let lines = render_markdown_lines(body, &theme);
+        assert_eq!(lines.len(), 5);
+        assert_eq!(
+            lines[1],
+            Line::from(Span::styled(
+                "```".to_string(),
+                Style::new().fg(theme.muted)
+            ))
+        );
+        assert_eq!(
+            lines[2],
+            Line::from(Span::styled(
+                "let x = 1;".to_string(),
+                Style::new().fg(theme.muted)
+            ))
+        );
+        assert_eq!(
+            lines[3],
+            Line::from(Span::styled(
+                "```".to_string(),
+                Style::new().fg(theme.muted)
+            ))
+        );
+    }
+
+    #[test]
+    fn render_markdown_lines_preserves_one_to_one_line_mapping() {
+        let theme = Theme::default();
+        let body = "line1\nline2\nline3";
+        assert_eq!(render_markdown_lines(body, &theme).len(), 3);
+    }
+
+    fn make_pr_with_participants(json: &str) -> PullRequest {
+        serde_json::from_str(json).expect("valid pr json")
+    }
+
+    #[test]
+    fn participant_panel_lines_shows_approved_and_changes_requested() {
+        let theme = Theme::default();
+        let pr = make_pr_with_participants(
+            r#"{ "id": 1, "participants": [
+                { "user": { "display_name": "Bob" }, "approved": true, "state": "approved" },
+                { "user": { "display_name": "Carol" }, "approved": false, "state": "changes_requested" }
+            ] }"#,
+        );
+        let lines = participant_panel_lines(&pr, &theme);
+        assert_eq!(
+            lines,
+            vec![
+                Line::from(vec![
+                    Span::styled("承認: ".to_string(), Style::new().fg(theme.success)),
+                    Span::raw("Bob".to_string()),
+                ]),
+                Line::from(vec![
+                    Span::styled("変更要求: ".to_string(), Style::new().fg(theme.danger)),
+                    Span::raw("Carol".to_string()),
+                ]),
+            ]
+        );
+    }
+
+    #[test]
+    fn participant_panel_lines_empty_when_no_participants() {
+        let theme = Theme::default();
+        let pr = make_pr_with_participants(r#"{ "id": 2, "participants": [] }"#);
+        assert!(participant_panel_lines(&pr, &theme).is_empty());
+    }
+
+    #[test]
+    fn render_comments_indents_reply_with_parent() {
+        let theme = Theme::default();
+        let root: Comment = serde_json::from_str(
+            r#"{ "id": 1, "content": { "raw": "root comment" },
+                "user": { "display_name": "Alice" } }"#,
+        )
+        .expect("valid comment json");
+        let reply: Comment = serde_json::from_str(
+            r#"{ "id": 2, "content": { "raw": "reply comment" },
+                "user": { "display_name": "Bob" }, "parent": { "id": 1 } }"#,
+        )
+        .expect("valid comment json");
+        let comments = vec![root, reply];
+
+        let backend = TestBackend::new(50, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                render_comments(frame, frame.area(), &comments, &theme);
+            })
+            .expect("draw succeeds");
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("root comment"));
+        assert!(text.contains("↳"));
+        assert!(text.contains("reply comment"));
     }
 
     #[test]

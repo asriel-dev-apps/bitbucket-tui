@@ -292,6 +292,20 @@ pub struct Participant {
     pub state: Option<String>,
 }
 
+/// `links` 内の 1 リンク（`{ "href": ".." }`）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct Link {
+    #[serde(default)]
+    pub href: Option<String>,
+}
+
+/// PR の `links`（ブラウザ表示用の `html` のみ使用。他種別は将来のため無視）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct PrLinks {
+    #[serde(default)]
+    pub html: Option<Link>,
+}
+
 /// `GET /repositories/{ws}/{repo}/pullrequests/{id}` の PR。
 ///
 /// 一覧・詳細で共通に使う。実 API 応答でのフィールド有無が未確定のため、`id` 以外は
@@ -328,6 +342,9 @@ pub struct PullRequest {
     pub reviewers: Option<Vec<User>>,
     #[serde(default)]
     pub participants: Vec<Participant>,
+    /// ブラウザで開くための URL 群（`links.html.href` のみ使用）。
+    #[serde(default)]
+    pub links: Option<PrLinks>,
 }
 
 impl PullRequest {
@@ -398,6 +415,41 @@ impl PullRequest {
             .count();
         by_role.max(self.reviewers.as_ref().map_or(0, Vec::len))
     }
+
+    /// ブラウザで開くための URL（`links.html.href`）。無ければ `None`。
+    pub fn html_url(&self) -> Option<&str> {
+        self.links.as_ref()?.html.as_ref()?.href.as_deref()
+    }
+
+    /// 承認した参加者の表示名一覧（`approved == true`）。
+    pub fn approved_names(&self) -> Vec<&str> {
+        self.participants
+            .iter()
+            .filter(|participant| participant.approved)
+            .map(|participant| {
+                participant
+                    .user
+                    .as_ref()
+                    .and_then(|user| user.display_name.as_deref())
+                    .unwrap_or("?")
+            })
+            .collect()
+    }
+
+    /// 変更要求した参加者の表示名一覧（`state == "changes_requested"`）。
+    pub fn changes_requested_names(&self) -> Vec<&str> {
+        self.participants
+            .iter()
+            .filter(|participant| participant.state.as_deref() == Some("changes_requested"))
+            .map(|participant| {
+                participant
+                    .user
+                    .as_ref()
+                    .and_then(|user| user.display_name.as_deref())
+                    .unwrap_or("?")
+            })
+            .collect()
+    }
 }
 
 /// コメント本文（`{ "raw": .., "html": .. }`）。
@@ -446,8 +498,8 @@ pub struct Comment {
     pub deleted: bool,
     #[serde(default)]
     pub inline: Option<Inline>,
+    /// 親コメント（返信元）。`Some` ならスレッドの返信としてインデント表示する。
     #[serde(default)]
-    #[allow(dead_code, reason = "スレッド表示は未対応")]
     pub parent: Option<CommentParent>,
 }
 
@@ -1082,6 +1134,42 @@ mod tests {
         assert_eq!(pr.approved_count(), 1);
         assert_eq!(pr.reviewer_count(), 2);
         assert_eq!(pr.close_source_branch, Some(true));
+        assert_eq!(pr.approved_names(), vec!["Bob"]);
+        assert_eq!(pr.changes_requested_names(), vec!["Carol"]);
+    }
+
+    #[test]
+    fn pull_request_reads_html_url_from_links() {
+        let json = r#"{
+            "id": 5,
+            "links": {
+                "html": { "href": "https://bitbucket.org/acme/widget/pull-requests/5" }
+            }
+        }"#;
+        let pr: PullRequest = serde_json::from_str(json).expect("valid json");
+        assert_eq!(
+            pr.html_url(),
+            Some("https://bitbucket.org/acme/widget/pull-requests/5")
+        );
+    }
+
+    #[test]
+    fn pull_request_without_links_has_no_html_url() {
+        let pr: PullRequest = serde_json::from_str(r#"{ "id": 6 }"#).expect("valid json");
+        assert_eq!(pr.html_url(), None);
+    }
+
+    #[test]
+    fn pull_request_without_matching_participants_has_empty_name_lists() {
+        let json = r#"{
+            "id": 7,
+            "participants": [
+                { "user": { "display_name": "Dan" }, "approved": false, "state": null }
+            ]
+        }"#;
+        let pr: PullRequest = serde_json::from_str(json).expect("valid json");
+        assert!(pr.approved_names().is_empty());
+        assert!(pr.changes_requested_names().is_empty());
     }
 
     #[test]
@@ -1122,6 +1210,20 @@ mod tests {
         assert_eq!(inline.path.as_deref(), Some("src/lib.rs"));
         assert_eq!(inline.to, Some(12));
         assert_eq!(inline.from, None);
+        assert!(comment.parent.is_none());
+    }
+
+    #[test]
+    fn deserializes_comment_reply_with_parent() {
+        let json = r#"{
+            "id": 101,
+            "content": { "raw": "同意です" },
+            "user": { "display_name": "Erin" },
+            "parent": { "id": 100 }
+        }"#;
+        let comment: Comment = serde_json::from_str(json).expect("valid json");
+        let parent = comment.parent.expect("parent present");
+        assert_eq!(parent.id, 100);
     }
 
     #[test]

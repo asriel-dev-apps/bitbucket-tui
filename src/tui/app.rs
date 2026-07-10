@@ -982,7 +982,21 @@ pub struct App {
 /// PR 詳細本文の固定ヘッダ行数（`ui::render_pr_meta_body` が積む先頭 4 行:
 /// タイトル / 状態・ブランチ / author 情報 / 空行）。`detail_scroll` の上限計算に使う。
 /// `ui::render_pr_meta_body` のヘッダ構成を変えたらここも合わせて更新すること。
+/// （承認/変更要求パネルの行数は可変なので別途 [`participant_panel_line_count`] で加算する）。
 const PR_DETAIL_HEADER_LINES: usize = 4;
+
+/// 承認/変更要求パネルの行数（`ui::render_pr_meta_body` が積む参加者パネルと対応させる）。
+/// 承認者がいれば 1 行、変更要求者がいれば 1 行、どちらも無ければ 0 行。
+fn participant_panel_line_count(pr: &PullRequest) -> usize {
+    let mut lines = 0;
+    if !pr.approved_names().is_empty() {
+        lines += 1;
+    }
+    if !pr.changes_requested_names().is_empty() {
+        lines += 1;
+    }
+    lines
+}
 
 impl App {
     /// 設定と（あれば）認証済みクライアントから初期状態を作る。
@@ -1896,7 +1910,8 @@ impl App {
             .reorder(items, |pr| format!("{} #{}", pr.title_str(), pr.id));
     }
 
-    /// PR 詳細本文の表示行数（ヘッダ 4 行 + 本文行数。本文が無い場合はプレースホルダの 1 行）。
+    /// PR 詳細本文の表示行数（ヘッダ 4 行 + 承認/変更要求パネル行 + 本文行数。
+    /// 本文が無い場合はプレースホルダの 1 行）。
     ///
     /// `ui::render_pr_meta_body` が積む行と対応する（折り返し前の行数。`Wrap` による折り返しは
     /// 数えないため、狭い端末では厳密な末尾より手前でクランプされ得るが、無制限スクロールという
@@ -1906,7 +1921,7 @@ impl App {
             return 0;
         };
         let body_lines = pr.body().map_or(1, |body| body.lines().count().max(1));
-        PR_DETAIL_HEADER_LINES + body_lines
+        PR_DETAIL_HEADER_LINES + participant_panel_line_count(pr) + body_lines
     }
 
     /// `detail_scroll` の上限（本文が直近描画のビューポートに収まる位置）。
@@ -2076,8 +2091,35 @@ impl App {
             KeyCode::Char('a') => self.toggle_approve(),
             KeyCode::Char('x') => self.toggle_request_changes(),
             KeyCode::Char('M') => self.open_merge_modal(),
+            KeyCode::Char('o') => self.open_pr_in_browser(),
             _ => Command::None,
         }
+    }
+
+    /// 現在の PR をデフォルトブラウザで開く（macOS の `open` コマンドを子プロセスで起動）。
+    ///
+    /// TUI を抜けず、子プロセスの stdout/stderr は端末を汚さないよう `Stdio::null()` へ
+    /// 捨てる。起動の成否のみを `Status` に反映する（終了を待たない = ブロックしない）。
+    fn open_pr_in_browser(&mut self) -> Command {
+        let Some(pr) = self.current_pr.as_ref() else {
+            self.status = Status::Error("PR が選択されていません".to_string());
+            return Command::None;
+        };
+        let Some(url) = pr.html_url() else {
+            self.status = Status::Error("この PR のブラウザ URL が不明です".to_string());
+            return Command::None;
+        };
+        let result = std::process::Command::new("open")
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        self.status = match result {
+            Ok(_) => Status::Success("ブラウザで開きました".to_string()),
+            Err(err) => Status::Error(format!("ブラウザを開けませんでした: {err}")),
+        };
+        Command::None
     }
 
     /// Diff 画面へ遷移する。未取得なら取得を開始し、取得済みなら再利用する。
@@ -3878,6 +3920,31 @@ mod tests {
     }
 
     #[test]
+    fn detail_o_without_html_url_reports_error_and_stays_on_screen() {
+        // html_url が無い PR では実プロセスを起動せず Status::Error にするだけ
+        // （`open` コマンドは呼ばれない分岐を検証する。実起動の分岐は
+        // `PullRequest::html_url` 側の単体テストで代替する）。
+        let mut app = review_app();
+        app.screen = Screen::PullRequestDetail;
+        app.current_pr = Some(make_pr(20, "OPEN"));
+        assert!(app.current_pr.as_ref().expect("pr").html_url().is_none());
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('o'))));
+        assert!(matches!(cmd, Command::None));
+        assert_eq!(app.screen, Screen::PullRequestDetail);
+        assert!(matches!(app.status, Status::Error(_)));
+    }
+
+    #[test]
+    fn detail_o_without_current_pr_reports_error() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequestDetail;
+        app.current_pr = None;
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('o'))));
+        assert!(matches!(cmd, Command::None));
+        assert!(matches!(app.status, Status::Error(_)));
+    }
+
+    #[test]
     fn detail_scroll_page_down_clamps_to_body_end() {
         let mut app = review_app();
         app.screen = Screen::PullRequestDetail;
@@ -3928,6 +3995,24 @@ mod tests {
 
         // ヘッダ 4 行 + 本文 3 行 = 7 行 - viewport 2 = 上限 5。
         assert_eq!(app.detail_scroll, 5);
+    }
+
+    #[test]
+    fn clamp_detail_scroll_accounts_for_participant_panel() {
+        let mut app = review_app();
+        let json = r#"{ "id": 16, "state": "OPEN", "description": "line1\nline2",
+            "participants": [
+                { "user": { "display_name": "Bob" }, "approved": true, "state": "approved" },
+                { "user": { "display_name": "Carol" }, "approved": false, "state": "changes_requested" }
+            ] }"#;
+        app.current_pr = Some(serde_json::from_str(json).expect("valid pr json"));
+        app.detail_viewport = 2;
+        app.detail_scroll = 999;
+
+        app.clamp_detail_scroll();
+
+        // ヘッダ 4 行 + 承認/変更要求パネル 2 行 + 本文 2 行 = 8 行 - viewport 2 = 上限 6。
+        assert_eq!(app.detail_scroll, 6);
     }
 
     #[test]
