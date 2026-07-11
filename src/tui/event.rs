@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 use crate::api::{BitbucketClient, InlineTarget};
 use crate::tui::Tui;
 use crate::tui::app::{App, Command, Msg, PipelineAction};
+use crate::tui::imageview::MAX_IMAGE_BYTES;
 use crate::tui::ui;
 
 /// 入力・API チャネルの容量。
@@ -582,6 +583,17 @@ fn dispatch(command: Command, api_tx: &mpsc::Sender<Msg>) -> bool {
                     Err(error) => Msg::LoadFailed(error),
                 };
                 let _ = tx.send(msg).await;
+            });
+            true
+        }
+        Command::LoadImage { client, url } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let result = client
+                    .get_image_bytes(&url, MAX_IMAGE_BYTES)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(Msg::ImageLoaded { url, result }).await;
             });
             true
         }

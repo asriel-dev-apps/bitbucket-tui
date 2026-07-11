@@ -24,6 +24,7 @@ use crate::tui::app::{
     PageJumpModal, Screen, SelectList, Status,
 };
 use crate::tui::diff::DiffLineKind;
+use crate::tui::imageview;
 use crate::tui::onboarding::Field;
 use crate::tui::theme::Theme;
 
@@ -57,6 +58,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Screen::CommitDetail => render_commit_detail(frame, chunks[1], app),
         Screen::Source => render_source(frame, chunks[1], app),
         Screen::FileView => render_file_view(frame, chunks[1], app),
+        Screen::ImageView => render_image_view(frame, chunks[1], app),
     }
 
     render_status(frame, chunks[2], &app.status, &app.theme);
@@ -101,6 +103,7 @@ fn screen_title(screen: Screen) -> &'static str {
         Screen::CommitDetail => "コミット詳細",
         Screen::Source => "ソース",
         Screen::FileView => "ファイル",
+        Screen::ImageView => "画像",
     }
 }
 
@@ -649,10 +652,11 @@ fn participant_panel_lines(pr: &PullRequest, theme: &Theme) -> Vec<Line<'static>
 
 /// PR 本文・コメント本文の Markdown を [`tui_markdown`] で描画する。
 ///
-/// 画像記法 `![alt](url)` は事前に（コードフェンス内を除いて）`[画像: alt]（o でブラウザ
-/// 表示）` という代替テキストへ置換してから `tui_markdown::from_str` へ渡す（TUI では画像を
-/// 描画できないため。将来インライン画像表示を実装した際の非対応端末フォールバックとしても
-/// この置換は残す）。
+/// 画像記法 `![alt](url)` は事前に（コードフェンス内を除いて）`[画像: alt]（i で表示 / o で
+/// ブラウザ）` という代替テキストへ置換してから `tui_markdown::from_str` へ渡す（本文中に画像を
+/// インライン描画することはできないため。`i` で開く ImageView（`Screen::ImageView`）が実体の
+/// 表示を担う。画像表示機能が無効な端末では `i` を押しても Status に案内が出るのみで、この
+/// プレースホルダ自体は表記を変えない）。
 ///
 /// `tui_markdown` は入力行数と出力行数が一致しない（見出し前後の空行挿入・ソフト改行の結合等）
 /// ため、呼び出し元は返り値の `len()` を実際の描画行数として扱うこと
@@ -763,9 +767,10 @@ fn convert_markdown_modifier<M: std::fmt::Binary>(modifier: M) -> Modifier {
 
 /// 画像記法 `![alt](url)` を TUI 向けの代替テキストへ置換する。
 ///
-/// TUI では画像を表示できないため、`[画像: alt]（o でブラウザ表示）` という代替テキストに
-/// 差し替える（画像本体の表示は非対応）。厳密な Markdown 解釈は行わず、`![` `]` `(` `)` の
-/// 並びのみを見る簡易版（記法が崩れている場合は元のテキストをそのまま残す）。
+/// 本文中にインライン描画はしないため、`[画像: alt]（i で表示 / o でブラウザ）` という代替
+/// テキストに差し替える（`i` で ImageView を開いて実体を表示できる。詳細は
+/// [`crate::tui::imageview`]）。厳密な Markdown 解釈は行わず、`![` `]` `(` `)` の並びのみを見る
+/// 簡易版（記法が崩れている場合は元のテキストをそのまま残す）。
 fn replace_image_syntax(line: &str) -> String {
     let mut result = String::new();
     let mut rest = line;
@@ -784,7 +789,7 @@ fn replace_image_syntax(line: &str) -> String {
             .and_then(|paren_rest| paren_rest.find(')').map(|end| (paren_rest, end)))
         {
             Some((paren_rest, close_paren)) => {
-                result.push_str(&format!("[画像: {alt}]（o でブラウザ表示）"));
+                result.push_str(&format!("[画像: {alt}]（i で表示 / o でブラウザ）"));
                 rest = &paren_rest[close_paren + 1..];
             }
             None => {
@@ -1608,6 +1613,62 @@ fn render_file_view(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(paragraph, area);
 }
 
+/// PR 本文内の画像を表示する（`i` で開く ImageView）。
+///
+/// `ratatui_image` のネイティブ画像プロトコルではなく、`imageview::render_halfblocks` による
+/// 自前のハーフブロック描画を使う（理由は `src/tui/imageview.rs` 冒頭のコメント参照）。
+/// 毎フレーム現在の描画エリアに合わせて再サンプリングするため、端末リサイズに追従する。
+fn render_image_view(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = app.theme;
+    let Some(current) = app.image_refs.get(app.image_index) else {
+        render_placeholder(frame, area, &app.status, "画像がありません", &theme);
+        return;
+    };
+    let alt_suffix = if current.alt.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", current.alt)
+    };
+    let title = format!(
+        " 画像 {}/{}{alt_suffix} ",
+        app.image_index + 1,
+        app.image_refs.len(),
+    );
+
+    match app.current_image.as_ref() {
+        None => {
+            let text = if matches!(app.status, Status::Loading(_)) {
+                "読み込み中…"
+            } else {
+                "画像を準備しています…"
+            };
+            let paragraph = Paragraph::new(Line::from(Span::styled(text, Style::new().dim())))
+                .block(themed_block(&theme, true).title(title))
+                .alignment(Alignment::Center);
+            frame.render_widget(paragraph, area);
+        }
+        Some(Err(message)) => {
+            let paragraph = Paragraph::new(Line::from(Span::styled(
+                message.clone(),
+                Style::new().fg(theme.danger),
+            )))
+            .block(themed_block(&theme, true).title(title))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false });
+            frame.render_widget(paragraph, area);
+        }
+        Some(Ok(image)) => {
+            let block = themed_block(&theme, true).title(title);
+            let inner_area = block.inner(area);
+            frame.render_widget(block, area);
+            let font_size = app.image_font_size.unwrap_or((10, 20));
+            let lines =
+                imageview::render_halfblocks(image, inner_area.width, inner_area.height, font_size);
+            frame.render_widget(Paragraph::new(lines), inner_area);
+        }
+    }
+}
+
 /// ISO8601 文字列を `YYYY-MM-DD HH:MM` へ短縮する（`T` を空白に）。
 fn short_datetime(value: &str) -> String {
     let truncated: String = value.chars().take(16).collect();
@@ -1785,6 +1846,7 @@ fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("x", "変更要求"),
             ("M", "マージ"),
             ("o", "ブラウザで開く"),
+            ("i", "画像を表示"),
             ("↑↓/jk", "ファイル"),
             ("Shift+J/K", "本文10行"),
             ("Esc", "戻る"),
@@ -1866,6 +1928,7 @@ fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("g/G", "先頭/末尾"),
             ("Esc", "戻る"),
         ],
+        Screen::ImageView => vec![("←→/np", "前/次の画像"), ("Esc", "戻る")],
     };
 
     if screen != Screen::Onboarding {
@@ -2057,6 +2120,7 @@ fn render_help(frame: &mut Frame, screen: Screen, theme: &Theme) {
             "M              マージ（確認モーダル: ←→/Tab 戦略切替, Space ブランチ削除切替,",
             "               Enter 実行, Esc 取消）",
             "o              ブラウザで開く（`open` コマンドで既定ブラウザに開く）",
+            "i              本文の画像を表示（画像が無い/端末が未対応なら Status に案内）",
             "↑↓ / j k       変更ファイル選択",
             "PgUp/PgDn      本文スクロール（±5 行）",
             "Shift+J / K    本文スクロール（±10 行）",
@@ -2139,6 +2203,11 @@ fn render_help(frame: &mut Frame, screen: Screen, theme: &Theme) {
             "Shift+J / K    10 行スクロール",
             "PgUp/PgDn / f/b 1 画面スクロール",
             "g / Home, G / End 先頭 / 末尾",
+        ],
+        Screen::ImageView => &[
+            "→ / n          次の画像",
+            "← / p          前の画像（いずれも境界でクランプ・循環しない）",
+            "Esc            PR 詳細へ戻る",
         ],
         Screen::Workspaces => &[
             "Shift+J / K    10 件下 / 上へ移動",
@@ -2625,13 +2694,13 @@ mod tests {
     #[test]
     fn replace_image_syntax_replaces_full_line_image() {
         let replaced = replace_image_syntax("![Screenshot](https://example.com/img.png)");
-        assert_eq!(replaced, "[画像: Screenshot]（o でブラウザ表示）");
+        assert_eq!(replaced, "[画像: Screenshot]（i で表示 / o でブラウザ）");
     }
 
     #[test]
     fn replace_image_syntax_replaces_inline_image_and_keeps_surrounding_text() {
         let replaced = replace_image_syntax("見て: ![図](https://example.com/a.png) です");
-        assert_eq!(replaced, "見て: [画像: 図]（o でブラウザ表示） です");
+        assert_eq!(replaced, "見て: [画像: 図]（i で表示 / o でブラウザ） です");
     }
 
     #[test]
@@ -2652,7 +2721,7 @@ mod tests {
         let replaced = replace_image_syntax("![a](u1) と ![b](u2)");
         assert_eq!(
             replaced,
-            "[画像: a]（o でブラウザ表示） と [画像: b]（o でブラウザ表示）"
+            "[画像: a]（i で表示 / o でブラウザ） と [画像: b]（i で表示 / o でブラウザ）"
         );
     }
 
@@ -2696,7 +2765,7 @@ mod tests {
     fn render_markdown_lines_replaces_image_syntax_with_placeholder() {
         let lines = render_markdown_lines("![alt](https://example.com/x.png)");
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(text.contains("[画像: alt]（o でブラウザ表示）"));
+        assert!(text.contains("[画像: alt]（i で表示 / o でブラウザ）"));
         // 画像記法そのもの（`![...]`）は残らない。
         assert!(!text.contains("!["));
     }

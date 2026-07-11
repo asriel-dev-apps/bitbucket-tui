@@ -3,6 +3,7 @@
 pub mod app;
 pub mod diff;
 pub mod event;
+pub mod imageview;
 pub mod logview;
 pub mod onboarding;
 pub mod theme;

@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use image::DynamicImage;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Matcher, Utf32Str};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -19,6 +20,7 @@ use crate::api::{
 use crate::auth;
 use crate::config::Config;
 use crate::tui::diff::{CommentAnchor, ParsedDiff, parse as parse_diff};
+use crate::tui::imageview::{self, ImageRef};
 use crate::tui::logview::LogView;
 use crate::tui::onboarding::{Field, OnboardingState, TextInput};
 use crate::tui::theme::{Theme, ThemeName};
@@ -40,6 +42,8 @@ pub enum Screen {
     CommitDetail,
     Source,
     FileView,
+    /// PR 本文内の画像を表示する画面（PR 詳細から `i`）。
+    ImageView,
 }
 
 /// PR 一覧の state フィルタ。
@@ -486,6 +490,13 @@ pub enum Msg {
     },
     /// ソースファイル内容の取得完了。
     FileLoaded { path: String, text: String },
+    /// PR 本文内の画像の取得完了（`result` は生バイト、デコードは `update()` 側で行う）。
+    /// 古い（もう表示していない）URL の結果は無視する（`App::current_image` への反映のみ
+    /// ガードする。キャッシュ自体は常に最新化する）。
+    ImageLoaded {
+        url: String,
+        result: Result<Vec<u8>, String>,
+    },
 }
 
 /// `update()` が返す副作用の指示。実行は `event` モジュールが担う。
@@ -676,6 +687,11 @@ pub enum Command {
         repo: String,
         reference: String,
         path: String,
+    },
+    /// PR 本文内の画像を取得する（`url` は本文の Markdown から抽出した絶対 URL）。
+    LoadImage {
+        client: BitbucketClient,
+        url: String,
     },
 }
 
@@ -1149,6 +1165,20 @@ pub struct App {
     pub page_jump: Option<PageJumpModal>,
     /// 直近開いた PR（新しい順）。ジャンプパレットの候補に使う。
     pub recent_prs: Vec<RecentPr>,
+    /// ImageView で表示対象の画像一覧（PR 本文から抽出。`i` キー押下時に確定する）。
+    pub image_refs: Vec<ImageRef>,
+    /// `image_refs` のうち現在表示中のインデックス。
+    pub image_index: usize,
+    /// 現在表示中の画像のデコード結果（`None` は読み込み中）。
+    pub current_image: Option<Result<DynamicImage, String>>,
+    /// 画像のデコード結果キャッシュ（キー = URL）。同一 URL の再取得を避ける（上限あり）。
+    pub image_cache: RevisitCache<String, Result<DynamicImage, String>>,
+    /// 起動時に検出したこの端末のフォントピクセルサイズ（`(width, height)`）。
+    /// `ratatui_image::picker::Picker::from_query_stdio` の検出結果を `main.rs` が起動時に
+    /// 一度だけ設定する。`None` は検出失敗＝画像表示機能を無効化する
+    /// （`src/tui/imageview.rs` 冒頭のコメント参照: ネイティブ画像プロトコルではなく自前の
+    /// ハーフブロック描画を使うため、フォントサイズはアスペクト比の補正にのみ使う）。
+    pub image_font_size: Option<(u16, u16)>,
 }
 
 /// PR 詳細本文の固定ヘッダ行数（`ui::render_pr_meta_body` が積む先頭 4 行:
@@ -1252,6 +1282,11 @@ impl App {
             jump_palette: None,
             page_jump: None,
             recent_prs: Vec::new(),
+            image_refs: Vec::new(),
+            image_index: 0,
+            current_image: None,
+            image_cache: RevisitCache::default(),
+            image_font_size: None,
         }
     }
 
@@ -1601,6 +1636,26 @@ impl App {
                 }
                 Command::None
             }
+            Msg::ImageLoaded { url, result } => {
+                let decoded = result.and_then(|bytes| imageview::decode_image(&bytes));
+                // 表示中かどうかに関わらずキャッシュは常に最新化する（他画像/他 PR へ切り替えて
+                // いても、その結果は次回再訪時に活かす）。
+                self.image_cache.insert(url.clone(), decoded.clone());
+                // 取得中に別の画像へ切り替えていた場合（古い URL の結果）は画面反映のみ破棄する。
+                if self.screen == Screen::ImageView
+                    && self
+                        .image_refs
+                        .get(self.image_index)
+                        .is_some_and(|current| current.url == url)
+                {
+                    self.current_image = Some(decoded.clone());
+                    self.status = match &decoded {
+                        Ok(_) => Status::Idle,
+                        Err(message) => Status::Error(message.clone()),
+                    };
+                }
+                Command::None
+            }
         }
     }
 
@@ -1713,6 +1768,7 @@ impl App {
             Screen::CommitDetail => self.on_key_commit_detail(key),
             Screen::Source => self.on_key_source(key),
             Screen::FileView => self.on_key_file_view(key),
+            Screen::ImageView => self.on_key_image_view(key),
         }
     }
 
@@ -2561,7 +2617,102 @@ impl App {
             KeyCode::Char('x') => self.toggle_request_changes(),
             KeyCode::Char('M') => self.open_merge_modal(),
             KeyCode::Char('o') => self.open_pr_in_browser(),
+            KeyCode::Char('i') => self.open_image_view(),
             _ => Command::None,
+        }
+    }
+
+    /// PR 本文の画像一覧から ImageView を開く（`i`）。
+    ///
+    /// 本文に画像が無ければ Status にエラーを出す。画像表示機能が無効
+    /// （`image_font_size` が `None` ＝起動時の端末検出に失敗）な環境では、その旨を案内し
+    /// ImageView へは遷移しない（アプリは落ちない）。
+    fn open_image_view(&mut self) -> Command {
+        let Some(pr) = self.current_pr.as_ref() else {
+            self.status = Status::Error("PR が選択されていません".to_string());
+            return Command::None;
+        };
+        let refs = pr
+            .body()
+            .map(imageview::extract_image_refs)
+            .unwrap_or_default();
+        if refs.is_empty() {
+            self.status = Status::Error("本文に画像がありません".to_string());
+            return Command::None;
+        }
+        if self.image_font_size.is_none() {
+            self.status =
+                Status::Error("この端末は画像表示に未対応です（o でブラウザ表示）".to_string());
+            return Command::None;
+        }
+        self.image_refs = refs;
+        self.image_index = 0;
+        self.current_image = None;
+        self.screen = Screen::ImageView;
+        self.load_current_image()
+    }
+
+    /// ImageView のキー処理。`Esc` で PR 詳細へ戻る。`n`/`p`/`←→` で画像を巡回する
+    /// （境界ではクランプし、循環しない）。
+    fn on_key_image_view(&mut self, key: KeyEvent) -> Command {
+        match key.code {
+            KeyCode::Char('q') => Command::Quit,
+            KeyCode::Char('?') => {
+                self.show_help = true;
+                Command::None
+            }
+            KeyCode::Esc => {
+                self.screen = Screen::PullRequestDetail;
+                self.status = Status::Idle;
+                Command::None
+            }
+            KeyCode::Right | KeyCode::Char('n') => self.next_image(),
+            KeyCode::Left | KeyCode::Char('p') => self.prev_image(),
+            _ => Command::None,
+        }
+    }
+
+    /// 次の画像へ（末尾では何もしない＝クランプ）。
+    fn next_image(&mut self) -> Command {
+        if self.image_index + 1 >= self.image_refs.len() {
+            return Command::None;
+        }
+        self.image_index += 1;
+        self.load_current_image()
+    }
+
+    /// 前の画像へ（先頭では何もしない＝クランプ）。
+    fn prev_image(&mut self) -> Command {
+        if self.image_index == 0 {
+            return Command::None;
+        }
+        self.image_index -= 1;
+        self.load_current_image()
+    }
+
+    /// `image_index` が指す画像を表示する。キャッシュ済みなら即座に反映し、未取得なら
+    /// [`Command::LoadImage`] を発行する。
+    fn load_current_image(&mut self) -> Command {
+        let Some(current) = self.image_refs.get(self.image_index).cloned() else {
+            return Command::None;
+        };
+        if let Some(cached) = self.image_cache.get(&current.url) {
+            self.current_image = Some(cached.clone());
+            self.status = match cached {
+                Ok(_) => Status::Idle,
+                Err(message) => Status::Error(message.clone()),
+            };
+            return Command::None;
+        }
+        let Some(client) = self.client.clone() else {
+            self.status = Status::Error("認証クライアントが未初期化です".to_string());
+            return Command::None;
+        };
+        self.current_image = None;
+        self.status = Status::Loading("画像を取得中…".to_string());
+        Command::LoadImage {
+            client,
+            url: current.url,
         }
     }
 
@@ -4609,6 +4760,218 @@ mod tests {
         let cmd = app.update(Msg::Key(key(KeyCode::Char('o'))));
         assert!(matches!(cmd, Command::None));
         assert!(matches!(app.status, Status::Error(_)));
+    }
+
+    // ---- ImageView（`i`） ----
+
+    /// 本文に画像 2 枚を含む PR の JSON（`make_pr` は `description` を持たないため専用に組む）。
+    fn make_pr_with_images(id: u64) -> PullRequest {
+        let json = format!(
+            r#"{{ "id": {id}, "state": "OPEN",
+                  "description": "見て: ![alt1](https://example.com/a.png) と ![alt2](https://example.com/b.png)",
+                  "participants": [] }}"#
+        );
+        serde_json::from_str(&json).expect("valid pr json")
+    }
+
+    #[test]
+    fn detail_i_with_images_and_supported_terminal_opens_image_view_and_loads_first() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequestDetail;
+        app.current_pr = Some(make_pr_with_images(1));
+        app.image_font_size = Some((10, 20));
+
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('i'))));
+
+        assert_eq!(app.screen, Screen::ImageView);
+        assert_eq!(app.image_index, 0);
+        assert_eq!(app.image_refs.len(), 2);
+        match cmd {
+            Command::LoadImage { url, .. } => assert_eq!(url, "https://example.com/a.png"),
+            other => panic!("expected LoadImage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detail_i_without_images_reports_error_and_stays_on_detail() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequestDetail;
+        app.current_pr = Some(make_pr(30, "OPEN"));
+        app.image_font_size = Some((10, 20));
+
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('i'))));
+
+        assert_eq!(app.screen, Screen::PullRequestDetail);
+        assert!(matches!(cmd, Command::None));
+        match &app.status {
+            Status::Error(message) => assert!(message.contains("画像がありません")),
+            other => panic!("expected Status::Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detail_i_with_images_but_unsupported_terminal_reports_guidance() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequestDetail;
+        app.current_pr = Some(make_pr_with_images(2));
+        app.image_font_size = None; // 端末検出失敗（Picker 無し）を模す。
+
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('i'))));
+
+        assert_eq!(app.screen, Screen::PullRequestDetail);
+        assert!(matches!(cmd, Command::None));
+        match &app.status {
+            Status::Error(message) => assert!(message.contains("未対応")),
+            other => panic!("expected Status::Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_view_n_and_right_advance_and_clamp_at_last() {
+        let mut app = review_app();
+        app.screen = Screen::ImageView;
+        app.image_refs = vec![
+            ImageRef {
+                alt: "a".to_string(),
+                url: "https://example.com/a.png".to_string(),
+            },
+            ImageRef {
+                alt: "b".to_string(),
+                url: "https://example.com/b.png".to_string(),
+            },
+        ];
+        app.image_index = 0;
+
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('n'))));
+        assert_eq!(app.image_index, 1);
+        assert!(matches!(cmd, Command::LoadImage { .. }));
+
+        // 末尾でさらに次へ進もうとしても何も起きない（境界クランプ）。
+        let cmd = app.update(Msg::Key(key(KeyCode::Right)));
+        assert_eq!(app.image_index, 1);
+        assert!(matches!(cmd, Command::None));
+    }
+
+    #[test]
+    fn image_view_p_and_left_go_back_and_clamp_at_first() {
+        let mut app = review_app();
+        app.screen = Screen::ImageView;
+        app.image_refs = vec![
+            ImageRef {
+                alt: "a".to_string(),
+                url: "https://example.com/a.png".to_string(),
+            },
+            ImageRef {
+                alt: "b".to_string(),
+                url: "https://example.com/b.png".to_string(),
+            },
+        ];
+        app.image_index = 1;
+
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('p'))));
+        assert_eq!(app.image_index, 0);
+        assert!(matches!(cmd, Command::LoadImage { .. }));
+
+        // 先頭でさらに前へ戻ろうとしても何も起きない（境界クランプ）。
+        let cmd = app.update(Msg::Key(key(KeyCode::Left)));
+        assert_eq!(app.image_index, 0);
+        assert!(matches!(cmd, Command::None));
+    }
+
+    #[test]
+    fn image_view_esc_returns_to_pull_request_detail() {
+        let mut app = review_app();
+        app.screen = Screen::ImageView;
+        let cmd = app.update(Msg::Key(key(KeyCode::Esc)));
+        assert_eq!(app.screen, Screen::PullRequestDetail);
+        assert!(matches!(cmd, Command::None));
+    }
+
+    /// テスト用の最小限の PNG バイト列（1x1px 不透明赤）。
+    fn tiny_png_bytes() -> Vec<u8> {
+        let image = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::from(image)
+            .write_to(&mut buffer, image::ImageFormat::Png)
+            .expect("PNG エンコードに成功すること");
+        buffer.into_inner()
+    }
+
+    #[test]
+    fn image_loaded_with_valid_bytes_decodes_and_updates_current_image() {
+        let mut app = review_app();
+        app.screen = Screen::ImageView;
+        app.image_refs = vec![ImageRef {
+            alt: "a".to_string(),
+            url: "https://example.com/a.png".to_string(),
+        }];
+        app.image_index = 0;
+
+        app.update(Msg::ImageLoaded {
+            url: "https://example.com/a.png".to_string(),
+            result: Ok(tiny_png_bytes()),
+        });
+
+        let image = app
+            .current_image
+            .as_ref()
+            .expect("current_image が Some であること")
+            .as_ref()
+            .expect("デコード成功");
+        assert_eq!((image.width(), image.height()), (1, 1));
+        assert_eq!(app.status, Status::Idle);
+    }
+
+    #[test]
+    fn image_loaded_with_corrupt_bytes_sets_error_without_panicking() {
+        let mut app = review_app();
+        app.screen = Screen::ImageView;
+        app.image_refs = vec![ImageRef {
+            alt: "a".to_string(),
+            url: "https://example.com/a.png".to_string(),
+        }];
+        app.image_index = 0;
+
+        app.update(Msg::ImageLoaded {
+            url: "https://example.com/a.png".to_string(),
+            result: Ok(b"not a real image".to_vec()),
+        });
+
+        assert!(app.current_image.as_ref().expect("Some").is_err());
+        assert!(matches!(app.status, Status::Error(_)));
+    }
+
+    #[test]
+    fn image_loaded_for_stale_url_is_ignored_but_cache_still_updates() {
+        let mut app = review_app();
+        app.screen = Screen::ImageView;
+        app.image_refs = vec![
+            ImageRef {
+                alt: "a".to_string(),
+                url: "https://example.com/a.png".to_string(),
+            },
+            ImageRef {
+                alt: "b".to_string(),
+                url: "https://example.com/b.png".to_string(),
+            },
+        ];
+        // ユーザーは既に 2 枚目へ進んでいるが、1 枚目（古い URL）の応答が遅れて届く想定。
+        app.image_index = 1;
+        app.current_image = None;
+
+        app.update(Msg::ImageLoaded {
+            url: "https://example.com/a.png".to_string(),
+            result: Ok(tiny_png_bytes()),
+        });
+
+        // 現在表示中（2 枚目）の状態は上書きされない。
+        assert!(app.current_image.is_none());
+
+        // ただしキャッシュには反映されるため、1 枚目へ戻れば再取得せず即表示できる。
+        app.image_index = 0;
+        let cmd = app.load_current_image();
+        assert!(matches!(cmd, Command::None));
+        assert!(app.current_image.as_ref().expect("Some").is_ok());
     }
 
     #[test]

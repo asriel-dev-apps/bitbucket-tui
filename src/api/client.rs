@@ -468,6 +468,47 @@ impl BitbucketClient {
         self.send_get_text(url).await
     }
 
+    /// PR 本文の画像 URL から生バイトを取得する（認証付き Basic、リダイレクトは reqwest の
+    /// 既定ポリシーで追従する）。
+    ///
+    /// `max_bytes` を超える場合は拒否する（`Content-Length` があれば受信前に、無ければ受信後の
+    /// 実サイズで判定する）。
+    pub async fn get_image_bytes(&self, url: &str, max_bytes: usize) -> Result<Vec<u8>, ApiError> {
+        let response = self
+            .http
+            .get(url)
+            .basic_auth(&self.email, Some(&self.token))
+            .send()
+            .await
+            .map_err(|error| ApiError::Network(error.to_string()))?;
+
+        if !response.status().is_success() {
+            return Err(response_to_error(response).await);
+        }
+
+        if let Some(length) = response.content_length()
+            && length as usize > max_bytes
+        {
+            return Err(ApiError::Decode(format!(
+                "画像が大きすぎます（{length} bytes、上限 {max_bytes} bytes）"
+            )));
+        }
+
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| ApiError::Network(error.to_string()))?;
+
+        if bytes.len() > max_bytes {
+            return Err(ApiError::Decode(format!(
+                "画像が大きすぎます（{} bytes、上限 {max_bytes} bytes）",
+                bytes.len()
+            )));
+        }
+
+        Ok(bytes.to_vec())
+    }
+
     /// ページングエンドポイントを `next` に従って全ページ集約する。
     ///
     /// 初回リクエストにのみ `query` を適用する。2 ページ目以降は Bitbucket が返す

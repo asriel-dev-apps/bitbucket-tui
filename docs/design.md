@@ -6,6 +6,7 @@
 - **v0.1.2 (2026-07-10)**: M2 実装に合わせ画面遷移を更新(`Pipelines`→`PipelineDetail`→`StepLog` を追加、`Repositories` から `p`、`PullRequests` から `P` で入る。stop/re-run は確認モーダル、進行中は自動ポーリング更新)。詳細は `specs/M2.md` / `LEDGER.md`。
 - **v0.1.3 (2026-07-10)**: M3 実装に合わせ画面遷移を更新(`Branches`→`Commits`→`CommitDetail`→`Diff`(流用) / `Source`→`FileView` を追加、`Repositories`/`PullRequests` から `b`=Branches・`s`=Source。commit diff は M1 の Diff、FileView は M2 の logview を流用。閲覧専用)。**ロードマップ M0〜M3 すべて実装完了**。詳細は `specs/M3.md` / `LEDGER.md`。
 - **v0.1.4 (2026-07-10)**: M4(差分レビュー強化)実装。Diff 画面に現在行カーソル(`↑↓/jk`/`Shift+J/K`/`PgUp/PgDn`/`g/G`/`n/N` が「現在行」を動かし自動スクロール、ハイライト+位置表示)を追加し、PR 差分のみ `c` でインラインコメント投稿(`Ctrl+S` 送信/`Esc` 取消。コミット差分では拒否)を実装。詳細は `LEDGER.md`(M4 実装メモ)。
+- **v0.1.5 (2026-07-11)**: PR 本文の画像をターミナル内に表示する `Screen::ImageView` を追加(PR 詳細で `i`、`n`/`p`/`←→` で巡回、`Esc` で戻る)。`ratatui-image` のネイティブ画像プロトコル(Sixel/Kitty/iTerm2)は本クレートの `ratatui`(0.29)と非互換なバージョン(`^0.30.1`)へ依存するため採用できず、`image` クレート(新規追加)によるデコード+自前のハーフブロック(`▀`/`▄`)描画で代替した。詳細は `LEDGER.md`(画像表示 実装メモ)。
 
 ---
 
@@ -80,6 +81,11 @@ M3 実装済み(2026-07-10)。`Repositories`/`PullRequests` で `b`=Branches・`
 のルート)。`Branches`→`Commits`→`CommitDetail`→`Diff`(M1 の Diff ビューアを流用、`Esc` で戻り先を
 出し分け) / `Source`(ディレクトリ潜行・親戻り)→`FileView`(M2 の logview ページャを流用、
 バイナリ/巨大は代替表示)を追加。閲覧専用。詳細は `docs/specs/M3.md` を参照。**M0〜M3 完了**。
+
+画像表示 実装済み(2026-07-11)。`PullRequestDetail` で `i`=ImageView（本文の `![alt](url)` 画像を
+`n`/`p`/`←→` で巡回表示、`Esc` で `PullRequestDetail` へ戻る）を追加。`ratatui-image` のネイティブ
+画像プロトコルはバージョン非互換のため使わず、自前のハーフブロック描画で代替。詳細は
+`LEDGER.md`(画像表示 実装メモ)を参照。
 
 ## 5. マイルストーン
 
