@@ -21,14 +21,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 base64 = "0.22"
 tui-markdown = "0.3.8"
-ratatui-image = { version = "11.0.6", default-features = false, features = ["image-defaults", "crossterm"] }
+ratatui-image = "8.1.1"
 nucleo-matcher = "0.3.1"
-# ratatui-image が内部で使う ratatui のバージョン（^0.30.1）は本クレートの ratatui（0.29）と
-# 互換性が無く（`cargo tree` で別インスタンスとして解決される）、StatefulImage/Image ウィジェット
-# は直接使えない（詳細は src/tui/imageview.rs 冒頭のコメント）。そのため画像デコード用途のみに
-# `image` を名前付き依存として追加する（版・feature は vendor/image/Cargo.toml の 0.25.10 に一致。
-# ratatui-image の `image-defaults` feature が既に `image/default` を有効化しているため、この追加
-# 自体は解決される features を増減させない＝offline のまま `cargo build --offline` が通る）。
+# ratatui-image は 8.1.1 に固定する（ratatui 0.29 互換の最新版。9.0 以降は内部 ratatui が
+# ^0.30 になり本クレートの ratatui と型非互換＝StatefulImage が使えなくなる。本体の ratatui を
+# 0.30 系へ上げるときに合わせて更新する）。`image` は画像デコード（取得 bytes → DynamicImage）を
+# 本クレートから直接呼ぶための名前付き依存（版は vendor 済みの 0.25.10 に一致。ratatui-image の
+# `image-defaults` feature が既に `image/default` を有効化しているため、この追加は解決される
+# features を増減させない＝offline のまま `cargo build --offline` が通る）。
 image = { version = "0.25.10", default-features = false, features = [
     "png",
     "jpeg",

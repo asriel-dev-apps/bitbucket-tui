@@ -11,6 +11,8 @@ use nucleo_matcher::{Matcher, Utf32Str};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Line;
 use ratatui::widgets::ListState;
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::StatefulProtocol;
 
 use crate::api::{
     ApiError, BitbucketClient, Branch, Comment, CommentSide, Commit, DiffStatEntry, ListSort,
@@ -1173,12 +1175,15 @@ pub struct App {
     pub current_image: Option<Result<DynamicImage, String>>,
     /// 画像のデコード結果キャッシュ（キー = URL）。同一 URL の再取得を避ける（上限あり）。
     pub image_cache: RevisitCache<String, Result<DynamicImage, String>>,
-    /// 起動時に検出したこの端末のフォントピクセルサイズ（`(width, height)`）。
-    /// `ratatui_image::picker::Picker::from_query_stdio` の検出結果を `main.rs` が起動時に
-    /// 一度だけ設定する。`None` は検出失敗＝画像表示機能を無効化する
-    /// （`src/tui/imageview.rs` 冒頭のコメント参照: ネイティブ画像プロトコルではなく自前の
-    /// ハーフブロック描画を使うため、フォントサイズはアスペクト比の補正にのみ使う）。
-    pub image_font_size: Option<(u16, u16)>,
+    /// 起動時に検出したこの端末向けの `ratatui_image::picker::Picker`。
+    /// `Picker::from_query_stdio` の検出結果を `main.rs` が起動時に一度だけ設定する。
+    /// `None` は検出失敗＝画像表示機能を無効化する。
+    pub image_picker: Option<Picker>,
+    /// 現在表示中の画像の `StatefulImage` 描画状態（`ratatui_image::protocol::StatefulProtocol`）。
+    /// `current_image` が `Ok` かつ `image_picker` が `Some` のときのみ
+    /// `Picker::new_resize_protocol` で生成する（[`App::set_current_image`]）。実際のリサイズ・
+    /// エンコードは描画時（`ui::render_image_view` の `StatefulImage`）に遅延される。
+    pub image_protocol: Option<StatefulProtocol>,
 }
 
 /// PR 詳細本文の固定ヘッダ行数（`ui::render_pr_meta_body` が積む先頭 4 行:
@@ -1286,7 +1291,8 @@ impl App {
             image_index: 0,
             current_image: None,
             image_cache: RevisitCache::default(),
-            image_font_size: None,
+            image_picker: None,
+            image_protocol: None,
         }
     }
 
@@ -1648,11 +1654,7 @@ impl App {
                         .get(self.image_index)
                         .is_some_and(|current| current.url == url)
                 {
-                    self.current_image = Some(decoded.clone());
-                    self.status = match &decoded {
-                        Ok(_) => Status::Idle,
-                        Err(message) => Status::Error(message.clone()),
-                    };
+                    self.set_current_image(decoded);
                 }
                 Command::None
             }
@@ -2625,7 +2627,7 @@ impl App {
     /// PR 本文の画像一覧から ImageView を開く（`i`）。
     ///
     /// 本文に画像が無ければ Status にエラーを出す。画像表示機能が無効
-    /// （`image_font_size` が `None` ＝起動時の端末検出に失敗）な環境では、その旨を案内し
+    /// （`image_picker` が `None` ＝起動時の端末検出に失敗）な環境では、その旨を案内し
     /// ImageView へは遷移しない（アプリは落ちない）。
     fn open_image_view(&mut self) -> Command {
         let Some(pr) = self.current_pr.as_ref() else {
@@ -2640,7 +2642,7 @@ impl App {
             self.status = Status::Error("本文に画像がありません".to_string());
             return Command::None;
         }
-        if self.image_font_size.is_none() {
+        if self.image_picker.is_none() {
             self.status =
                 Status::Error("この端末は画像表示に未対応です（o でブラウザ表示）".to_string());
             return Command::None;
@@ -2648,6 +2650,7 @@ impl App {
         self.image_refs = refs;
         self.image_index = 0;
         self.current_image = None;
+        self.image_protocol = None;
         self.screen = Screen::ImageView;
         self.load_current_image()
     }
@@ -2696,12 +2699,8 @@ impl App {
         let Some(current) = self.image_refs.get(self.image_index).cloned() else {
             return Command::None;
         };
-        if let Some(cached) = self.image_cache.get(&current.url) {
-            self.current_image = Some(cached.clone());
-            self.status = match cached {
-                Ok(_) => Status::Idle,
-                Err(message) => Status::Error(message.clone()),
-            };
+        if let Some(cached) = self.image_cache.get(&current.url).cloned() {
+            self.set_current_image(cached);
             return Command::None;
         }
         let Some(client) = self.client.clone() else {
@@ -2709,11 +2708,30 @@ impl App {
             return Command::None;
         };
         self.current_image = None;
+        self.image_protocol = None;
         self.status = Status::Loading("画像を取得中…".to_string());
         Command::LoadImage {
             client,
             url: current.url,
         }
+    }
+
+    /// 現在表示中の画像結果を `current_image`/`image_protocol`/`status` へ反映する
+    /// （[`Msg::ImageLoaded`] とキャッシュ即時ヒットの双方から呼ぶ共通処理）。
+    ///
+    /// デコード成功（`Ok`）かつ `image_picker` が利用可能な場合のみ、
+    /// `Picker::new_resize_protocol` で描画用の `StatefulProtocol` を新規生成する
+    /// （生成自体は軽量で、実際のリサイズ・エンコードは描画時に遅延される）。
+    fn set_current_image(&mut self, result: Result<DynamicImage, String>) {
+        self.image_protocol = match (&result, self.image_picker.as_ref()) {
+            (Ok(image), Some(picker)) => Some(picker.new_resize_protocol(image.clone())),
+            _ => None,
+        };
+        self.status = match &result {
+            Ok(_) => Status::Idle,
+            Err(message) => Status::Error(message.clone()),
+        };
+        self.current_image = Some(result);
     }
 
     /// 現在の PR をデフォルトブラウザで開く（macOS の `open` コマンドを子プロセスで起動）。
@@ -4779,7 +4797,7 @@ mod tests {
         let mut app = review_app();
         app.screen = Screen::PullRequestDetail;
         app.current_pr = Some(make_pr_with_images(1));
-        app.image_font_size = Some((10, 20));
+        app.image_picker = Some(Picker::from_fontsize((10, 20)));
 
         let cmd = app.update(Msg::Key(key(KeyCode::Char('i'))));
 
@@ -4797,7 +4815,7 @@ mod tests {
         let mut app = review_app();
         app.screen = Screen::PullRequestDetail;
         app.current_pr = Some(make_pr(30, "OPEN"));
-        app.image_font_size = Some((10, 20));
+        app.image_picker = Some(Picker::from_fontsize((10, 20)));
 
         let cmd = app.update(Msg::Key(key(KeyCode::Char('i'))));
 
@@ -4814,7 +4832,7 @@ mod tests {
         let mut app = review_app();
         app.screen = Screen::PullRequestDetail;
         app.current_pr = Some(make_pr_with_images(2));
-        app.image_font_size = None; // 端末検出失敗（Picker 無し）を模す。
+        app.image_picker = None; // 端末検出失敗（Picker 無し）を模す。
 
         let cmd = app.update(Msg::Key(key(KeyCode::Char('i'))));
 
@@ -4906,6 +4924,7 @@ mod tests {
             url: "https://example.com/a.png".to_string(),
         }];
         app.image_index = 0;
+        app.image_picker = Some(Picker::from_fontsize((10, 20)));
 
         app.update(Msg::ImageLoaded {
             url: "https://example.com/a.png".to_string(),
@@ -4920,6 +4939,30 @@ mod tests {
             .expect("デコード成功");
         assert_eq!((image.width(), image.height()), (1, 1));
         assert_eq!(app.status, Status::Idle);
+        // デコード成功 + Picker あり → 描画用 StatefulProtocol が生成される。
+        assert!(app.image_protocol.is_some());
+    }
+
+    #[test]
+    fn image_loaded_without_picker_decodes_but_leaves_protocol_none() {
+        // 端末検出に失敗した環境（`image_picker == None`）でも `open_image_view` 側でガードして
+        // いるため通常は到達しないが、念のため防御的に protocol 生成をスキップすることを確認する。
+        let mut app = review_app();
+        app.screen = Screen::ImageView;
+        app.image_refs = vec![ImageRef {
+            alt: "a".to_string(),
+            url: "https://example.com/a.png".to_string(),
+        }];
+        app.image_index = 0;
+        app.image_picker = None;
+
+        app.update(Msg::ImageLoaded {
+            url: "https://example.com/a.png".to_string(),
+            result: Ok(tiny_png_bytes()),
+        });
+
+        assert!(app.current_image.as_ref().expect("Some").is_ok());
+        assert!(app.image_protocol.is_none());
     }
 
     #[test]
@@ -4931,6 +4974,7 @@ mod tests {
             url: "https://example.com/a.png".to_string(),
         }];
         app.image_index = 0;
+        app.image_picker = Some(Picker::from_fontsize((10, 20)));
 
         app.update(Msg::ImageLoaded {
             url: "https://example.com/a.png".to_string(),
@@ -4939,6 +4983,8 @@ mod tests {
 
         assert!(app.current_image.as_ref().expect("Some").is_err());
         assert!(matches!(app.status, Status::Error(_)));
+        // デコード失敗時は Picker があっても protocol は作らない。
+        assert!(app.image_protocol.is_none());
     }
 
     #[test]
@@ -4958,6 +5004,7 @@ mod tests {
         // ユーザーは既に 2 枚目へ進んでいるが、1 枚目（古い URL）の応答が遅れて届く想定。
         app.image_index = 1;
         app.current_image = None;
+        app.image_picker = Some(Picker::from_fontsize((10, 20)));
 
         app.update(Msg::ImageLoaded {
             url: "https://example.com/a.png".to_string(),
@@ -4966,12 +5013,15 @@ mod tests {
 
         // 現在表示中（2 枚目）の状態は上書きされない。
         assert!(app.current_image.is_none());
+        assert!(app.image_protocol.is_none());
 
         // ただしキャッシュには反映されるため、1 枚目へ戻れば再取得せず即表示できる。
         app.image_index = 0;
         let cmd = app.load_current_image();
         assert!(matches!(cmd, Command::None));
         assert!(app.current_image.as_ref().expect("Some").is_ok());
+        // キャッシュ即時反映（`load_current_image`）でも protocol は再生成される。
+        assert!(app.image_protocol.is_some());
     }
 
     #[test]

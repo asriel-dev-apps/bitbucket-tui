@@ -81,37 +81,34 @@ async fn run_tui() -> Result<()> {
     let mut app = App::new(config, client);
 
     let mut terminal = tui::Tui::init()?;
-    // 画像表示機能向けの端末フォントサイズ検出（`ratatui_image::picker::Picker`）は、
-    // raw mode + alternate screen に入った直後・入力読み取りスレッド開始前の今ここで
-    // 一度だけ行う（`tui::run` が内部で stdin を占有する専用スレッドを起動するため、
-    // それより後に呼ぶと標準入力の読み取りが競合する）。検出に失敗しても（`None`）
-    // アプリは落とさず、画像表示機能だけを無効化する（`App::image_font_size`）。
-    app.image_font_size = detect_image_font_size();
+    // 画像表示機能向けの `Picker`（`ratatui_image::picker::Picker`）生成は、raw mode +
+    // alternate screen に入った直後・入力読み取りスレッド開始前の今ここで一度だけ行う
+    // （`tui::run` が内部で stdin を占有する専用スレッドを起動するため、それより後に呼ぶと
+    // 標準入力の読み取りが競合する）。`Picker::from_query_stdio` は端末へ問い合わせの
+    // エスケープシーケンスを送受信して画像プロトコル（Sixel/Kitty/iTerm2/ハーフブロック）と
+    // フォントサイズを検出する。検出に失敗しても（`None`）アプリは落とさず、画像表示機能だけを
+    // 無効化する（`App::image_picker`）。
+    app.image_picker = detect_image_picker();
     // ガード（terminal）は Drop で端末を復元するため、途中エラーでも安全。
     let result = tui::run(&mut terminal, app).await;
     drop(terminal);
     result
 }
 
-/// 画像表示機能向けにこの端末のフォントピクセルサイズを検出する。
+/// 画像表示機能向けにこの端末が使う `ratatui_image::picker::Picker` を検出する。
 ///
-/// `ratatui_image::picker::Picker::from_query_stdio` は端末へ問い合わせのエスケープシーケンス
-/// を送受信するため、raw mode + alternate screen へ入った後・イベントループの入力スレッド
-/// 開始前に呼ぶ必要がある（呼び出し元の [`run_tui`] のコメント参照）。検出に失敗した場合は
-/// `None` を返し、呼び出し側は画像表示機能を無効化する（アプリは落ちない）。
+/// `Picker::from_query_stdio` は端末へ問い合わせのエスケープシーケンスを送受信するため、
+/// raw mode + alternate screen へ入った後・イベントループの入力スレッド開始前に呼ぶ必要がある
+/// （呼び出し元の [`run_tui`] のコメント参照）。検出に失敗した場合は `None` を返し、呼び出し側は
+/// 画像表示機能を無効化する（アプリは落ちない）。
 ///
-/// 実際のピクセル→端末セル変換（Sixel/Kitty/iTerm2 等のネイティブ画像プロトコル）は使わない
-/// （`ratatui_image` 側の `ratatui`（0.30 系）が本クレートの `ratatui`（0.29）と型として
-/// 非互換なため。詳細は `src/tui/imageview.rs` 冒頭のコメント）。ここで使うのは
-/// `Picker::font_size()` のみで、これは `ratatui_image` 自身の `FontSize`（プレーンな
-/// `u16` フィールド）を返すためクレート境界の問題を起こさない。
-fn detect_image_font_size() -> Option<(u16, u16)> {
-    ratatui_image::picker::Picker::from_query_stdio()
-        .ok()
-        .map(|picker| {
-            let size = picker.font_size();
-            (size.width, size.height)
-        })
+/// 生成した `Picker` は `App::image_picker` として保持し、`i` キーで画像を開くたびに
+/// `Picker::new_resize_protocol` で `StatefulProtocol` を作る（`src/tui/app.rs` 参照）。
+/// 端末が画像プロトコル（Sixel/Kitty/iTerm2）に対応していなければ `ratatui-image` 自身が
+/// 内蔵のハーフブロック描画へ自動フォールバックするため、この関数側でのフォールバック処理は
+/// 不要（`Picker::from_query_stdio` 自体が失敗した場合のみ `None`）。
+fn detect_image_picker() -> Option<ratatui_image::picker::Picker> {
+    ratatui_image::picker::Picker::from_query_stdio().ok()
 }
 
 /// config の email と Keychain の token から、可能ならクライアントを復元する。

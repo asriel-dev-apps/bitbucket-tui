@@ -14,6 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Clear, HighlightSpacing, List, ListItem, ListState, Padding, Paragraph, Wrap,
 };
+use ratatui_image::StatefulImage;
 
 use crate::api::{
     Branch, Comment, CommentSide, Commit, DiffStatEntry, MergeStrategy, PageInfo, Pipeline,
@@ -24,7 +25,6 @@ use crate::tui::app::{
     PageJumpModal, Screen, SelectList, Status,
 };
 use crate::tui::diff::DiffLineKind;
-use crate::tui::imageview;
 use crate::tui::onboarding::Field;
 use crate::tui::theme::Theme;
 
@@ -1615,10 +1615,11 @@ fn render_file_view(frame: &mut Frame, area: Rect, app: &mut App) {
 
 /// PR 本文内の画像を表示する（`i` で開く ImageView）。
 ///
-/// `ratatui_image` のネイティブ画像プロトコルではなく、`imageview::render_halfblocks` による
-/// 自前のハーフブロック描画を使う（理由は `src/tui/imageview.rs` 冒頭のコメント参照）。
-/// 毎フレーム現在の描画エリアに合わせて再サンプリングするため、端末リサイズに追従する。
-fn render_image_view(frame: &mut Frame, area: Rect, app: &App) {
+/// `ratatui_image`（8.1.1）のネイティブ画像プロトコル（`StatefulImage` + `StatefulProtocol`）で
+/// 描画する。端末が Sixel/Kitty/iTerm2 のいずれにも対応しなければ `ratatui-image` 自身が内蔵の
+/// ハーフブロック描画へ自動フォールバックする。`StatefulImage`（既定 `Resize::Fit`）は毎フレーム
+/// 現在の描画エリアに合わせて再エンコードするため、端末リサイズに追従する。
+fn render_image_view(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = app.theme;
     let Some(current) = app.image_refs.get(app.image_index) else {
         render_placeholder(frame, area, &app.status, "画像がありません", &theme);
@@ -1635,7 +1636,7 @@ fn render_image_view(frame: &mut Frame, area: Rect, app: &App) {
         app.image_refs.len(),
     );
 
-    match app.current_image.as_ref() {
+    match &app.current_image {
         None => {
             let text = if matches!(app.status, Status::Loading(_)) {
                 "読み込み中…"
@@ -1657,14 +1658,26 @@ fn render_image_view(frame: &mut Frame, area: Rect, app: &App) {
             .wrap(Wrap { trim: false });
             frame.render_widget(paragraph, area);
         }
-        Some(Ok(image)) => {
+        Some(Ok(_)) => {
             let block = themed_block(&theme, true).title(title);
             let inner_area = block.inner(area);
             frame.render_widget(block, area);
-            let font_size = app.image_font_size.unwrap_or((10, 20));
-            let lines =
-                imageview::render_halfblocks(image, inner_area.width, inner_area.height, font_size);
-            frame.render_widget(Paragraph::new(lines), inner_area);
+            match app.image_protocol.as_mut() {
+                Some(protocol) => {
+                    frame.render_stateful_widget(StatefulImage::default(), inner_area, protocol);
+                }
+                None => {
+                    // デコードは成功したが描画用 protocol が無い状態（`image_picker` が
+                    // `None`＝起動時の端末検出失敗）。`open_image_view` で事前にガードしている
+                    // ため通常は到達しないが、念のため案内を出す（アプリは落ちない）。
+                    let paragraph = Paragraph::new(Line::from(Span::styled(
+                        "この端末は画像表示に未対応です",
+                        Style::new().dim(),
+                    )))
+                    .alignment(Alignment::Center);
+                    frame.render_widget(paragraph, inner_area);
+                }
+            }
         }
     }
 }
