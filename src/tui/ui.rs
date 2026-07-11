@@ -539,9 +539,15 @@ fn render_pull_request_detail(frame: &mut Frame, area: Rect, app: &mut App) {
     app.detail_viewport = rows[0].height.saturating_sub(2) as usize;
     app.clamp_detail_scroll();
 
-    match app.current_pr.as_ref() {
-        Some(pr) => render_pr_meta_body(frame, rows[0], pr, app.detail_scroll, &theme),
-        None => render_placeholder(frame, rows[0], &app.status, "PR を選択してください", &theme),
+    if let Some(pr) = app.current_pr.as_ref() {
+        let body_line_count = render_pr_meta_body(frame, rows[0], pr, app.detail_scroll, &theme);
+        // `tui_markdown` は入力行数と出力行数が一致しないため、実際に描画した行数を
+        // `App::detail_body_line_count` へ書き戻す（`detail_viewport` と同じ「ui が毎フレーム
+        // 更新する」パターン）。次回以降のスクロール clamp（`PageDown`/`Shift+J` 等）はこの値を
+        // 使う。
+        app.detail_body_rendered_lines = Some(body_line_count);
+    } else {
+        render_placeholder(frame, rows[0], &app.status, "PR を選択してください", &theme);
     }
 
     let bottom =
@@ -550,13 +556,15 @@ fn render_pull_request_detail(frame: &mut Frame, area: Rect, app: &mut App) {
     render_comments(frame, bottom[1], &app.comments, &theme);
 }
 
+/// PR 詳細本文ペインを描画し、本文（Markdown）の実際の描画行数を返す
+/// （`App::detail_body_rendered_lines` へ書き戻すために呼び出し元が使う）。
 fn render_pr_meta_body(
     frame: &mut Frame,
     area: Rect,
     pr: &PullRequest,
     scroll: u16,
     theme: &Theme,
-) {
+) -> usize {
     let mut lines = vec![
         Line::from(vec![
             Span::styled(
@@ -599,10 +607,12 @@ fn render_pr_meta_body(
     lines.extend(participant_panel_lines(pr, theme));
     lines.push(Line::raw(""));
 
-    match pr.body() {
-        Some(body) => lines.extend(render_markdown_lines(body, theme)),
-        None => lines.push(Line::from(Span::styled("（本文なし）", Style::new().dim()))),
-    }
+    let body_lines = match pr.body() {
+        Some(body) => render_markdown_lines(body),
+        None => vec![Line::from(Span::styled("（本文なし）", Style::new().dim()))],
+    };
+    let body_line_count = body_lines.len();
+    lines.extend(body_lines);
 
     // 複数ペイン画面: 本文は静的な表示ペインなので非フォーカス（下の変更ファイル一覧が
     // インタラクティブな主ペイン）。
@@ -611,6 +621,7 @@ fn render_pr_meta_body(
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     frame.render_widget(paragraph, area);
+    body_line_count
 }
 
 /// 承認/変更要求パネル（承認者・変更要求者の表示名を 1 行ずつ）。
@@ -636,104 +647,118 @@ fn participant_panel_lines(pr: &PullRequest, theme: &Theme) -> Vec<Line<'static>
     lines
 }
 
-/// PR 本文の簡易 Markdown 整形（フルパーサ不要・行頭記号ベース）。
+/// PR 本文・コメント本文の Markdown を [`tui_markdown`] で描画する。
 ///
-/// - 見出し（`#`〜`######` + 半角スペース）: `theme.accent` 太字。
-/// - 箇条書き（`-`/`*` + 半角スペース、インデント可）: 記号のみ `theme.accent`。
-/// - コードフェンス（\`\`\`）で囲まれた行・インライン `` `code` ``: `theme.muted`。
-/// - 画像記法 `![alt](url)`: TUI では表示できないため `[画像: alt]（o でブラウザ表示）`
-///   という代替テキストに置換する（画像本体は非対応）。
+/// 画像記法 `![alt](url)` は事前に（コードフェンス内を除いて）`[画像: alt]（o でブラウザ
+/// 表示）` という代替テキストへ置換してから `tui_markdown::from_str` へ渡す（TUI では画像を
+/// 描画できないため。将来インライン画像表示を実装した際の非対応端末フォールバックとしても
+/// この置換は残す）。
 ///
-/// 1 入力行 = 1 出力行を維持する（`App::detail_body_line_count` の行数計算と対応させるため、
-/// 行の増減を伴う変換はしない）。
-fn render_markdown_lines(body: &str, theme: &Theme) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
+/// `tui_markdown` は入力行数と出力行数が一致しない（見出し前後の空行挿入・ソフト改行の結合等）
+/// ため、呼び出し元は返り値の `len()` を実際の描画行数として扱うこと
+/// （PR 本文側は [`App::detail_body_rendered_lines`] への書き戻しに使う）。
+fn render_markdown_lines(body: &str) -> Vec<Line<'static>> {
+    let with_placeholders = replace_image_syntax_outside_code_fences(body);
+    convert_markdown_text(&with_placeholders)
+}
+
+/// 画像記法をコードフェンス（\`\`\`で囲まれた範囲）の外側だけ [`replace_image_syntax`] で
+/// 置換する（コードブロック内の `![...]()` はそのまま保持する）。
+fn replace_image_syntax_outside_code_fences(body: &str) -> String {
     let mut in_code_block = false;
-    for raw in body.lines() {
-        let trimmed_start = raw.trim_start();
-        if trimmed_start.starts_with("```") {
-            in_code_block = !in_code_block;
-            lines.push(Line::from(Span::styled(
-                raw.to_string(),
-                Style::new().fg(theme.muted),
-            )));
-            continue;
-        }
-        if in_code_block {
-            lines.push(Line::from(Span::styled(
-                raw.to_string(),
-                Style::new().fg(theme.muted),
-            )));
-            continue;
-        }
-
-        let replaced = replace_image_syntax(raw);
-
-        if is_heading_line(&replaced) {
-            lines.push(Line::from(Span::styled(
-                replaced,
-                Style::new().fg(theme.accent).bold(),
-            )));
-            continue;
-        }
-
-        if let Some((prefix, rest)) = split_bullet_prefix(&replaced) {
-            let mut spans = vec![Span::styled(prefix, Style::new().fg(theme.accent))];
-            spans.extend(inline_code_spans(&rest, theme));
-            lines.push(Line::from(spans));
-            continue;
-        }
-
-        lines.push(Line::from(inline_code_spans(&replaced, theme)));
-    }
-    lines
+    body.lines()
+        .map(|line| {
+            if line.trim_start().starts_with("```") {
+                in_code_block = !in_code_block;
+                line.to_string()
+            } else if in_code_block {
+                line.to_string()
+            } else {
+                replace_image_syntax(line)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-/// 見出し行か（行頭の空白を除き `#`〜`######` の後に半角スペースまたは行末が続く）。
-fn is_heading_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    let hashes = trimmed.chars().take_while(|&c| c == '#').count();
-    if hashes == 0 || hashes > 6 {
-        return false;
-    }
-    matches!(trimmed.as_bytes().get(hashes), None | Some(b' '))
+/// `tui_markdown::from_str` の出力（`ratatui-core` 版の `Text`）を、本クレートが使う
+/// `ratatui`（0.29 系、`ratatui-core` 分離前の独自型）の `Vec<Line<'static>>` へ変換する。
+///
+/// 両クレートの `Text`/`Line`/`Span`/`Style` はフィールド構成が同一だが型としては別物なので
+/// 直接代入できない。`ratatui-core` は本クレートの直接依存ではなく `tui-markdown` 経由の
+/// 推移的依存のため型を名指しできず、`Color`/`Modifier` は `Display`/`Binary`（`fmt` 経由の
+/// 往復変換）で型名を経由せずに変換する。
+fn convert_markdown_text(body: &str) -> Vec<Line<'static>> {
+    let source = tui_markdown::from_str(body);
+    source
+        .lines
+        .into_iter()
+        .map(|line| {
+            let line_style = convert_markdown_style(
+                line.style.fg,
+                line.style.bg,
+                line.style.add_modifier,
+                line.style.sub_modifier,
+            );
+            let spans: Vec<Span<'static>> = line
+                .spans
+                .into_iter()
+                .map(|span| {
+                    let span_style = convert_markdown_style(
+                        span.style.fg,
+                        span.style.bg,
+                        span.style.add_modifier,
+                        span.style.sub_modifier,
+                    );
+                    Span::styled(span.content.into_owned(), span_style)
+                })
+                .collect();
+            Line::from(spans).style(line_style)
+        })
+        .collect()
 }
 
-/// 箇条書き行を `(先頭の空白+記号+空白, 残りの本文)` に分解する（`-`/`*` のみ対応）。
-fn split_bullet_prefix(line: &str) -> Option<(String, String)> {
-    let indent_len = line.len() - line.trim_start().len();
-    let indent = &line[..indent_len];
-    let rest = &line[indent_len..];
-    if let Some(after) = rest.strip_prefix("- ") {
-        Some((format!("{indent}- "), after.to_string()))
-    } else {
-        rest.strip_prefix("* ")
-            .map(|after| (format!("{indent}* "), after.to_string()))
+/// [`convert_markdown_text`] の一部。`ratatui-core::style::Style` の各フィールド（型を名指し
+/// できないので個別の値として受け取る）を本クレートの `ratatui::style::Style` へ組み立て直す。
+fn convert_markdown_style<C, M>(
+    fg: Option<C>,
+    bg: Option<C>,
+    add_modifier: M,
+    sub_modifier: M,
+) -> Style
+where
+    C: std::fmt::Display,
+    M: std::fmt::Binary,
+{
+    Style {
+        fg: fg.map(convert_markdown_color),
+        bg: bg.map(convert_markdown_color),
+        add_modifier: convert_markdown_modifier(add_modifier),
+        sub_modifier: convert_markdown_modifier(sub_modifier),
+        ..Style::default()
     }
 }
 
-/// インライン `` `code` `` を分割して色分けする（バッククォートの対応が崩れていても
-/// パニックせず、単純な交互トグルとしてフェイルソフトに扱う）。
-fn inline_code_spans(line: &str, theme: &Theme) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let mut in_code = false;
-    for (index, part) in line.split('`').enumerate() {
-        if index > 0 {
-            in_code = !in_code;
-        }
-        if part.is_empty() {
-            continue;
-        }
-        if in_code {
-            spans.push(Span::styled(part.to_string(), Style::new().fg(theme.muted)));
-        } else {
-            spans.push(Span::raw(part.to_string()));
-        }
-    }
-    if spans.is_empty() {
-        spans.push(Span::raw(String::new()));
-    }
-    spans
+/// `ratatui-core::style::Color` → `ratatui::style::Color`（本クレートの直接依存）。
+///
+/// 両者は同一のバリアント集合を持ち、`Display`/`FromStr` の書式も一致している
+/// （named 色はそのまま・`Rgb` は `#RRGGBB`・`Indexed` は数値文字列）ため、文字列往復で
+/// 型名を経由せずロスレスに変換できる。
+///
+/// この関数が生の `Color` を扱うのは `tui-markdown` 自身の配色（見出し・コード・リンク等）を
+/// そのまま持ち込むための型変換であり、本クレートが新たにハードコード色を選んでいるわけでは
+/// ない（`ui` 内の他の色選択は必ず `theme` 経由にすること）。
+fn convert_markdown_color<C: std::fmt::Display>(color: C) -> Color {
+    color.to_string().parse().unwrap_or(Color::Reset)
+}
+
+/// `ratatui-core::style::Modifier` → `ratatui::style::Modifier`。
+///
+/// どちらも同じビットフラグ定義（`bitflags!` 生成の `u16`）なので、`{:b}` で得たビットパターン
+/// をそのまま読み直せば型名を経由せず変換できる。
+fn convert_markdown_modifier<M: std::fmt::Binary>(modifier: M) -> Modifier {
+    let bits = u16::from_str_radix(&format!("{modifier:b}"), 2).unwrap_or(0);
+    Modifier::from_bits_truncate(bits)
 }
 
 /// 画像記法 `![alt](url)` を TUI 向けの代替テキストへ置換する。
@@ -869,8 +894,11 @@ fn render_comments(frame: &mut Frame, area: Rect, comments: &[Comment], theme: &
             ));
         }
         lines.push(Line::from(header));
-        for raw in comment.raw().lines() {
-            lines.push(Line::raw(format!("  {indent}{raw}")));
+        let body_indent = format!("  {indent}");
+        for body_line in render_markdown_lines(comment.raw()) {
+            let mut spans = vec![Span::raw(body_indent.clone())];
+            spans.extend(body_line.spans);
+            lines.push(Line::from(spans).style(body_line.style));
         }
         lines.push(Line::raw(""));
     }
@@ -2629,129 +2657,146 @@ mod tests {
     }
 
     #[test]
-    fn is_heading_line_detects_hash_headings() {
-        assert!(is_heading_line("# Title"));
-        assert!(is_heading_line("## Subtitle"));
-        assert!(is_heading_line("###### Deep"));
-        assert!(is_heading_line("#"));
-        assert!(!is_heading_line("#no-space"));
-        assert!(!is_heading_line("normal text"));
-        assert!(!is_heading_line("####### too many"));
+    fn render_markdown_lines_styles_heading_as_bold_colored_line() {
+        // H2 は `cyan().bold()`（`tui_markdown::DefaultStyleSheet::heading`）。見出しの色/太字は
+        // 行スタイル（`Line::style`）に載る（各スパン自体は無地）。
+        let lines = render_markdown_lines("## Heading");
+        assert_eq!(lines.len(), 1);
+        assert!(line_text(&lines[0]).contains("Heading"));
+        assert!(lines[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(lines[0].style.fg, Some(Color::Cyan));
     }
 
     #[test]
-    fn split_bullet_prefix_splits_dash_and_star_bullets() {
-        let (prefix, rest) = split_bullet_prefix("- item one").expect("bullet");
-        assert_eq!(prefix, "- ");
-        assert_eq!(rest, "item one");
-
-        let (prefix, rest) = split_bullet_prefix("* item two").expect("bullet");
-        assert_eq!(prefix, "* ");
-        assert_eq!(rest, "item two");
+    fn render_markdown_lines_renders_bullet_list_with_inline_code() {
+        let lines = render_markdown_lines("- item `code`");
+        assert_eq!(lines.len(), 1);
+        let text = line_text(&lines[0]);
+        assert!(text.contains("- "));
+        assert!(text.contains("item"));
+        assert!(text.contains("code"));
+        // インラインコードは白地に黒背景（`tui_markdown::DefaultStyleSheet::code`）。
+        let code_span = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "code")
+            .expect("code span present");
+        assert_eq!(code_span.style.fg, Some(Color::White));
+        assert_eq!(code_span.style.bg, Some(Color::Black));
     }
 
     #[test]
-    fn split_bullet_prefix_preserves_leading_indent() {
-        let (prefix, rest) = split_bullet_prefix("  - nested").expect("bullet");
-        assert_eq!(prefix, "  - ");
-        assert_eq!(rest, "nested");
+    fn render_markdown_lines_preserves_code_fence_content() {
+        let lines = render_markdown_lines("```\nlet x = 1;\n```");
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("let x = 1;"));
     }
 
     #[test]
-    fn split_bullet_prefix_returns_none_for_non_bullet_lines() {
-        assert!(split_bullet_prefix("plain text").is_none());
-        assert!(split_bullet_prefix("-no space after dash").is_none());
+    fn render_markdown_lines_replaces_image_syntax_with_placeholder() {
+        let lines = render_markdown_lines("![alt](https://example.com/x.png)");
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("[画像: alt]（o でブラウザ表示）"));
+        // 画像記法そのもの（`![...]`）は残らない。
+        assert!(!text.contains("!["));
     }
 
     #[test]
-    fn inline_code_spans_highlights_backtick_segments() {
-        let theme = Theme::default();
-        let spans = inline_code_spans("use `foo` here", &theme);
-        assert_eq!(
-            spans,
-            vec![
-                Span::raw("use ".to_string()),
-                Span::styled("foo".to_string(), Style::new().fg(theme.muted)),
-                Span::raw(" here".to_string()),
-            ]
-        );
+    fn render_markdown_lines_keeps_image_syntax_verbatim_inside_code_fence() {
+        // コードフェンス内の `![...]()` は画像プレースホルダに置換されず、コード片として
+        // そのまま残る（`replace_image_syntax_outside_code_fences` の契約）。
+        let lines = render_markdown_lines("```\n![alt](u)\n```");
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("![alt](u)"));
     }
 
     #[test]
-    fn inline_code_spans_without_backticks_is_plain_raw() {
-        let theme = Theme::default();
-        let spans = inline_code_spans("plain text", &theme);
-        assert_eq!(spans, vec![Span::raw("plain text".to_string())]);
+    fn render_markdown_lines_multi_block_body_produces_multiple_styled_lines() {
+        // 見出し・箇条書き・コードブロックを含む本文が複数行の styled Text になることを確認する
+        // （tui-markdown は入力行数と出力行数が一致しないため、単純な行数一致ではなく
+        // 「複数行になっている」ことと「各要素の内容が含まれる」ことを検査する）。
+        let body = "# Title\n\n- one\n- two\n\n```\ncode line\n```\n\nplain paragraph";
+        let lines = render_markdown_lines(body);
+        assert!(lines.len() > 4, "got {} lines", lines.len());
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Title"));
+        assert!(text.contains("one"));
+        assert!(text.contains("two"));
+        assert!(text.contains("code line"));
+        assert!(text.contains("plain paragraph"));
     }
 
     #[test]
-    fn render_markdown_lines_styles_heading_bullet_and_image() {
-        let theme = Theme::default();
-        let body = "# Heading\n- item `code`\n![alt](https://example.com/x.png)\nplain";
-        let lines = render_markdown_lines(body, &theme);
-        assert_eq!(lines.len(), 4);
-        assert_eq!(
-            lines[0],
-            Line::from(Span::styled(
-                "# Heading".to_string(),
-                Style::new().fg(theme.accent).bold()
-            ))
-        );
-        assert_eq!(
-            lines[1],
-            Line::from(vec![
-                Span::styled("- ".to_string(), Style::new().fg(theme.accent)),
-                Span::raw("item ".to_string()),
-                Span::styled("code".to_string(), Style::new().fg(theme.muted)),
-            ])
-        );
-        assert_eq!(
-            lines[2],
-            Line::from(vec![Span::raw(
-                "[画像: alt]（o でブラウザ表示）".to_string()
-            )])
-        );
-        assert_eq!(lines[3], Line::from(vec![Span::raw("plain".to_string())]));
-    }
-
-    #[test]
-    fn render_markdown_lines_dims_code_fence_block() {
-        let theme = Theme::default();
-        let body = "before\n```\nlet x = 1;\n```\nafter";
-        let lines = render_markdown_lines(body, &theme);
-        assert_eq!(lines.len(), 5);
-        assert_eq!(
-            lines[1],
-            Line::from(Span::styled(
-                "```".to_string(),
-                Style::new().fg(theme.muted)
-            ))
-        );
-        assert_eq!(
-            lines[2],
-            Line::from(Span::styled(
-                "let x = 1;".to_string(),
-                Style::new().fg(theme.muted)
-            ))
-        );
-        assert_eq!(
-            lines[3],
-            Line::from(Span::styled(
-                "```".to_string(),
-                Style::new().fg(theme.muted)
-            ))
-        );
-    }
-
-    #[test]
-    fn render_markdown_lines_preserves_one_to_one_line_mapping() {
-        let theme = Theme::default();
-        let body = "line1\nline2\nline3";
-        assert_eq!(render_markdown_lines(body, &theme).len(), 3);
+    fn render_markdown_lines_does_not_panic_on_japanese_and_ragged_markdown() {
+        // 日本語テキスト・崩れた画像記法・空文字列で panic しないこと。
+        let _ = render_markdown_lines("");
+        let _ = render_markdown_lines("見出し\n\n- 箇条書き\n\n![壊れた画像記法(url)\n\n> 引用");
+        let _ = render_markdown_lines("![]()");
+        let _ = render_markdown_lines("![alt](");
     }
 
     fn make_pr_with_participants(json: &str) -> PullRequest {
         serde_json::from_str(json).expect("valid pr json")
+    }
+
+    #[test]
+    fn render_pull_request_detail_writes_back_rendered_body_line_count_for_scroll_clamp() {
+        // 本文はソフト改行を含む複数段落（`tui_markdown` は 1 入力行 = 1 出力行を保証しない
+        // ため、素朴な生行数カウントとは異なる行数になる）。実際に描画した行数が
+        // `App::detail_body_rendered_lines` へ書き戻され、`PageDown` 連打で本文末尾に到達すると
+        // スクロールが止まる（無制限に伸び続けない）ことを確認する。
+        use crate::config::Config;
+        use crate::tui::app::Msg;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut paragraphs = Vec::new();
+        for i in 0..30 {
+            paragraphs.push(format!("paragraph {i} line a\nline b"));
+        }
+        let body = paragraphs.join("\n\n");
+        let description = serde_json::to_string(&body).expect("json string");
+        let pr = make_pr_with_participants(&format!(
+            r#"{{ "id": 1, "description": {description}, "participants": [] }}"#
+        ));
+
+        let mut app = App::new(Config::default(), None);
+        app.theme = Theme::default();
+        app.screen = Screen::PullRequestDetail;
+        app.current_pr = Some(pr);
+
+        let backend = TestBackend::new(40, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("first draw succeeds");
+        assert!(
+            app.detail_body_rendered_lines.is_some(),
+            "初回描画で本文の実測行数が書き戻されるべき"
+        );
+
+        for _ in 0..200 {
+            app.update(Msg::Key(KeyEvent::new(
+                KeyCode::PageDown,
+                KeyModifiers::NONE,
+            )));
+            terminal
+                .draw(|frame| render(frame, &mut app))
+                .expect("draw succeeds");
+        }
+        let stabilized = app.detail_scroll;
+
+        // さらに押しても増えない（本文末尾で止まっている）。
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::PageDown,
+            KeyModifiers::NONE,
+        )));
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("draw succeeds");
+        assert_eq!(
+            app.detail_scroll, stabilized,
+            "スクロール上限で止まらず伸び続けている（clamp が破綻している）"
+        );
     }
 
     #[test]

@@ -5,6 +5,8 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Matcher, Utf32Str};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Line;
 use ratatui::widgets::ListState;
@@ -686,14 +688,20 @@ pub enum Command {
 /// 選択（`state`）は常に「`matches` 上の位置」を指す。
 ///
 /// `T: Default` を要求しないよう `Default` は手動実装する。
+///
+/// `matcher` は fuzzy 検索（[`SelectList::set_filter`]）用のスクラッチメモリを再利用するために
+/// 保持する（`nucleo_matcher::Matcher` は生成コストが高いため、フィルタ再計算のたびに作り直さ
+/// ない）。検索を使わない画面（pipelines/branches/commits/source 等）では一度も使われない。
 #[derive(Debug)]
 pub struct SelectList<T> {
     pub items: Vec<T>,
     pub state: ListState,
     /// 検索フィルタ文字列（空ならフィルタなし）。検索を使わない画面では常に空のまま。
     pub filter: String,
-    /// フィルタ通過した `items` のインデックス（表示順）。`ui` の一覧描画はこれを辿る。
+    /// フィルタ通過した `items` のインデックス（表示順、スコア降順）。`ui` の一覧描画はこれを
+    /// 辿る。フィルタが空なら `items` の並び順そのまま（恒等写像）。
     pub matches: Vec<usize>,
+    matcher: Matcher,
 }
 
 impl<T> Default for SelectList<T> {
@@ -703,6 +711,7 @@ impl<T> Default for SelectList<T> {
             state: ListState::default(),
             filter: String::new(),
             matches: Vec::new(),
+            matcher: Matcher::default(),
         }
     }
 }
@@ -761,8 +770,9 @@ impl<T> SelectList<T> {
         self.items = items;
     }
 
-    /// 検索フィルタ文字列を更新し、`key_fn` が返す文字列（大文字小文字は無視）に対する
-    /// 部分一致で `matches` を再計算する。選択位置は新しい `matches` の範囲にクランプする。
+    /// 検索フィルタ文字列を更新し、`key_fn` が返す文字列に対する fuzzy マッチ（大文字小文字は
+    /// 無視、スコア降順）で `matches` を再計算する。選択位置は新しい `matches` の範囲に
+    /// クランプする。
     pub fn set_filter<F>(&mut self, filter: String, key_fn: F)
     where
         F: Fn(&T) -> String,
@@ -771,6 +781,12 @@ impl<T> SelectList<T> {
         self.recompute_matches(key_fn);
     }
 
+    /// `filter` に対する fuzzy マッチで `matches` を再計算する（`nucleo_matcher` 使用）。
+    ///
+    /// 空フィルタは全件（`items` の並び順そのまま）。非空フィルタはスコア > 0 の要素のみを
+    /// スコア降順（同点は `items` の順序を維持する安定ソート）で並べる。大文字小文字は常に
+    /// 無視する（クエリの大文字小文字によらず一貫させるため、既存の `to_lowercase` 部分一致と
+    /// 同じ挙動を保つ）。
     fn recompute_matches<F>(&mut self, key_fn: F)
     where
         F: Fn(&T) -> String,
@@ -778,14 +794,21 @@ impl<T> SelectList<T> {
         if self.filter.is_empty() {
             self.matches = (0..self.items.len()).collect();
         } else {
-            let needle = self.filter.to_lowercase();
-            self.matches = self
+            let pattern = Pattern::parse(&self.filter, CaseMatching::Ignore, Normalization::Smart);
+            let mut buf = Vec::new();
+            let matcher = &mut self.matcher;
+            let mut scored: Vec<(usize, u32)> = self
                 .items
                 .iter()
                 .enumerate()
-                .filter(|(_, item)| key_fn(item).to_lowercase().contains(&needle))
-                .map(|(index, _)| index)
+                .filter_map(|(index, item)| {
+                    let text = key_fn(item);
+                    let haystack = Utf32Str::new(&text, &mut buf);
+                    pattern.score(haystack, matcher).map(|score| (index, score))
+                })
                 .collect();
+            scored.sort_by_key(|&(_, score)| std::cmp::Reverse(score));
+            self.matches = scored.into_iter().map(|(index, _)| index).collect();
         }
         let selection = if self.matches.is_empty() {
             None
@@ -1064,6 +1087,11 @@ pub struct App {
     /// 直近描画時の PR 詳細本文のビューポート高さ（`detail_scroll` の上限計算に使う。
     /// `ui` が毎フレーム更新する。`DiffState::viewport` / `LogView::viewport` と同じ役割）。
     pub detail_viewport: usize,
+    /// 直近描画時の PR 本文（Markdown）の実際の描画行数。`tui_markdown` は入力行数と出力行数が
+    /// 一致しない（見出し前後の空行挿入・ソフト改行の結合等）ため、`ui` が毎フレーム実測して
+    /// 書き戻す（`detail_viewport` と同じパターン）。`None` は「まだ描画していない」を表し、
+    /// その間は [`App::detail_body_line_count`] が本文の生の行数から近似する。
+    pub detail_body_rendered_lines: Option<usize>,
     pub diff: Option<DiffState>,
     pub comment_editor: Option<CommentEditor>,
     pub merge_modal: Option<MergeModal>,
@@ -1192,6 +1220,7 @@ impl App {
             comments: Vec::new(),
             detail_scroll: 0,
             detail_viewport: 0,
+            detail_body_rendered_lines: None,
             diff: None,
             comment_editor: None,
             merge_modal: None,
@@ -2336,11 +2365,19 @@ impl App {
     /// `ui::render_pr_meta_body` が積む行と対応する（折り返し前の行数。`Wrap` による折り返しは
     /// 数えないため、狭い端末では厳密な末尾より手前でクランプされ得るが、無制限スクロールという
     /// バグを防ぐには十分）。
+    ///
+    /// 本文行数は `tui_markdown` による実際の描画結果（[`App::detail_body_rendered_lines`]、
+    /// `ui` が毎フレーム書き戻す）を優先して使う。まだ描画していない場合（画面遷移直後の 1 フレ
+    /// ーム目やユニットテスト等）は、本文の生の行数から近似する（`tui_markdown` はソフト改行の
+    /// 結合や見出し前後の空行挿入により行数が変わるため、この近似値は厳密ではないが、
+    /// 「スクロール上限が無い」バグを防ぐには十分）。
     fn detail_body_line_count(&self) -> usize {
         let Some(pr) = self.current_pr.as_ref() else {
             return 0;
         };
-        let body_lines = pr.body().map_or(1, |body| body.lines().count().max(1));
+        let body_lines = self
+            .detail_body_rendered_lines
+            .unwrap_or_else(|| pr.body().map_or(1, |body| body.lines().count().max(1)));
         PR_DETAIL_HEADER_LINES + participant_panel_line_count(pr) + body_lines
     }
 
@@ -2409,6 +2446,9 @@ impl App {
         self.current_pr = Some(pr.clone());
         self.diff = None;
         self.detail_scroll = 0;
+        // 新しい PR の本文行数はまだ描画していない（前の PR の実測値を持ち越さない）。次回描画
+        // で `ui::render_pr_meta_body` が実測して書き戻すまでは近似値にフォールバックする。
+        self.detail_body_rendered_lines = None;
         self.screen = Screen::PullRequestDetail;
         self.record_recent_pr(pr);
 
@@ -6381,6 +6421,49 @@ diff --git a/two.txt b/two.txt\n\
         assert_eq!(list.matches, vec![0, 1]);
         assert_eq!(list.state.selected(), Some(1)); // 3 件→2 件でクランプ。
         assert_eq!(list.selected(), Some(&20));
+    }
+
+    // ---- fuzzy 検索（nucleo-matcher） ----
+
+    #[test]
+    fn select_list_filter_matches_non_contiguous_fuzzy_subsequence() {
+        // "bktui" は連続部分文字列ではないが、"bitbucket-tui" の中に b→k→t→u→i の順で
+        // （間を飛ばしつつ）部分列として出現するため fuzzy マッチではヒットする
+        // （旧・単純部分一致では絶対にマッチしなかった）。
+        let mut list: SelectList<&str> = SelectList::default();
+        list.set_items(vec!["bitbucket-tui", "unrelated"]);
+        list.set_filter("bktui".to_string(), |s: &&str| s.to_string());
+        assert_eq!(list.matches, vec![0]);
+        assert_eq!(list.selected(), Some(&"bitbucket-tui"));
+    }
+
+    #[test]
+    fn select_list_filter_orders_matches_by_score_descending() {
+        // 先頭一致（"apple"）は途中一致（"pineapple"）よりスコアが高く、先に並ぶ。
+        let mut list: SelectList<&str> = SelectList::default();
+        list.set_items(vec!["pineapple", "apple", "grape"]);
+        list.set_filter("apple".to_string(), |s: &&str| s.to_string());
+        assert_eq!(list.matches, vec![1, 0]);
+    }
+
+    #[test]
+    fn select_list_filter_does_not_panic_on_japanese_and_path_like_candidates() {
+        let mut list: SelectList<&str> = SelectList::default();
+        list.set_items(vec![
+            "ワークスペース一覧",
+            "src/tui/app.rs",
+            "foo/bar/baz.rs",
+            "",
+        ]);
+        // 日本語クエリ。
+        list.set_filter("覧".to_string(), |s: &&str| s.to_string());
+        assert_eq!(list.matches, vec![0]);
+        // パス区切りを含む部分列クエリ（"app.rs" の非英数字を飛ばした部分列）。
+        list.set_filter("apprs".to_string(), |s: &&str| s.to_string());
+        assert_eq!(list.matches, vec![1]);
+        // 空文字列候補や空クエリでも panic しない。
+        list.set_filter(String::new(), |s: &&str| s.to_string());
+        assert_eq!(list.matches, vec![0, 1, 2, 3]);
     }
 
     // ---- Shift+J/K（10 件/10 行移動、#D） ----
