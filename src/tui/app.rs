@@ -3,12 +3,15 @@
 //! bubbletea の `Model`/`Msg`/`Cmd` に相当する構造。`update()` は状態を更新し、副作用を
 //! [`Command`] として返す。実際の非同期実行（API 呼び出しの spawn）は `event` モジュールが行う。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use image::DynamicImage;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Matcher, Utf32Str};
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::widgets::ListState;
 use ratatui_image::picker::Picker;
@@ -25,6 +28,7 @@ use crate::tui::diff::{CommentAnchor, ParsedDiff, parse as parse_diff};
 use crate::tui::imageview::{self, ImageRef};
 use crate::tui::logview::LogView;
 use crate::tui::onboarding::{Field, OnboardingState, TextInput};
+use crate::tui::richdoc::{self, ImagePresentation, LinkPosition};
 use crate::tui::theme::{Theme, ThemeName};
 
 /// 画面種別。
@@ -46,6 +50,122 @@ pub enum Screen {
     FileView,
     /// PR 本文内の画像を表示する画面（PR 詳細から `i`）。
     ImageView,
+}
+
+/// PR 詳細画面でキーボード操作の対象になっているペイン。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DetailFocus {
+    #[default]
+    Overview,
+    Files,
+    Comments,
+}
+
+/// 毎フレーム UI から書き戻されるマウスのヒットテスト対象。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneKind {
+    Overview,
+    ChangedFiles,
+    Comments,
+    DiffFiles,
+    DiffBody,
+    StepLog,
+    FileView,
+    ImageView,
+    Static,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListKind {
+    Workspaces,
+    Repositories,
+    PullRequests,
+    ChangedFiles,
+    Pipelines,
+    PipelineSteps,
+    Branches,
+    Commits,
+    Source,
+    DiffFiles,
+    LinkPalette,
+    JumpPalette,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModalKind {
+    Help,
+    CommentEditor,
+    MergeConfirm,
+    PipelineConfirm,
+    PageJump,
+    LinkPalette,
+    JumpPalette,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListLayout {
+    pub kind: ListKind,
+    pub area: Rect,
+    pub first_visible: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModalLayout {
+    pub kind: ModalKind,
+    pub area: Rect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HintLayout {
+    pub area: Rect,
+    pub key: KeyEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageHit {
+    pub area: Rect,
+    pub url: String,
+}
+
+/// 描画と入力を分離する App 所有のレイアウト表。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AppLayout {
+    pub panes: Vec<(PaneKind, Rect)>,
+    pub lists: Vec<ListLayout>,
+    pub modal: Option<ModalLayout>,
+    pub hints: Vec<HintLayout>,
+    pub overview_content: Option<Rect>,
+    pub overview_images: Vec<ImageHit>,
+}
+
+impl DetailFocus {
+    fn next(self) -> Self {
+        match self {
+            Self::Overview => Self::Files,
+            Self::Files => Self::Comments,
+            Self::Comments => Self::Overview,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            Self::Overview => Self::Comments,
+            Self::Files => Self::Overview,
+            Self::Comments => Self::Files,
+        }
+    }
+}
+
+/// PR 本文・コメントから抽出したブラウザで開けるリンク。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetailLink {
+    pub label: String,
+    pub url: String,
+}
+
+#[derive(Debug, Default)]
+pub struct LinkPalette {
+    pub links: SelectList<DetailLink>,
 }
 
 /// PR 一覧の state フィルタ。
@@ -393,6 +513,8 @@ pub enum Status {
 pub enum Msg {
     /// キー入力。
     Key(KeyEvent),
+    /// フィルタ済みのマウス入力（左押下・ホイールのみ）。
+    Mouse(MouseEvent),
     /// Onboarding の認証検証に成功（`GET /2.0/user`）。
     AuthValidated {
         email: String,
@@ -890,6 +1012,14 @@ impl<T> SelectList<T> {
         self.state.select(Some(prev));
     }
 
+    /// 表示順（`matches` 上）の位置を直接選択する。
+    pub fn select_position(&mut self, position: usize) {
+        if !self.matches.is_empty() {
+            self.state
+                .select(Some(position.min(self.matches.len() - 1)));
+        }
+    }
+
     /// 現在選択中の要素（`matches` 上の位置を `items` のインデックスへ変換して引く）。
     pub fn selected(&self) -> Option<&T> {
         let position = self.state.selected()?;
@@ -1058,6 +1188,8 @@ pub struct App {
     pub theme: Theme,
     /// 現在のテーマ名（`config.theme` の永続化・巡回の起点に使う）。
     pub theme_name: ThemeName,
+    /// 直近描画フレームのペイン・一覧・モーダル・ヒント配置。
+    pub layout: AppLayout,
     pub me: Me,
     pub onboarding: OnboardingState,
     pub workspaces: SelectList<Workspace>,
@@ -1101,15 +1233,21 @@ pub struct App {
     pub pr_detail_cache: RevisitCache<(String, u64), PrDetailCache>,
     pub diffstat: SelectList<DiffStatEntry>,
     pub comments: Vec<Comment>,
+    pub detail_focus: DetailFocus,
     pub detail_scroll: u16,
     /// 直近描画時の PR 詳細本文のビューポート高さ（`detail_scroll` の上限計算に使う。
     /// `ui` が毎フレーム更新する。`DiffState::viewport` / `LogView::viewport` と同じ役割）。
     pub detail_viewport: usize,
-    /// 直近描画時の PR 本文（Markdown）の実際の描画行数。`tui_markdown` は入力行数と出力行数が
-    /// 一致しない（見出し前後の空行挿入・ソフト改行の結合等）ため、`ui` が毎フレーム実測して
-    /// 書き戻す（`detail_viewport` と同じパターン）。`None` は「まだ描画していない」を表し、
-    /// その間は [`App::detail_body_line_count`] が本文の生の行数から近似する。
+    /// 直近描画時の概要リッチドキュメントの仮想高さ（折り返し済み Text 行 + Image 高）。
+    /// `ui` が現在の pane 幅と画像状態から毎フレーム算出して書き戻す。
+    /// `None` は「まだ描画していない」を表し、その間は生の行数から近似する。
     pub detail_body_rendered_lines: Option<usize>,
+    /// 概要リッチドキュメント内のリンク位置（5.4 のヒットテスト用）。
+    /// `ui` が現在の幅・画像高・wrap 結果に合わせて毎フレーム書き戻す。
+    pub overview_link_positions: Vec<LinkPosition>,
+    pub comments_scroll: u16,
+    pub comments_viewport: usize,
+    pub comments_rendered_lines: Option<usize>,
     pub diff: Option<DiffState>,
     pub comment_editor: Option<CommentEditor>,
     pub merge_modal: Option<MergeModal>,
@@ -1165,6 +1303,7 @@ pub struct App {
     pub jump_palette: Option<JumpPaletteState>,
     /// ページ番号ジャンプ（`g`）の入力状態。開いている間は最優先でキー入力を奪う。
     pub page_jump: Option<PageJumpModal>,
+    pub link_palette: Option<LinkPalette>,
     /// 直近開いた PR（新しい順）。ジャンプパレットの候補に使う。
     pub recent_prs: Vec<RecentPr>,
     /// ImageView で表示対象の画像一覧（PR 本文から抽出。`i` キー押下時に確定する）。
@@ -1184,6 +1323,10 @@ pub struct App {
     /// `Picker::new_resize_protocol` で生成する（[`App::set_current_image`]）。実際のリサイズ・
     /// エンコードは描画時（`ui::render_image_view` の `StatefulImage`）に遅延される。
     pub image_protocol: Option<StatefulProtocol>,
+    /// 概要内インライン画像ごとの描画状態（URL キー）。ImageView の状態とは分離する。
+    pub overview_image_protocols: HashMap<String, StatefulProtocol>,
+    /// 概要表示から非同期取得を発行済みで、まだ結果を受け取っていない画像 URL。
+    overview_images_loading: HashSet<String>,
 }
 
 /// PR 詳細本文の固定ヘッダ行数（`ui::render_pr_meta_body` が積む先頭 4 行:
@@ -1203,6 +1346,103 @@ fn participant_panel_line_count(pr: &PullRequest) -> usize {
         lines += 1;
     }
     lines
+}
+
+fn add_signed(value: u16, amount: i32) -> u16 {
+    if amount >= 0 {
+        value.saturating_add(amount.min(u16::MAX as i32) as u16)
+    } else {
+        value.saturating_sub(amount.unsigned_abs().min(u16::MAX as u32) as u16)
+    }
+}
+
+fn rect_contains(area: Rect, point: (u16, u16)) -> bool {
+    point.0 >= area.x
+        && point.0 < area.x.saturating_add(area.width)
+        && point.1 >= area.y
+        && point.1 < area.y.saturating_add(area.height)
+}
+
+fn modal_accepts_list(modal: ModalKind, list: ListKind) -> bool {
+    matches!(
+        (modal, list),
+        (ModalKind::LinkPalette, ListKind::LinkPalette)
+            | (ModalKind::JumpPalette, ListKind::JumpPalette)
+    )
+}
+
+fn batch_or_none(commands: Vec<Command>) -> Command {
+    if commands.is_empty() {
+        Command::None
+    } else {
+        Command::Batch(commands)
+    }
+}
+
+/// Markdown リンクと裸 URL をコードフェンス外から抽出する。画像記法は対象外。
+fn extract_links(markdown: &str, links: &mut Vec<DetailLink>) {
+    let mut in_fence = false;
+    for line in markdown.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+
+        let mut masked = line.to_string();
+        let mut cursor = 0;
+        while let Some(open_rel) = line[cursor..].find('[') {
+            let open = cursor + open_rel;
+            let is_image = open > 0 && line.as_bytes().get(open - 1) == Some(&b'!');
+            let Some(close_rel) = line[open + 1..].find("](") else {
+                cursor = open + 1;
+                continue;
+            };
+            let close = open + 1 + close_rel;
+            let url_start = close + 2;
+            let Some(end_rel) = line[url_start..].find(')') else {
+                cursor = url_start;
+                continue;
+            };
+            let end = url_start + end_rel;
+            let url = &line[url_start..end];
+            if !is_image && is_http_url(url) {
+                push_unique_link(links, &line[open + 1..close], url);
+            }
+            let mask_start = if is_image { open - 1 } else { open };
+            // Spaces prevent the same URL from being found again as a bare URL.
+            masked.replace_range(mask_start..=end, &" ".repeat(end + 1 - mask_start));
+            cursor = end + 1;
+        }
+
+        for token in masked.split_whitespace() {
+            let Some(start) = token.find("http://").or_else(|| token.find("https://")) else {
+                continue;
+            };
+            let url = token[start..].trim_end_matches(|ch: char| {
+                matches!(ch, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}')
+            });
+            if is_http_url(url) {
+                push_unique_link(links, url, url);
+            }
+        }
+    }
+}
+
+fn is_http_url(value: &str) -> bool {
+    value.starts_with("http://") || value.starts_with("https://")
+}
+
+fn push_unique_link(links: &mut Vec<DetailLink>, label: &str, url: &str) {
+    if links.iter().any(|link| link.url == url) {
+        return;
+    }
+    links.push(DetailLink {
+        label: if label.is_empty() { url } else { label }.to_string(),
+        url: url.to_string(),
+    });
 }
 
 impl App {
@@ -1232,6 +1472,7 @@ impl App {
             client,
             theme,
             theme_name,
+            layout: AppLayout::default(),
             me,
             onboarding,
             workspaces: SelectList::default(),
@@ -1253,9 +1494,14 @@ impl App {
             pr_detail_cache: RevisitCache::default(),
             diffstat: SelectList::default(),
             comments: Vec::new(),
+            detail_focus: DetailFocus::default(),
             detail_scroll: 0,
             detail_viewport: 0,
             detail_body_rendered_lines: None,
+            overview_link_positions: Vec::new(),
+            comments_scroll: 0,
+            comments_viewport: 0,
+            comments_rendered_lines: None,
             diff: None,
             comment_editor: None,
             merge_modal: None,
@@ -1286,6 +1532,7 @@ impl App {
             search_editing: false,
             jump_palette: None,
             page_jump: None,
+            link_palette: None,
             recent_prs: Vec::new(),
             image_refs: Vec::new(),
             image_index: 0,
@@ -1293,6 +1540,8 @@ impl App {
             image_cache: RevisitCache::default(),
             image_picker: None,
             image_protocol: None,
+            overview_image_protocols: HashMap::new(),
+            overview_images_loading: HashSet::new(),
         }
     }
 
@@ -1312,6 +1561,7 @@ impl App {
     pub fn update(&mut self, msg: Msg) -> Command {
         match msg {
             Msg::Key(key) => self.on_key(key),
+            Msg::Mouse(mouse) => self.on_mouse(mouse),
             Msg::AuthValidated { email, token, user } => self.on_auth_validated(email, token, user),
             Msg::AuthFailed(error) => {
                 self.onboarding.validating = false;
@@ -1399,6 +1649,9 @@ impl App {
                     let pr = *pr;
                     self.current_pr = Some(pr.clone());
                     self.update_pr_detail_cache(id, move |entry| entry.pr = pr);
+                    if let Some(client) = self.client.clone() {
+                        return batch_or_none(self.queue_overview_images(&client));
+                    }
                 }
                 Command::None
             }
@@ -1644,9 +1897,19 @@ impl App {
             }
             Msg::ImageLoaded { url, result } => {
                 let decoded = result.and_then(|bytes| imageview::decode_image(&bytes));
+                self.overview_images_loading.remove(&url);
                 // 表示中かどうかに関わらずキャッシュは常に最新化する（他画像/他 PR へ切り替えて
                 // いても、その結果は次回再訪時に活かす）。
                 self.image_cache.insert(url.clone(), decoded.clone());
+                match (&decoded, self.image_picker.as_ref()) {
+                    (Ok(image), Some(picker)) => {
+                        self.overview_image_protocols
+                            .insert(url.clone(), picker.new_resize_protocol(image.clone()));
+                    }
+                    _ => {
+                        self.overview_image_protocols.remove(&url);
+                    }
+                }
                 // 取得中に別の画像へ切り替えていた場合（古い URL の結果）は画面反映のみ破棄する。
                 if self.screen == Screen::ImageView
                     && self
@@ -1717,6 +1980,9 @@ impl App {
         if self.jump_palette.is_some() {
             return self.on_key_jump_palette(key);
         }
+        if self.link_palette.is_some() {
+            return self.on_key_link_palette(key);
+        }
         // 開くトリガーは show_help と同格（他のモーダル/検索編集中/Onboarding では無効）。
         // Onboarding だけは対象外: `Ctrl+K` は emacs 風の「行末まで削除」で既に使用中で、
         // 認証前は保持済みデータも無くジャンプ先が無いため衝突を避ける。
@@ -1772,6 +2038,389 @@ impl App {
             Screen::FileView => self.on_key_file_view(key),
             Screen::ImageView => self.on_key_image_view(key),
         }
+    }
+
+    /// 直近フレームの [`AppLayout`] を使ってマウス入力を既存のキー操作へ変換する。
+    fn on_mouse(&mut self, mouse: MouseEvent) -> Command {
+        let point = (mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.on_mouse_wheel(point, false),
+            MouseEventKind::ScrollDown => self.on_mouse_wheel(point, true),
+            MouseEventKind::Down(MouseButton::Left) => self.on_mouse_left(point),
+            _ => Command::None,
+        }
+    }
+
+    fn on_mouse_wheel(&mut self, point: (u16, u16), downward: bool) -> Command {
+        if let Some(modal) = self.layout.modal.clone() {
+            if !rect_contains(modal.area, point) {
+                return Command::None;
+            }
+            if let Some(list) = self
+                .layout
+                .lists
+                .iter()
+                .find(|list| {
+                    modal_accepts_list(modal.kind, list.kind) && rect_contains(list.area, point)
+                })
+                .cloned()
+            {
+                self.move_list(list.kind, downward, 3);
+            }
+            return Command::None;
+        }
+
+        if let Some(list) = self
+            .layout
+            .lists
+            .iter()
+            .find(|list| rect_contains(list.area, point))
+            .cloned()
+        {
+            self.move_list(list.kind, downward, 3);
+            return Command::None;
+        }
+        let pane = self
+            .layout
+            .panes
+            .iter()
+            .find(|(_, area)| rect_contains(*area, point))
+            .map(|(kind, _)| *kind);
+        match pane {
+            Some(PaneKind::Overview) => {
+                self.detail_scroll = add_signed(self.detail_scroll, if downward { 3 } else { -3 });
+                self.detail_scroll = self.detail_scroll.min(self.detail_max_scroll());
+            }
+            Some(PaneKind::Comments) => {
+                self.comments_scroll =
+                    add_signed(self.comments_scroll, if downward { 3 } else { -3 });
+                self.clamp_comments_scroll();
+            }
+            Some(PaneKind::DiffBody) => {
+                if let Some(diff) = self.diff.as_mut() {
+                    diff.focus = DiffFocus::Body;
+                    diff.move_cursor(if downward { 3 } else { -3 });
+                }
+            }
+            Some(PaneKind::StepLog) => {
+                if let Some(log) = self.step_log.as_mut() {
+                    if downward {
+                        log.scroll_down(3);
+                    } else {
+                        log.scroll_up(3);
+                    }
+                }
+            }
+            Some(PaneKind::FileView) => {
+                if let Some(view) = self.file_view.as_mut() {
+                    if downward {
+                        view.scroll_down(3);
+                    } else {
+                        view.scroll_up(3);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Command::None
+    }
+
+    fn on_mouse_left(&mut self, point: (u16, u16)) -> Command {
+        if let Some(modal) = self.layout.modal.clone() {
+            if !rect_contains(modal.area, point) {
+                return self.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            }
+            // 破壊的操作はモーダル内のどこをクリックしても決定しない。
+            if matches!(
+                modal.kind,
+                ModalKind::MergeConfirm | ModalKind::PipelineConfirm
+            ) {
+                return Command::None;
+            }
+            if let Some(list) = self
+                .layout
+                .lists
+                .iter()
+                .find(|list| {
+                    modal_accepts_list(modal.kind, list.kind) && rect_contains(list.area, point)
+                })
+                .cloned()
+            {
+                return self.click_list_row(&list, point.1);
+            }
+            return Command::None;
+        }
+
+        if let Some(image) = self
+            .layout
+            .overview_images
+            .iter()
+            .find(|image| rect_contains(image.area, point))
+            .cloned()
+        {
+            self.detail_focus = DetailFocus::Overview;
+            return self.open_clicked_image(&image.url);
+        }
+
+        if let Some(content) = self.layout.overview_content
+            && rect_contains(content, point)
+        {
+            self.detail_focus = DetailFocus::Overview;
+            if let Some(urls) = self.overview_urls_at(point) {
+                if urls.len() == 1 {
+                    return self.open_url_in_browser(&urls[0]);
+                }
+                let mut palette = LinkPalette::default();
+                palette.links.set_items(
+                    urls.into_iter()
+                        .map(|url| DetailLink {
+                            label: url.clone(),
+                            url,
+                        })
+                        .collect(),
+                );
+                self.link_palette = Some(palette);
+                return Command::None;
+            }
+        }
+
+        if let Some(list) = self
+            .layout
+            .lists
+            .iter()
+            .find(|list| rect_contains(list.area, point))
+            .cloned()
+        {
+            return self.click_list_row(&list, point.1);
+        }
+
+        let pane = self
+            .layout
+            .panes
+            .iter()
+            .find(|(_, area)| rect_contains(*area, point))
+            .map(|(kind, _)| *kind);
+        match pane {
+            Some(PaneKind::Overview) => self.detail_focus = DetailFocus::Overview,
+            Some(PaneKind::ChangedFiles) => self.detail_focus = DetailFocus::Files,
+            Some(PaneKind::Comments) => self.detail_focus = DetailFocus::Comments,
+            Some(PaneKind::DiffFiles) => {
+                if let Some(diff) = self.diff.as_mut() {
+                    diff.focus = DiffFocus::Files;
+                }
+            }
+            Some(PaneKind::DiffBody) => {
+                if let Some(diff) = self.diff.as_mut() {
+                    diff.focus = DiffFocus::Body;
+                }
+            }
+            _ => {}
+        }
+
+        if let Some(hint) = self
+            .layout
+            .hints
+            .iter()
+            .find(|hint| rect_contains(hint.area, point))
+            .cloned()
+        {
+            return self.on_key(hint.key);
+        }
+        Command::None
+    }
+
+    fn overview_urls_at(&self, point: (u16, u16)) -> Option<Vec<String>> {
+        let content = self.layout.overview_content?;
+        if !rect_contains(content, point) {
+            return None;
+        }
+        let visual_line = usize::from(self.detail_scroll)
+            .saturating_add(usize::from(point.1.saturating_sub(content.y)));
+        let column = point.0.saturating_sub(content.x);
+        self.overview_link_positions
+            .iter()
+            .find(|position| {
+                position.visual_line == visual_line && position.column_range.contains(&column)
+            })
+            .map(|position| position.urls.clone())
+    }
+
+    fn move_list(&mut self, kind: ListKind, downward: bool, amount: usize) {
+        macro_rules! move_selection {
+            ($list:expr) => {
+                if downward {
+                    $list.select_next_by(amount);
+                } else {
+                    $list.select_prev_by(amount);
+                }
+            };
+        }
+        match kind {
+            ListKind::Workspaces => move_selection!(self.workspaces),
+            ListKind::Repositories => move_selection!(self.repositories),
+            ListKind::PullRequests => move_selection!(self.pull_requests),
+            ListKind::ChangedFiles => move_selection!(self.diffstat),
+            ListKind::Pipelines => move_selection!(self.pipelines),
+            ListKind::PipelineSteps => move_selection!(self.pipeline_steps),
+            ListKind::Branches => move_selection!(self.branches),
+            ListKind::Commits => move_selection!(self.commits),
+            ListKind::Source => {
+                if let Some(source) = self.source.as_mut() {
+                    move_selection!(source.entries);
+                }
+            }
+            ListKind::DiffFiles => {
+                if let Some(diff) = self.diff.as_mut() {
+                    for _ in 0..amount {
+                        if downward {
+                            diff.select_file_next();
+                        } else {
+                            diff.select_file_prev();
+                        }
+                    }
+                }
+            }
+            ListKind::LinkPalette => {
+                if let Some(palette) = self.link_palette.as_mut() {
+                    move_selection!(palette.links);
+                }
+            }
+            ListKind::JumpPalette => {
+                if let Some(palette) = self.jump_palette.as_mut() {
+                    move_selection!(palette.entries);
+                }
+            }
+        }
+    }
+
+    fn click_list_row(&mut self, layout: &ListLayout, row: u16) -> Command {
+        match layout.kind {
+            ListKind::ChangedFiles => self.detail_focus = DetailFocus::Files,
+            ListKind::DiffFiles => {
+                if let Some(diff) = self.diff.as_mut() {
+                    diff.focus = DiffFocus::Files;
+                }
+            }
+            _ => {}
+        }
+        let position = layout
+            .first_visible
+            .saturating_add(usize::from(row.saturating_sub(layout.area.y)));
+        if position >= self.list_len(layout.kind) {
+            return Command::None;
+        }
+        let selected = self.list_selection(layout.kind);
+        self.select_list_position(layout.kind, position);
+        if selected == Some(position) {
+            self.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        } else {
+            Command::None
+        }
+    }
+
+    fn list_selection(&self, kind: ListKind) -> Option<usize> {
+        match kind {
+            ListKind::Workspaces => self.workspaces.state.selected(),
+            ListKind::Repositories => self.repositories.state.selected(),
+            ListKind::PullRequests => self.pull_requests.state.selected(),
+            ListKind::ChangedFiles => self.diffstat.state.selected(),
+            ListKind::Pipelines => self.pipelines.state.selected(),
+            ListKind::PipelineSteps => self.pipeline_steps.state.selected(),
+            ListKind::Branches => self.branches.state.selected(),
+            ListKind::Commits => self.commits.state.selected(),
+            ListKind::Source => self
+                .source
+                .as_ref()
+                .and_then(|source| source.entries.state.selected()),
+            ListKind::DiffFiles => self.diff.as_ref().map(|diff| diff.file_index),
+            ListKind::LinkPalette => self
+                .link_palette
+                .as_ref()
+                .and_then(|palette| palette.links.state.selected()),
+            ListKind::JumpPalette => self
+                .jump_palette
+                .as_ref()
+                .and_then(|palette| palette.entries.state.selected()),
+        }
+    }
+
+    fn list_len(&self, kind: ListKind) -> usize {
+        match kind {
+            ListKind::Workspaces => self.workspaces.matches.len(),
+            ListKind::Repositories => self.repositories.matches.len(),
+            ListKind::PullRequests => self.pull_requests.matches.len(),
+            ListKind::ChangedFiles => self.diffstat.matches.len(),
+            ListKind::Pipelines => self.pipelines.matches.len(),
+            ListKind::PipelineSteps => self.pipeline_steps.matches.len(),
+            ListKind::Branches => self.branches.matches.len(),
+            ListKind::Commits => self.commits.matches.len(),
+            ListKind::Source => self
+                .source
+                .as_ref()
+                .map_or(0, |source| source.entries.matches.len()),
+            ListKind::DiffFiles => self.diff.as_ref().map_or(0, |diff| diff.parsed.files.len()),
+            ListKind::LinkPalette => self
+                .link_palette
+                .as_ref()
+                .map_or(0, |palette| palette.links.matches.len()),
+            ListKind::JumpPalette => self
+                .jump_palette
+                .as_ref()
+                .map_or(0, |palette| palette.entries.matches.len()),
+        }
+    }
+
+    fn select_list_position(&mut self, kind: ListKind, position: usize) {
+        match kind {
+            ListKind::Workspaces => self.workspaces.select_position(position),
+            ListKind::Repositories => self.repositories.select_position(position),
+            ListKind::PullRequests => self.pull_requests.select_position(position),
+            ListKind::ChangedFiles => self.diffstat.select_position(position),
+            ListKind::Pipelines => self.pipelines.select_position(position),
+            ListKind::PipelineSteps => self.pipeline_steps.select_position(position),
+            ListKind::Branches => self.branches.select_position(position),
+            ListKind::Commits => self.commits.select_position(position),
+            ListKind::Source => {
+                if let Some(source) = self.source.as_mut() {
+                    source.entries.select_position(position);
+                }
+            }
+            ListKind::DiffFiles => {
+                if let Some(diff) = self.diff.as_mut()
+                    && position < diff.parsed.files.len()
+                {
+                    diff.select_file(position);
+                }
+            }
+            ListKind::LinkPalette => {
+                if let Some(palette) = self.link_palette.as_mut() {
+                    palette.links.select_position(position);
+                }
+            }
+            ListKind::JumpPalette => {
+                if let Some(palette) = self.jump_palette.as_mut() {
+                    palette.entries.select_position(position);
+                }
+            }
+        }
+    }
+
+    fn open_clicked_image(&mut self, url: &str) -> Command {
+        let refs = self
+            .current_pr
+            .as_ref()
+            .and_then(PullRequest::body)
+            .map(imageview::extract_image_refs)
+            .unwrap_or_default();
+        let Some(index) = refs.iter().position(|image| image.url == url) else {
+            return Command::None;
+        };
+        self.image_refs = refs;
+        self.image_index = index;
+        self.current_image = None;
+        self.image_protocol = None;
+        self.screen = Screen::ImageView;
+        self.load_current_image()
     }
 
     /// テーマを次へ巡回する（`Ctrl+T`）。`config.toml` へ永続化し、Diff の着色済み行
@@ -2417,12 +3066,8 @@ impl App {
         }
     }
 
-    /// PR 詳細本文の表示行数（ヘッダ 4 行 + 承認/変更要求パネル行 + 本文行数。
-    /// 本文が無い場合はプレースホルダの 1 行）。
-    ///
-    /// `ui::render_pr_meta_body` が積む行と対応する（折り返し前の行数。`Wrap` による折り返しは
-    /// 数えないため、狭い端末では厳密な末尾より手前でクランプされ得るが、無制限スクロールという
-    /// バグを防ぐには十分）。
+    /// PR 詳細概要ペインの表示行数。描画後は rich document の仮想高さ、初回描画前だけは
+    /// ヘッダ・参加者・本文の論理行数による近似値を返す。
     ///
     /// 本文行数は `tui_markdown` による実際の描画結果（[`App::detail_body_rendered_lines`]、
     /// `ui` が毎フレーム書き戻す）を優先して使う。まだ描画していない場合（画面遷移直後の 1 フレ
@@ -2433,10 +3078,11 @@ impl App {
         let Some(pr) = self.current_pr.as_ref() else {
             return 0;
         };
-        let body_lines = self
-            .detail_body_rendered_lines
-            .unwrap_or_else(|| pr.body().map_or(1, |body| body.lines().count().max(1)));
-        PR_DETAIL_HEADER_LINES + participant_panel_line_count(pr) + body_lines
+        self.detail_body_rendered_lines.unwrap_or_else(|| {
+            PR_DETAIL_HEADER_LINES
+                + participant_panel_line_count(pr)
+                + pr.body().map_or(1, |body| body.lines().count().max(1))
+        })
     }
 
     /// `detail_scroll` の上限（本文が直近描画のビューポートに収まる位置）。
@@ -2453,6 +3099,23 @@ impl App {
         if self.detail_scroll > max {
             self.detail_scroll = max;
         }
+    }
+
+    fn comments_max_scroll(&self) -> u16 {
+        let total = self.comments_rendered_lines.unwrap_or_else(|| {
+            self.comments
+                .iter()
+                .map(|comment| comment.raw().lines().count().max(1) + 2)
+                .sum::<usize>()
+                .max(1)
+        });
+        total
+            .saturating_sub(self.comments_viewport.max(1))
+            .min(u16::MAX as usize) as u16
+    }
+
+    pub fn clamp_comments_scroll(&mut self) {
+        self.comments_scroll = self.comments_scroll.min(self.comments_max_scroll());
     }
 
     /// 選択中の PR の詳細画面へ遷移し、詳細/diffstat/コメントの取得を開始する。
@@ -2504,9 +3167,13 @@ impl App {
         self.current_pr = Some(pr.clone());
         self.diff = None;
         self.detail_scroll = 0;
+        self.comments_scroll = 0;
+        self.detail_focus = DetailFocus::Overview;
         // 新しい PR の本文行数はまだ描画していない（前の PR の実測値を持ち越さない）。次回描画
         // で `ui::render_pr_meta_body` が実測して書き戻すまでは近似値にフォールバックする。
         self.detail_body_rendered_lines = None;
+        self.overview_link_positions.clear();
+        self.comments_rendered_lines = None;
         self.screen = Screen::PullRequestDetail;
         self.record_recent_pr(pr);
 
@@ -2525,7 +3192,7 @@ impl App {
             }
         }
 
-        Command::Batch(vec![
+        let mut commands = vec![
             Command::LoadPrDetail {
                 client: client.clone(),
                 workspace: workspace.clone(),
@@ -2539,12 +3206,41 @@ impl App {
                 id,
             },
             Command::LoadComments {
-                client,
+                client: client.clone(),
                 workspace,
                 repo,
                 id,
             },
-        ])
+        ];
+        commands.extend(self.queue_overview_images(&client));
+        Command::Batch(commands)
+    }
+
+    /// 現在の PR 本文にある全画像について、未キャッシュ・未取得中のものだけ取得を発行する。
+    /// ImageView と同じ `Command::LoadImage` / `image_cache` 経路を使い、表示中の Status は
+    /// 画像ロード用に上書きしない。
+    fn queue_overview_images(&mut self, client: &BitbucketClient) -> Vec<Command> {
+        let refs = self
+            .current_pr
+            .as_ref()
+            .and_then(PullRequest::body)
+            .map(imageview::extract_image_refs)
+            .unwrap_or_default();
+        let mut seen = HashSet::new();
+        let mut commands = Vec::new();
+        for image in refs {
+            if !seen.insert(image.url.clone())
+                || self.image_cache.get(&image.url).is_some()
+                || !self.overview_images_loading.insert(image.url.clone())
+            {
+                continue;
+            }
+            commands.push(Command::LoadImage {
+                client: client.clone(),
+                url: image.url,
+            });
+        }
+        commands
     }
 
     /// 「直近開いた PR」リストへ記録する（先頭に追加・同一 PR の重複は除去・上限 20 件）。
@@ -2584,32 +3280,22 @@ impl App {
                 self.status = Status::Idle;
                 Command::None
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.diffstat.select_next();
+            KeyCode::Tab => {
+                self.detail_focus = self.detail_focus.next();
                 Command::None
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.diffstat.select_prev();
+            KeyCode::BackTab => {
+                self.detail_focus = self.detail_focus.previous();
                 Command::None
             }
-            KeyCode::PageDown => {
-                self.detail_scroll = self.detail_scroll.saturating_add(5);
-                self.clamp_detail_scroll();
-                Command::None
-            }
-            KeyCode::PageUp => {
-                self.detail_scroll = self.detail_scroll.saturating_sub(5);
-                Command::None
-            }
-            KeyCode::Char('J') => {
-                self.detail_scroll = self.detail_scroll.saturating_add(10);
-                self.clamp_detail_scroll();
-                Command::None
-            }
-            KeyCode::Char('K') => {
-                self.detail_scroll = self.detail_scroll.saturating_sub(10);
-                Command::None
-            }
+            KeyCode::Down | KeyCode::Char('j') => self.move_detail_focus(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_detail_focus(-1),
+            KeyCode::PageDown => self.page_detail_focus(false),
+            KeyCode::PageUp => self.page_detail_focus(true),
+            KeyCode::Char('J') => self.move_detail_focus(10),
+            KeyCode::Char('K') => self.move_detail_focus(-10),
+            KeyCode::Char('g') => self.goto_detail_focus(false),
+            KeyCode::Char('G') => self.goto_detail_focus(true),
             KeyCode::Char('d') => self.open_diff(),
             KeyCode::Char('c') => {
                 self.comment_editor = Some(CommentEditor::default());
@@ -2620,6 +3306,115 @@ impl App {
             KeyCode::Char('M') => self.open_merge_modal(),
             KeyCode::Char('o') => self.open_pr_in_browser(),
             KeyCode::Char('i') => self.open_image_view(),
+            KeyCode::Char('L') => self.open_link_palette(),
+            _ => Command::None,
+        }
+    }
+
+    fn move_detail_focus(&mut self, amount: i32) -> Command {
+        match self.detail_focus {
+            DetailFocus::Overview => {
+                self.detail_scroll = add_signed(self.detail_scroll, amount);
+                self.clamp_detail_scroll();
+            }
+            DetailFocus::Files => {
+                if amount >= 0 {
+                    self.diffstat.select_next_by(amount as usize);
+                } else {
+                    self.diffstat.select_prev_by(amount.unsigned_abs() as usize);
+                }
+            }
+            DetailFocus::Comments => {
+                self.comments_scroll = add_signed(self.comments_scroll, amount);
+                self.clamp_comments_scroll();
+            }
+        }
+        Command::None
+    }
+
+    fn page_detail_focus(&mut self, upward: bool) -> Command {
+        let amount = match self.detail_focus {
+            DetailFocus::Overview => self.detail_viewport.max(1),
+            DetailFocus::Comments => self.comments_viewport.max(1),
+            DetailFocus::Files => return Command::None,
+        };
+        self.move_detail_focus(if upward {
+            -(amount as i32)
+        } else {
+            amount as i32
+        })
+    }
+
+    fn goto_detail_focus(&mut self, end: bool) -> Command {
+        match self.detail_focus {
+            DetailFocus::Overview => {
+                self.detail_scroll = if end { self.detail_max_scroll() } else { 0 };
+            }
+            DetailFocus::Files => {
+                let selected = if self.diffstat.matches.is_empty() {
+                    None
+                } else if end {
+                    Some(self.diffstat.matches.len() - 1)
+                } else {
+                    Some(0)
+                };
+                self.diffstat.state.select(selected);
+            }
+            DetailFocus::Comments => {
+                self.comments_scroll = if end { self.comments_max_scroll() } else { 0 };
+            }
+        }
+        Command::None
+    }
+
+    fn open_link_palette(&mut self) -> Command {
+        let mut links = Vec::new();
+        if let Some(body) = self.current_pr.as_ref().and_then(PullRequest::body) {
+            extract_links(body, &mut links);
+        }
+        for comment in &self.comments {
+            extract_links(comment.raw(), &mut links);
+        }
+        if links.is_empty() {
+            self.status = Status::Error("本文にリンクがありません".to_string());
+            return Command::None;
+        }
+        let mut palette = LinkPalette::default();
+        palette.links.set_items(links);
+        self.link_palette = Some(palette);
+        Command::None
+    }
+
+    fn on_key_link_palette(&mut self, key: KeyEvent) -> Command {
+        match key.code {
+            KeyCode::Esc => {
+                self.link_palette = None;
+                Command::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(palette) = self.link_palette.as_mut() {
+                    palette.links.select_next();
+                }
+                Command::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(palette) = self.link_palette.as_mut() {
+                    palette.links.select_prev();
+                }
+                Command::None
+            }
+            KeyCode::Enter => {
+                let url = self
+                    .link_palette
+                    .as_ref()
+                    .and_then(|palette| palette.links.selected())
+                    .map(|link| link.url.clone());
+                self.link_palette = None;
+                match url {
+                    Some(url) => self.open_url_in_browser(&url),
+                    None => Command::None,
+                }
+            }
             _ => Command::None,
         }
     }
@@ -2734,6 +3529,37 @@ impl App {
         self.current_image = Some(result);
     }
 
+    /// 概要内画像の現在のレイアウト状態を、画像キャッシュと Picker から組み立てる。
+    pub fn overview_image_presentation(
+        &self,
+        alt: &str,
+        url: &str,
+        pane_width: u16,
+    ) -> ImagePresentation {
+        let key = url.to_string();
+        let result = self.image_cache.get(&key);
+        let font_size = self.image_picker.as_ref().map(Picker::font_size);
+        richdoc::image_presentation(alt, result, font_size, pane_width)
+    }
+
+    /// URL ごとの概要用 `StatefulProtocol` を返す。キャッシュ済み画像に対してまだ protocol が
+    /// 無い場合（たとえば別 PR で先に取得済み）は、その場で一度だけ生成する。
+    pub fn overview_image_protocol_mut(&mut self, url: &str) -> Option<&mut StatefulProtocol> {
+        if !self.overview_image_protocols.contains_key(url) {
+            let key = url.to_string();
+            let image = self
+                .image_cache
+                .get(&key)
+                .and_then(|result| result.as_ref().ok())
+                .cloned();
+            if let (Some(image), Some(picker)) = (image, self.image_picker.as_ref()) {
+                self.overview_image_protocols
+                    .insert(key, picker.new_resize_protocol(image));
+            }
+        }
+        self.overview_image_protocols.get_mut(url)
+    }
+
     /// 現在の PR をデフォルトブラウザで開く（macOS の `open` コマンドを子プロセスで起動）。
     ///
     /// TUI を抜けず、子プロセスの stdout/stderr は端末を汚さないよう `Stdio::null()` へ
@@ -2743,10 +3569,14 @@ impl App {
             self.status = Status::Error("PR が選択されていません".to_string());
             return Command::None;
         };
-        let Some(url) = pr.html_url() else {
+        let Some(url) = pr.html_url().map(str::to_string) else {
             self.status = Status::Error("この PR のブラウザ URL が不明です".to_string());
             return Command::None;
         };
+        self.open_url_in_browser(&url)
+    }
+
+    fn open_url_in_browser(&mut self, url: &str) -> Command {
         let result = std::process::Command::new("open")
             .arg(url)
             .stdin(std::process::Stdio::null())
@@ -4395,6 +5225,15 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::CONTROL)
     }
 
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
     fn app() -> App {
         App::new(Config::default(), None)
     }
@@ -4746,6 +5585,30 @@ mod tests {
     }
 
     #[test]
+    fn entering_detail_queues_every_body_image_through_existing_load_command() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.pull_requests.set_items(vec![make_pr_with_images(8)]);
+
+        let command = app.update(Msg::Key(key(KeyCode::Enter)));
+
+        let Command::Batch(commands) = command else {
+            panic!("expected Batch");
+        };
+        let image_urls = commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::LoadImage { url, .. } => Some(url.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            image_urls,
+            vec!["https://example.com/a.png", "https://example.com/b.png"]
+        );
+    }
+
+    #[test]
     fn detail_d_opens_diff_and_loads() {
         let mut app = review_app();
         app.screen = Screen::PullRequestDetail;
@@ -4753,6 +5616,68 @@ mod tests {
         let cmd = app.update(Msg::Key(key(KeyCode::Char('d'))));
         assert_eq!(app.screen, Screen::Diff);
         assert!(matches!(cmd, Command::LoadDiff { id: 9, .. }));
+    }
+
+    #[test]
+    fn detail_focus_cycles_both_directions_and_keeps_global_keybindings() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequestDetail;
+        app.current_pr = Some(make_pr(9, "OPEN"));
+        assert_eq!(app.detail_focus, DetailFocus::Overview);
+
+        app.update(Msg::Key(key(KeyCode::Tab)));
+        assert_eq!(app.detail_focus, DetailFocus::Files);
+        app.update(Msg::Key(key(KeyCode::Tab)));
+        assert_eq!(app.detail_focus, DetailFocus::Comments);
+        app.update(Msg::Key(key(KeyCode::Tab)));
+        assert_eq!(app.detail_focus, DetailFocus::Overview);
+        app.update(Msg::Key(key(KeyCode::BackTab)));
+        assert_eq!(app.detail_focus, DetailFocus::Comments);
+
+        app.update(Msg::Key(key(KeyCode::Char('c'))));
+        assert!(app.comment_editor.is_some());
+    }
+
+    #[test]
+    fn comments_focus_scrolls_and_clamps_using_rendered_height() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequestDetail;
+        app.detail_focus = DetailFocus::Comments;
+        app.comments_viewport = 3;
+        app.comments_rendered_lines = Some(8);
+
+        app.update(Msg::Key(key(KeyCode::Char('G'))));
+        assert_eq!(app.comments_scroll, 5);
+        app.update(Msg::Key(key(KeyCode::Char('j'))));
+        assert_eq!(app.comments_scroll, 5);
+        app.update(Msg::Key(key(KeyCode::Char('g'))));
+        assert_eq!(app.comments_scroll, 0);
+    }
+
+    #[test]
+    fn link_extraction_excludes_fences_and_images_deduplicates_and_keeps_bare_urls() {
+        let mut links = Vec::new();
+        extract_links(
+            "[docs](https://example.com/docs) https://example.com/bare\n\
+             ![image](https://example.com/image.png)\n\
+             ```\nhttps://example.com/code\n```\n\
+             https://example.com/docs",
+            &mut links,
+        );
+
+        assert_eq!(
+            links,
+            vec![
+                DetailLink {
+                    label: "docs".to_string(),
+                    url: "https://example.com/docs".to_string(),
+                },
+                DetailLink {
+                    label: "https://example.com/bare".to_string(),
+                    url: "https://example.com/bare".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -4985,6 +5910,43 @@ mod tests {
         assert!(matches!(app.status, Status::Error(_)));
         // デコード失敗時は Picker があっても protocol は作らない。
         assert!(app.image_protocol.is_none());
+    }
+
+    #[test]
+    fn image_loaded_caches_a_distinct_overview_protocol_by_url() {
+        let mut app = review_app();
+        app.image_picker = Some(Picker::from_fontsize((10, 20)));
+        let url = "https://example.com/inline.png";
+
+        app.update(Msg::ImageLoaded {
+            url: url.to_string(),
+            result: Ok(tiny_png_bytes()),
+        });
+
+        assert!(app.overview_image_protocols.contains_key(url));
+    }
+
+    #[test]
+    fn image_loaded_with_bitbucket_attachment_error_surfaces_exact_guidance() {
+        const MESSAGE: &str = "この画像（Bitbucket 添付）は API token では取得できません。o でブラウザ表示してください";
+        let mut app = review_app();
+        app.screen = Screen::ImageView;
+        app.image_refs = vec![ImageRef {
+            alt: "attachment".to_string(),
+            url: "https://bitbucket.org/workspace/repo/images/file.png".to_string(),
+        }];
+
+        app.update(Msg::ImageLoaded {
+            url: "https://bitbucket.org/workspace/repo/images/file.png".to_string(),
+            result: Err(MESSAGE.to_string()),
+        });
+
+        assert_eq!(app.status, Status::Error(MESSAGE.to_string()));
+        assert_eq!(
+            app.current_image,
+            Some(Err(MESSAGE.to_string())),
+            "raw reqwest error must not replace the dedicated guidance"
+        );
     }
 
     #[test]
@@ -8452,5 +9414,191 @@ diff --git a/two.txt b/two.txt\n\
             Command::LoadBranches { page, .. } => assert_eq!(page, 2),
             other => panic!("expected LoadBranches, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mouse_hit_testing_uses_half_open_pane_boundaries() {
+        let area = Rect::new(4, 7, 10, 3);
+        assert!(rect_contains(area, (4, 7)));
+        assert!(rect_contains(area, (13, 9)));
+        assert!(!rect_contains(area, (14, 9)));
+        assert!(!rect_contains(area, (13, 10)));
+    }
+
+    #[test]
+    fn overview_link_hit_corrects_for_scroll_offset() {
+        let mut app = app();
+        app.detail_scroll = 5;
+        app.layout.overview_content = Some(Rect::new(10, 20, 30, 4));
+        app.overview_link_positions = vec![LinkPosition {
+            visual_line: 6,
+            column_range: 2..8,
+            urls: vec!["https://example.com/target".to_string()],
+        }];
+
+        assert_eq!(
+            app.overview_urls_at((13, 21)),
+            Some(vec!["https://example.com/target".to_string()])
+        );
+        assert_eq!(app.overview_urls_at((13, 20)), None);
+    }
+
+    #[test]
+    fn overview_multi_link_fallback_click_opens_palette() {
+        let mut app = app();
+        app.screen = Screen::PullRequestDetail;
+        app.layout.overview_content = Some(Rect::new(10, 20, 30, 4));
+        app.overview_link_positions = vec![LinkPosition {
+            visual_line: 0,
+            column_range: 0..30,
+            urls: vec![
+                "https://example.com/one".to_string(),
+                "https://example.com/two".to_string(),
+            ],
+        }];
+
+        app.update(Msg::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            13,
+            20,
+        )));
+        let palette = app.link_palette.as_ref().expect("palette opens");
+        assert_eq!(palette.links.items.len(), 2);
+    }
+
+    #[test]
+    fn list_row_click_selects_then_second_click_runs_enter_handler() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        app.repositories.set_items(vec![
+            make_repo("acme/one", Some("main")),
+            make_repo("acme/two", Some("main")),
+        ]);
+        app.layout.lists.push(ListLayout {
+            kind: ListKind::Repositories,
+            area: Rect::new(2, 10, 30, 2),
+            first_visible: 0,
+        });
+
+        let first = app.update(Msg::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            3,
+            11,
+        )));
+        assert!(matches!(first, Command::None));
+        assert_eq!(app.repositories.state.selected(), Some(1));
+        assert_eq!(app.screen, Screen::Repositories);
+
+        let second = app.update(Msg::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            3,
+            11,
+        )));
+        assert!(matches!(second, Command::LoadPullRequests { .. }));
+        assert_eq!(app.screen, Screen::PullRequests);
+    }
+
+    #[test]
+    fn click_on_blank_space_below_list_rows_is_inert() {
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        app.repositories.set_items(vec![
+            make_repo("acme/one", Some("main")),
+            make_repo("acme/two", Some("main")),
+        ]);
+        app.layout.lists.push(ListLayout {
+            kind: ListKind::Repositories,
+            area: Rect::new(2, 10, 30, 5),
+            first_visible: 0,
+        });
+
+        app.update(Msg::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            3,
+            14,
+        )));
+        assert_eq!(app.repositories.state.selected(), Some(0));
+        assert_eq!(app.screen, Screen::Repositories);
+    }
+
+    #[test]
+    fn click_outside_modal_runs_escape_equivalent() {
+        let mut app = app();
+        app.screen = Screen::Repositories;
+        app.page_jump = Some(PageJumpModal::default());
+        app.layout.modal = Some(ModalLayout {
+            kind: ModalKind::PageJump,
+            area: Rect::new(10, 10, 20, 8),
+        });
+
+        app.update(Msg::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            2,
+            2,
+        )));
+        assert!(app.page_jump.is_none());
+    }
+
+    #[test]
+    fn confirmation_modal_is_never_decided_by_inside_click() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequestDetail;
+        app.current_pr = Some(make_pr(42, "OPEN"));
+        app.merge_modal = Some(MergeModal::new(true));
+        app.layout.modal = Some(ModalLayout {
+            kind: ModalKind::MergeConfirm,
+            area: Rect::new(10, 10, 30, 12),
+        });
+
+        let command = app.update(Msg::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            20,
+            15,
+        )));
+        assert!(matches!(command, Command::None));
+        let modal = app.merge_modal.as_ref().expect("modal remains open");
+        assert!(!modal.submitting);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_three_lines_in_pane_under_cursor() {
+        let mut app = app();
+        app.screen = Screen::PullRequestDetail;
+        app.current_pr = Some(make_pr(1, "OPEN"));
+        app.detail_body_rendered_lines = Some(20);
+        app.detail_viewport = 5;
+        app.layout
+            .panes
+            .push((PaneKind::Overview, Rect::new(0, 0, 40, 10)));
+
+        app.update(Msg::Mouse(mouse(MouseEventKind::ScrollDown, 5, 5)));
+        assert_eq!(app.detail_scroll, 3);
+        app.update(Msg::Mouse(mouse(MouseEventKind::ScrollUp, 5, 5)));
+        assert_eq!(app.detail_scroll, 0);
+    }
+
+    #[test]
+    fn mouse_wheel_moves_list_selection_three_rows() {
+        let mut app = app();
+        app.screen = Screen::Workspaces;
+        app.workspaces.set_items(
+            (0..6)
+                .map(|index| Workspace {
+                    slug: format!("ws-{index}"),
+                    name: None,
+                    uuid: None,
+                })
+                .collect(),
+        );
+        app.layout.lists.push(ListLayout {
+            kind: ListKind::Workspaces,
+            area: Rect::new(0, 0, 40, 6),
+            first_visible: 0,
+        });
+
+        app.update(Msg::Mouse(mouse(MouseEventKind::ScrollDown, 5, 2)));
+        assert_eq!(app.workspaces.state.selected(), Some(3));
+        app.update(Msg::Mouse(mouse(MouseEventKind::ScrollUp, 5, 2)));
+        assert_eq!(app.workspaces.state.selected(), Some(0));
     }
 }

@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyEventKind, MouseButton, MouseEventKind};
 use tokio::sync::mpsc;
 
 use crate::api::{BitbucketClient, InlineTarget};
@@ -51,11 +51,20 @@ pub async fn run(tui: &mut Tui, mut app: App) -> Result<()> {
             maybe_event = input_rx.recv() => {
                 // 入力スレッドが終了したら（stdin クローズ等）ループも終える。
                 let Some(event) = maybe_event else { break };
-                if let Event::Key(key) = event
-                    && key.kind == KeyEventKind::Press
-                    && !dispatch(app.update(Msg::Key(key)), &api_tx)
-                {
-                    break;
+                match event {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        if !dispatch(app.update(Msg::Key(key)), &api_tx) {
+                            break;
+                        }
+                    }
+                    Event::Mouse(mouse)
+                        if matches!(
+                            mouse.kind,
+                            MouseEventKind::Down(MouseButton::Left)
+                                | MouseEventKind::ScrollUp
+                                | MouseEventKind::ScrollDown
+                        ) && !dispatch(app.update(Msg::Mouse(mouse)), &api_tx) => break,
+                    _ => {}
                 }
                 // それ以外（リサイズ等）は次のループ先頭で再描画される。
             }

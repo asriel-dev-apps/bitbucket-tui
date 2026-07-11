@@ -8,24 +8,28 @@
 //! （`&App`/`&mut App` を受け取る関数は `app.theme` を、純粋関数は `theme: &Theme` 引数を使う）。
 
 use ratatui::Frame;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Clear, HighlightSpacing, List, ListItem, ListState, Padding, Paragraph, Wrap,
 };
-use ratatui_image::StatefulImage;
+use ratatui_image::{CropOptions, Resize, StatefulImage};
+use unicode_width::UnicodeWidthStr;
 
 use crate::api::{
     Branch, Comment, CommentSide, Commit, DiffStatEntry, MergeStrategy, PageInfo, Pipeline,
     PipelineStatus, PipelineStep, PullRequest, SrcEntry,
 };
 use crate::tui::app::{
-    App, CommentEditor, ConfirmModal, DiffFocus, DiffState, JumpPaletteState, MergeModal,
-    PageJumpModal, Screen, SelectList, Status,
+    App, CommentEditor, ConfirmModal, DetailFocus, DiffFocus, DiffState, HintLayout, ImageHit,
+    JumpPaletteState, LinkPalette, ListKind, ListLayout, MergeModal, ModalKind, ModalLayout,
+    PageJumpModal, PaneKind, Screen, SelectList, Status,
 };
 use crate::tui::diff::DiffLineKind;
 use crate::tui::onboarding::Field;
+use crate::tui::richdoc::{self, DocBlock, RichDocument};
 use crate::tui::theme::Theme;
 
 /// API token 発行に関する常時ヒント。
@@ -33,6 +37,7 @@ const TOKEN_HINT: &str = "API token は Atlassian アカウント設定 > Securi
 
 /// 画面全体を描画する。
 pub fn render(frame: &mut Frame, app: &mut App) {
+    app.layout = Default::default();
     let chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -60,31 +65,111 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Screen::FileView => render_file_view(frame, chunks[1], app),
         Screen::ImageView => render_image_view(frame, chunks[1], app),
     }
+    if app.layout.panes.is_empty() {
+        let kind = if app.screen == Screen::ImageView {
+            PaneKind::ImageView
+        } else {
+            PaneKind::Static
+        };
+        app.layout.panes.push((kind, chunks[1]));
+    }
 
     render_status(frame, chunks[2], &app.status, &app.theme);
-    render_hints(frame, chunks[3], app.screen, &app.theme);
+    render_hints(frame, chunks[3], app);
 
     // オーバーレイ（優先度: コメント/merge/確認モーダル → ヘルプ）。
     if let Some(editor) = &app.comment_editor {
-        render_comment_editor(frame, editor, &app.theme);
+        let area = centered_rect(70, 50, frame.area());
+        render_comment_editor(frame, area, editor, &app.theme);
+        app.layout.modal = Some(ModalLayout {
+            kind: ModalKind::CommentEditor,
+            area,
+        });
     }
     if let Some(modal) = &app.merge_modal {
-        render_merge_modal(frame, modal, app.current_pr.as_ref(), &app.theme);
+        let area = centered_rect(60, 55, frame.area());
+        render_merge_modal(frame, area, modal, app.current_pr.as_ref(), &app.theme);
+        app.layout.modal = Some(ModalLayout {
+            kind: ModalKind::MergeConfirm,
+            area,
+        });
     }
     if let Some(modal) = &app.confirm_modal {
-        render_confirm_modal(frame, modal, &app.theme);
+        let area = centered_rect(60, 40, frame.area());
+        render_confirm_modal(frame, area, modal, &app.theme);
+        app.layout.modal = Some(ModalLayout {
+            kind: ModalKind::PipelineConfirm,
+            area,
+        });
     }
     if let Some(modal) = &app.page_jump {
-        render_page_jump(frame, modal, &app.theme);
+        let area = centered_rect(46, 22, frame.area());
+        render_page_jump(frame, area, modal, &app.theme);
+        app.layout.modal = Some(ModalLayout {
+            kind: ModalKind::PageJump,
+            area,
+        });
+    }
+    if let Some(palette) = app.link_palette.as_mut() {
+        let area = centered_rect(74, 64, frame.area());
+        render_link_palette(frame, area, palette, &app.theme);
+        app.layout.modal = Some(ModalLayout {
+            kind: ModalKind::LinkPalette,
+            area,
+        });
+        app.layout.lists.push(ListLayout {
+            kind: ListKind::LinkPalette,
+            area: list_inner(area),
+            first_visible: palette.links.state.offset(),
+        });
     }
     if app.show_help {
-        render_help(frame, app.screen, &app.theme);
+        let area = centered_rect(64, 70, frame.area());
+        render_help(frame, area, app.screen, &app.theme);
+        app.layout.modal = Some(ModalLayout {
+            kind: ModalKind::Help,
+            area,
+        });
     }
     // ジャンプパレットは最前面（他のどのオーバーレイより優先して開ける想定のため）。
     let theme = app.theme;
     if let Some(palette) = app.jump_palette.as_mut() {
-        render_jump_palette(frame, palette, &theme);
+        let area = centered_rect(70, 60, frame.area());
+        render_jump_palette(frame, area, palette, &theme);
+        let inner = list_inner(area);
+        let rows = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+        app.layout.modal = Some(ModalLayout {
+            kind: ModalKind::JumpPalette,
+            area,
+        });
+        app.layout.lists.push(ListLayout {
+            kind: ListKind::JumpPalette,
+            area: rows[2],
+            first_visible: palette.entries.state.offset(),
+        });
     }
+}
+
+fn list_inner(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(2),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(4),
+        area.height.saturating_sub(2),
+    )
+}
+
+fn record_list(app: &mut App, kind: ListKind, area: Rect, first_visible: usize) {
+    app.layout.lists.push(ListLayout {
+        kind,
+        area: list_inner(area),
+        first_visible,
+    });
 }
 
 fn screen_title(screen: Screen) -> &'static str {
@@ -119,8 +204,8 @@ fn rounded_block<'a>(theme: &Theme, border_color: Color) -> Block<'a> {
         .padding(Padding::horizontal(1))
 }
 
-/// 通常ペイン用の Block。複数ペイン画面ではキー操作が向く側（インタラクティブな一覧）を
-/// `focused = true`、付随する静的な表示ペイン（本文・コメント等）を `false` にする。
+/// 通常ペイン用の Block。複数ペイン画面ではキー操作が向いているペイン
+/// （PR 詳細は `App::detail_focus` のペイン）を `focused = true` にする。
 /// 単一ペイン画面（一覧のみ・スクロール本文のみ 等）は常に `true` でよい。
 fn themed_block<'a>(theme: &Theme, focused: bool) -> Block<'a> {
     rounded_block(
@@ -334,6 +419,12 @@ fn render_workspaces(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 
     render_pager(frame, pager_area, app.workspaces_page_info, &theme);
+    record_list(
+        app,
+        ListKind::Workspaces,
+        list_area,
+        app.workspaces.state.offset(),
+    );
 }
 
 fn render_repositories(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -377,6 +468,12 @@ fn render_repositories(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 
     render_pager(frame, pager_area, app.repositories_page_info, &theme);
+    record_list(
+        app,
+        ListKind::Repositories,
+        list_area,
+        app.repositories.state.offset(),
+    );
 }
 
 fn render_pull_requests(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -405,6 +502,12 @@ fn render_pull_requests(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 
     render_pager(frame, pager_area, app.pull_requests_page_info, &theme);
+    record_list(
+        app,
+        ListKind::PullRequests,
+        list_area,
+        app.pull_requests.state.offset(),
+    );
 }
 
 /// ページャ行を描画する（`‹ 1 2 [3] 4 … N ›` 形式）。[`pager_line`] を参照。
@@ -537,37 +640,84 @@ fn render_pull_request_detail(frame: &mut Frame, area: Rect, app: &mut App) {
     let rows =
         Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).split(area);
 
-    // 枠線ぶんを差し引いたビューポート高さを保持し、リサイズ等で末尾を超えていれば
-    // 再クランプする（`DiffState`/`LogView` と同じパターン）。
+    // 枠線ぶんを差し引いたビューポート高さを保持する。概要の clamp は rich document の
+    // 仮想高さを組み立てた後に行う。
     app.detail_viewport = rows[0].height.saturating_sub(2) as usize;
-    app.clamp_detail_scroll();
 
-    if let Some(pr) = app.current_pr.as_ref() {
-        let body_line_count = render_pr_meta_body(frame, rows[0], pr, app.detail_scroll, &theme);
-        // `tui_markdown` は入力行数と出力行数が一致しないため、実際に描画した行数を
-        // `App::detail_body_line_count` へ書き戻す（`detail_viewport` と同じ「ui が毎フレーム
-        // 更新する」パターン）。次回以降のスクロール clamp（`PageDown`/`Shift+J` 等）はこの値を
-        // 使う。
-        app.detail_body_rendered_lines = Some(body_line_count);
+    if app.current_pr.is_some() {
+        render_pr_meta_body(frame, rows[0], app, &theme);
     } else {
         render_placeholder(frame, rows[0], &app.status, "PR を選択してください", &theme);
     }
 
     let bottom =
         Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(rows[1]);
-    render_diffstat_list(frame, bottom[0], &mut app.diffstat, &theme);
-    render_comments(frame, bottom[1], &app.comments, &theme);
+    app.layout.panes.extend([
+        (PaneKind::Overview, rows[0]),
+        (PaneKind::ChangedFiles, bottom[0]),
+        (PaneKind::Comments, bottom[1]),
+    ]);
+    render_diffstat_list(
+        frame,
+        bottom[0],
+        &mut app.diffstat,
+        app.detail_focus == DetailFocus::Files,
+        &theme,
+    );
+    app.comments_viewport = bottom[1].height.saturating_sub(2) as usize;
+    app.clamp_comments_scroll();
+    app.comments_rendered_lines = Some(render_comments(
+        frame,
+        bottom[1],
+        &app.comments,
+        app.comments_scroll,
+        app.detail_focus == DetailFocus::Comments,
+        &theme,
+    ));
+    record_list(
+        app,
+        ListKind::ChangedFiles,
+        bottom[0],
+        app.diffstat.state.offset(),
+    );
 }
 
-/// PR 詳細本文ペインを描画し、本文（Markdown）の実際の描画行数を返す
-/// （`App::detail_body_rendered_lines` へ書き戻すために呼び出し元が使う）。
-fn render_pr_meta_body(
-    frame: &mut Frame,
-    area: Rect,
-    pr: &PullRequest,
-    scroll: u16,
-    theme: &Theme,
-) -> usize {
+/// PR 詳細の概要ペインを、折り返し済みテキストとインライン画像の仮想文書として描画する。
+fn render_pr_meta_body(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
+    let focused = app.detail_focus == DetailFocus::Overview;
+    let block = themed_block(theme, focused).title(" 概要 ");
+    let inner = block.inner(area);
+    app.layout.overview_content = Some(inner);
+    frame.render_widget(block, area);
+
+    let (leading_lines, body) = {
+        let Some(pr) = app.current_pr.as_ref() else {
+            return;
+        };
+        let mut leading = pr_meta_lines(pr, theme);
+        let body = match pr.body() {
+            Some(body) => body.to_string(),
+            None => {
+                leading.push(Line::from(Span::styled("（本文なし）", Style::new().dim())));
+                String::new()
+            }
+        };
+        (leading, body)
+    };
+
+    let document = richdoc::build_document(leading_lines, &body, inner.width, |alt, url| {
+        app.overview_image_presentation(alt, url, inner.width)
+    });
+    app.detail_body_rendered_lines = Some(document.height);
+    app.detail_scroll =
+        richdoc::clamp_scroll(app.detail_scroll, document.height, app.detail_viewport);
+    app.overview_link_positions = document.links.clone();
+
+    render_rich_document(frame, inner, app.detail_scroll, &document, app, theme);
+}
+
+/// 現行のタイトル/ブランチ/author/承認パネルをリッチドキュメントの先頭 Text block にする。
+fn pr_meta_lines(pr: &PullRequest, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(vec![
             Span::styled(
@@ -609,22 +759,108 @@ fn render_pr_meta_body(
     // どちらも無ければ 0 行のまま追加しない）。
     lines.extend(participant_panel_lines(pr, theme));
     lines.push(Line::raw(""));
+    lines
+}
 
-    let body_lines = match pr.body() {
-        Some(body) => render_markdown_lines(body),
-        None => vec![Line::from(Span::styled("（本文なし）", Style::new().dim()))],
-    };
-    let body_line_count = body_lines.len();
-    lines.extend(body_lines);
+fn render_rich_document(
+    frame: &mut Frame,
+    area: Rect,
+    scroll: u16,
+    document: &RichDocument,
+    app: &mut App,
+    theme: &Theme,
+) {
+    let viewport_start = usize::from(scroll);
+    let viewport_end = viewport_start.saturating_add(usize::from(area.height));
+    let mut document_y = 0usize;
 
-    // 複数ペイン画面: 本文は静的な表示ペインなので非フォーカス（下の変更ファイル一覧が
-    // インタラクティブな主ペイン）。
-    let paragraph = Paragraph::new(lines)
-        .block(themed_block(theme, false).title(" 概要 "))
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
-    frame.render_widget(paragraph, area);
-    body_line_count
+    for (index, block) in document.blocks.iter().enumerate() {
+        let block_height = document.block_height(index);
+        let block_end = document_y.saturating_add(block_height);
+        if block_end <= viewport_start {
+            document_y = block_end;
+            continue;
+        }
+        if document_y >= viewport_end {
+            break;
+        }
+
+        let visible_start = document_y.max(viewport_start);
+        let visible_end = block_end.min(viewport_end);
+        let screen_y = area
+            .y
+            .saturating_add((visible_start - viewport_start) as u16);
+        let visible_height = (visible_end - visible_start) as u16;
+        match block {
+            DocBlock::Text(lines) => {
+                let start = visible_start - document_y;
+                let end = start
+                    .saturating_add(usize::from(visible_height))
+                    .min(lines.len());
+                if start < end {
+                    let visible = lines[start..end].to_vec();
+                    frame.render_widget(
+                        Paragraph::new(visible),
+                        Rect::new(area.x, screen_y, area.width, visible_height),
+                    );
+                }
+            }
+            DocBlock::Image { url, .. } => {
+                let Some(presentation) = document.image_presentation(index) else {
+                    document_y = block_end;
+                    continue;
+                };
+                match presentation.size {
+                    Some(size) => {
+                        let image_area =
+                            Rect::new(area.x, screen_y, size.width.min(area.width), visible_height);
+                        app.layout.overview_images.push(ImageHit {
+                            area: image_area,
+                            url: url.clone(),
+                        });
+                        if let Some(protocol) = app.overview_image_protocol_mut(url) {
+                            let top_clipped = visible_start > document_y;
+                            let resize = if top_clipped {
+                                Resize::Crop(Some(CropOptions {
+                                    clip_top: true,
+                                    clip_left: false,
+                                }))
+                            } else {
+                                Resize::Crop(None)
+                            };
+                            frame.render_stateful_widget(
+                                StatefulImage::default().resize(resize),
+                                image_area,
+                                protocol,
+                            );
+                        } else {
+                            frame.render_widget(
+                                Paragraph::new(Line::from(Span::styled(
+                                    presentation.placeholder.clone(),
+                                    Style::new().fg(theme.muted),
+                                ))),
+                                Rect::new(area.x, screen_y, area.width, 1),
+                            );
+                        }
+                    }
+                    None => {
+                        app.layout.overview_images.push(ImageHit {
+                            area: Rect::new(area.x, screen_y, area.width, visible_height.min(1)),
+                            url: url.clone(),
+                        });
+                        frame.render_widget(
+                            Paragraph::new(Line::from(Span::styled(
+                                presentation.placeholder.clone(),
+                                Style::new().fg(theme.muted),
+                            ))),
+                            Rect::new(area.x, screen_y, area.width, visible_height.min(1)),
+                        );
+                    }
+                }
+            }
+        }
+        document_y = block_end;
+    }
 }
 
 /// 承認/変更要求パネル（承認者・変更要求者の表示名を 1 行ずつ）。
@@ -693,76 +929,7 @@ fn replace_image_syntax_outside_code_fences(body: &str) -> String {
 /// 推移的依存のため型を名指しできず、`Color`/`Modifier` は `Display`/`Binary`（`fmt` 経由の
 /// 往復変換）で型名を経由せずに変換する。
 fn convert_markdown_text(body: &str) -> Vec<Line<'static>> {
-    let source = tui_markdown::from_str(body);
-    source
-        .lines
-        .into_iter()
-        .map(|line| {
-            let line_style = convert_markdown_style(
-                line.style.fg,
-                line.style.bg,
-                line.style.add_modifier,
-                line.style.sub_modifier,
-            );
-            let spans: Vec<Span<'static>> = line
-                .spans
-                .into_iter()
-                .map(|span| {
-                    let span_style = convert_markdown_style(
-                        span.style.fg,
-                        span.style.bg,
-                        span.style.add_modifier,
-                        span.style.sub_modifier,
-                    );
-                    Span::styled(span.content.into_owned(), span_style)
-                })
-                .collect();
-            Line::from(spans).style(line_style)
-        })
-        .collect()
-}
-
-/// [`convert_markdown_text`] の一部。`ratatui-core::style::Style` の各フィールド（型を名指し
-/// できないので個別の値として受け取る）を本クレートの `ratatui::style::Style` へ組み立て直す。
-fn convert_markdown_style<C, M>(
-    fg: Option<C>,
-    bg: Option<C>,
-    add_modifier: M,
-    sub_modifier: M,
-) -> Style
-where
-    C: std::fmt::Display,
-    M: std::fmt::Binary,
-{
-    Style {
-        fg: fg.map(convert_markdown_color),
-        bg: bg.map(convert_markdown_color),
-        add_modifier: convert_markdown_modifier(add_modifier),
-        sub_modifier: convert_markdown_modifier(sub_modifier),
-        ..Style::default()
-    }
-}
-
-/// `ratatui-core::style::Color` → `ratatui::style::Color`（本クレートの直接依存）。
-///
-/// 両者は同一のバリアント集合を持ち、`Display`/`FromStr` の書式も一致している
-/// （named 色はそのまま・`Rgb` は `#RRGGBB`・`Indexed` は数値文字列）ため、文字列往復で
-/// 型名を経由せずロスレスに変換できる。
-///
-/// この関数が生の `Color` を扱うのは `tui-markdown` 自身の配色（見出し・コード・リンク等）を
-/// そのまま持ち込むための型変換であり、本クレートが新たにハードコード色を選んでいるわけでは
-/// ない（`ui` 内の他の色選択は必ず `theme` 経由にすること）。
-fn convert_markdown_color<C: std::fmt::Display>(color: C) -> Color {
-    color.to_string().parse().unwrap_or(Color::Reset)
-}
-
-/// `ratatui-core::style::Modifier` → `ratatui::style::Modifier`。
-///
-/// どちらも同じビットフラグ定義（`bitflags!` 生成の `u16`）なので、`{:b}` で得たビットパターン
-/// をそのまま読み直せば型名を経由せず変換できる。
-fn convert_markdown_modifier<M: std::fmt::Binary>(modifier: M) -> Modifier {
-    let bits = u16::from_str_radix(&format!("{modifier:b}"), 2).unwrap_or(0);
-    Modifier::from_bits_truncate(bits)
+    crate::tui::richdoc::markdown_to_lines(body)
 }
 
 /// 画像記法 `![alt](url)` を TUI 向けの代替テキストへ置換する。
@@ -807,10 +974,11 @@ fn render_diffstat_list(
     frame: &mut Frame,
     area: Rect,
     diffstat: &mut SelectList<DiffStatEntry>,
+    focused: bool,
     theme: &Theme,
 ) {
     if diffstat.items.is_empty() {
-        let block = themed_block(theme, true).title(" 変更ファイル ");
+        let block = themed_block(theme, focused).title(" 変更ファイル ");
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "（差分情報なし）",
@@ -841,7 +1009,7 @@ fn render_diffstat_list(
         })
         .collect();
     let title = format!(" 変更ファイル ({}) ", diffstat.items.len());
-    let list = list_widget(theme, items, title);
+    let list = list_widget_with_focus(theme, items, title, focused);
     frame.render_stateful_widget(list, area, &mut diffstat.state);
 }
 
@@ -857,10 +1025,16 @@ fn diffstat_status_style(status: &str, theme: &Theme) -> Style {
     Style::new().fg(color)
 }
 
-fn render_comments(frame: &mut Frame, area: Rect, comments: &[Comment], theme: &Theme) {
+fn render_comments(
+    frame: &mut Frame,
+    area: Rect,
+    comments: &[Comment],
+    scroll: u16,
+    focused: bool,
+    theme: &Theme,
+) -> usize {
     let title = format!(" コメント ({}) ", comments.len());
-    // 静的な表示ペイン（スクロール等の操作を持たない）なので非フォーカス。
-    let block = themed_block(theme, false).title(title);
+    let block = themed_block(theme, focused).title(title);
     if comments.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -870,7 +1044,7 @@ fn render_comments(frame: &mut Frame, area: Rect, comments: &[Comment], theme: &
             .block(block),
             area,
         );
-        return;
+        return 1;
     }
     let mut lines = Vec::new();
     for comment in comments {
@@ -907,12 +1081,16 @@ fn render_comments(frame: &mut Frame, area: Rect, comments: &[Comment], theme: &
         }
         lines.push(Line::raw(""));
     }
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+    // `line_count` は Block の上下枠 2 行を加算して返すため差し引く（概要ペイン側と同じ）。
+    let rendered_line_count = paragraph
+        .line_count(area.width.saturating_sub(2))
+        .saturating_sub(2);
+    frame.render_widget(paragraph, area);
+    rendered_line_count
 }
 
 /// inline コメントの表示アンカー（`path:line`）。line は新ファイル行(`to`)を優先。
@@ -957,6 +1135,20 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
 
     render_diff_sidebar(frame, cols[0], diff, &theme);
     render_diff_body(frame, cols[1], diff, &theme);
+    app.layout.panes.extend([
+        (PaneKind::DiffFiles, cols[0]),
+        (PaneKind::DiffBody, cols[1]),
+    ]);
+    let visible_height = usize::from(cols[0].height.saturating_sub(2)).max(1);
+    let first_visible = diff
+        .file_index
+        .saturating_add(1)
+        .saturating_sub(visible_height);
+    app.layout.lists.push(ListLayout {
+        kind: ListKind::DiffFiles,
+        area: list_inner(cols[0]),
+        first_visible,
+    });
 }
 
 /// ファイル一覧サイドバー。選択中ファイル（`file_index`）をハイライトし、フォーカス中は
@@ -1177,6 +1369,12 @@ fn render_pipelines(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 
     render_pager(frame, pager_area, app.pipelines_page_info, &theme);
+    record_list(
+        app,
+        ListKind::Pipelines,
+        list_area,
+        app.pipelines.state.offset(),
+    );
 }
 
 fn pipeline_row(pipeline: &Pipeline, theme: &Theme) -> Line<'static> {
@@ -1228,6 +1426,15 @@ fn render_pipeline_detail(frame: &mut Frame, area: Rect, app: &mut App) {
         ),
     }
     render_steps_list(frame, rows[1], &mut app.pipeline_steps, &theme);
+    app.layout
+        .panes
+        .extend([(PaneKind::Static, rows[0]), (PaneKind::Static, rows[1])]);
+    record_list(
+        app,
+        ListKind::PipelineSteps,
+        rows[1],
+        app.pipeline_steps.state.offset(),
+    );
 }
 
 fn render_pipeline_meta(
@@ -1366,6 +1573,7 @@ fn render_step_log(frame: &mut Frame, area: Rect, app: &mut App) {
         .block(themed_block(&theme, true).title(title))
         .scroll((log.scroll.min(u16::MAX as usize) as u16, 0));
     frame.render_widget(paragraph, area);
+    app.layout.panes.push((PaneKind::StepLog, area));
 }
 
 // ---- リポジトリブラウズ（M3） ----
@@ -1395,6 +1603,12 @@ fn render_branches(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 
     render_pager(frame, pager_area, app.branches_page_info, &theme);
+    record_list(
+        app,
+        ListKind::Branches,
+        list_area,
+        app.branches.state.offset(),
+    );
 }
 
 fn branch_row(branch: &Branch, theme: &Theme) -> Line<'static> {
@@ -1430,6 +1644,7 @@ fn render_commits(frame: &mut Frame, area: Rect, app: &mut App) {
     let title = format!(" コミット [{revision}] ({}) ", app.commits.items.len());
     let list = list_widget(&theme, items, title);
     frame.render_stateful_widget(list, area, &mut app.commits.state);
+    record_list(app, ListKind::Commits, area, app.commits.state.offset());
 }
 
 fn commit_row(commit: &Commit, theme: &Theme) -> Line<'static> {
@@ -1461,6 +1676,7 @@ fn render_commit_detail(frame: &mut Frame, area: Rect, app: &mut App) {
             &theme,
         ),
     }
+    app.layout.panes.push((PaneKind::Static, area));
 }
 
 fn render_commit_meta_body(
@@ -1545,6 +1761,8 @@ fn render_source(frame: &mut Frame, area: Rect, app: &mut App) {
         .collect();
     let list = list_widget(&theme, items, title);
     frame.render_stateful_widget(list, area, &mut source.entries.state);
+    let offset = source.entries.state.offset();
+    record_list(app, ListKind::Source, area, offset);
 }
 
 fn src_entry_row(entry: &SrcEntry, theme: &Theme) -> Line<'static> {
@@ -1611,6 +1829,7 @@ fn render_file_view(frame: &mut Frame, area: Rect, app: &mut App) {
         .block(themed_block(&theme, true).title(title))
         .scroll((view.scroll.min(u16::MAX as usize) as u16, 0));
     frame.render_widget(paragraph, area);
+    app.layout.panes.push((PaneKind::FileView, area));
 }
 
 /// PR 本文内の画像を表示する（`i` で開く ImageView）。
@@ -1688,8 +1907,7 @@ fn short_datetime(value: &str) -> String {
     truncated.replacen('T', " ", 1)
 }
 
-fn render_confirm_modal(frame: &mut Frame, modal: &ConfirmModal, theme: &Theme) {
-    let area = centered_rect(60, 40, frame.area());
+fn render_confirm_modal(frame: &mut Frame, area: Rect, modal: &ConfirmModal, theme: &Theme) {
     frame.render_widget(Clear, area);
 
     let mut lines = vec![
@@ -1723,8 +1941,7 @@ fn render_confirm_modal(frame: &mut Frame, modal: &ConfirmModal, theme: &Theme) 
 }
 
 /// ページ番号ジャンプ（`g`）の入力プロンプトを描画する。数字入力 + `Enter` で移動、`Esc` で取消。
-fn render_page_jump(frame: &mut Frame, modal: &PageJumpModal, theme: &Theme) {
-    let area = centered_rect(46, 22, frame.area());
+fn render_page_jump(frame: &mut Frame, area: Rect, modal: &PageJumpModal, theme: &Theme) {
     frame.render_widget(Clear, area);
 
     // 入力中のカーソルを反転ブロックで示す（未入力でも位置が分かるように）。
@@ -1742,6 +1959,28 @@ fn render_page_jump(frame: &mut Frame, modal: &PageJumpModal, theme: &Theme) {
         .title(" ページ番号ジャンプ (g) ")
         .style(Style::new().bg(theme.bg));
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn render_link_palette(frame: &mut Frame, area: Rect, palette: &mut LinkPalette, theme: &Theme) {
+    frame.render_widget(Clear, area);
+    let items = palette
+        .links
+        .items
+        .iter()
+        .map(|link| {
+            let domain = link
+                .url
+                .split_once("://")
+                .map(|(_, rest)| rest.split('/').next().unwrap_or(rest))
+                .unwrap_or("");
+            ListItem::new(Line::from(vec![
+                Span::raw(link.label.clone()),
+                Span::styled(format!("  {domain}"), Style::new().fg(theme.muted)),
+            ]))
+        })
+        .collect();
+    let list = list_widget_with_focus(theme, items, " リンク (L) ".to_string(), true);
+    frame.render_stateful_widget(list, area, &mut palette.links.state);
 }
 
 fn render_placeholder(
@@ -1767,8 +2006,17 @@ fn render_placeholder(
 ///
 /// 常にフォーカス色の枠線を使う（一覧が表示される画面では、それが常に主たる操作対象のため）。
 fn list_widget<'a>(theme: &Theme, items: Vec<ListItem<'a>>, title: String) -> List<'a> {
+    list_widget_with_focus(theme, items, title, true)
+}
+
+fn list_widget_with_focus<'a>(
+    theme: &Theme,
+    items: Vec<ListItem<'a>>,
+    title: String,
+    focused: bool,
+) -> List<'a> {
     List::new(items)
-        .block(themed_block(theme, true).title(title))
+        .block(themed_block(theme, focused).title(title))
         .highlight_style(
             Style::new()
                 .bg(theme.selection_bg)
@@ -1853,6 +2101,11 @@ fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("Esc", "戻る"),
         ],
         Screen::PullRequestDetail => vec![
+            ("Tab", "ペイン移動"),
+            ("↑↓/jk", "フォーカス先を移動"),
+            ("Shift+J/K", "10行/10件"),
+            ("PgUp/PgDn", "1画面"),
+            ("g/G", "先頭/末尾"),
             ("d", "Diff"),
             ("c", "コメント"),
             ("a", "承認"),
@@ -1860,8 +2113,7 @@ fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("M", "マージ"),
             ("o", "ブラウザで開く"),
             ("i", "画像を表示"),
-            ("↑↓/jk", "ファイル"),
-            ("Shift+J/K", "本文10行"),
+            ("L", "リンク"),
             ("Esc", "戻る"),
         ],
         Screen::Diff => vec![
@@ -1953,12 +2205,26 @@ fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
     entries
 }
 
-fn render_hints(frame: &mut Frame, area: Rect, screen: Screen, theme: &Theme) {
+fn render_hints(frame: &mut Frame, area: Rect, app: &mut App) {
+    let screen = app.screen;
+    let theme = app.theme;
     let mut spans = Vec::new();
+    let mut x = area.x;
     for (index, (key, description)) in hint_entries(screen).iter().enumerate() {
         if index > 0 {
             spans.push(Span::raw("  "));
+            x = x.saturating_add(2);
         }
+        let item_width = UnicodeWidthStr::width(format!("{key} {description}").as_str())
+            .min(usize::from(u16::MAX)) as u16;
+        let visible_width = item_width.min(area.x.saturating_add(area.width).saturating_sub(x));
+        if visible_width > 0 {
+            app.layout.hints.push(HintLayout {
+                area: Rect::new(x, area.y, visible_width, area.height),
+                key: hint_key(key),
+            });
+        }
+        x = x.saturating_add(item_width);
         spans.push(Span::styled(*key, Style::new().fg(theme.accent)));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(*description, Style::new().fg(theme.muted)));
@@ -1966,8 +2232,31 @@ fn render_hints(frame: &mut Frame, area: Rect, screen: Screen, theme: &Theme) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_comment_editor(frame: &mut Frame, editor: &CommentEditor, theme: &Theme) {
-    let area = centered_rect(70, 50, frame.area());
+fn hint_key(label: &str) -> KeyEvent {
+    let (code, modifiers) = match label {
+        value if value.starts_with("Ctrl+C") => (KeyCode::Char('c'), KeyModifiers::CONTROL),
+        value if value.starts_with("Ctrl+K") => (KeyCode::Char('k'), KeyModifiers::CONTROL),
+        value if value.starts_with("Shift+J") => (KeyCode::Char('J'), KeyModifiers::SHIFT),
+        value if value.starts_with("Tab") => (KeyCode::Tab, KeyModifiers::NONE),
+        value if value.starts_with("Enter") => (KeyCode::Enter, KeyModifiers::NONE),
+        value if value.starts_with("Esc") || value.starts_with("Backspace/Esc") => {
+            (KeyCode::Esc, KeyModifiers::NONE)
+        }
+        value if value.starts_with("PgUp") => (KeyCode::PageDown, KeyModifiers::NONE),
+        value if value.starts_with("↑↓") => (KeyCode::Down, KeyModifiers::NONE),
+        value if value.starts_with("←→") => (KeyCode::Right, KeyModifiers::NONE),
+        value if value.starts_with("[/]") => (KeyCode::Char(']'), KeyModifiers::NONE),
+        value if value.starts_with("g/G") => (KeyCode::Char('G'), KeyModifiers::SHIFT),
+        value if value.starts_with("n/N") => (KeyCode::Char('n'), KeyModifiers::NONE),
+        _ => (
+            KeyCode::Char(label.chars().next().unwrap_or('?')),
+            KeyModifiers::NONE,
+        ),
+    };
+    KeyEvent::new(code, modifiers)
+}
+
+fn render_comment_editor(frame: &mut Frame, area: Rect, editor: &CommentEditor, theme: &Theme) {
     frame.render_widget(Clear, area);
 
     let mut lines: Vec<Line> = if editor.text.is_empty() {
@@ -2013,11 +2302,11 @@ fn render_comment_editor(frame: &mut Frame, editor: &CommentEditor, theme: &Them
 
 fn render_merge_modal(
     frame: &mut Frame,
+    area: Rect,
     modal: &MergeModal,
     pr: Option<&PullRequest>,
     theme: &Theme,
 ) {
-    let area = centered_rect(60, 55, frame.area());
     frame.render_widget(Clear, area);
 
     let title = pr
@@ -2073,8 +2362,7 @@ fn render_merge_modal(
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_help(frame: &mut Frame, screen: Screen, theme: &Theme) {
-    let area = centered_rect(64, 70, frame.area());
+fn render_help(frame: &mut Frame, area: Rect, screen: Screen, theme: &Theme) {
     frame.render_widget(Clear, area);
 
     let mut lines = vec![
@@ -2094,6 +2382,11 @@ fn render_help(frame: &mut Frame, screen: Screen, theme: &Theme) {
         Line::raw("Ctrl+C         強制終了（常に有効）"),
         Line::raw("/              検索（Workspaces/Repositories/PullRequests。文字入力で絞込み、"),
         Line::raw("               Enter で確定、Esc で解除）"),
+        Line::raw("マウス         ホイールはカーソル下を3行/3件移動。クリックはペイン/行/リンク/"),
+        Line::raw("               画像/ヒントを操作（選択済み行の再クリックは Enter 相当）"),
+        Line::raw("Shift+ドラッグ 端末本来のテキスト選択（マウスキャプチャ中）"),
+        Line::raw("               多重化端末ではマウスイベントのパススルー実装に依存"),
+        Line::raw("確認モーダル   外側クリックは取消。内側クリックでは決定せず Enter のみ実行"),
     ];
 
     let screen_keys: &[&str] = match screen {
@@ -2126,6 +2419,11 @@ fn render_help(frame: &mut Frame, screen: Screen, theme: &Theme) {
             "g              ページ番号ジャンプ（数字入力 + Enter, Esc で取消）",
         ],
         Screen::PullRequestDetail => &[
+            "Tab / Shift+Tab ペイン移動（概要 → 変更ファイル → コメント）",
+            "↑↓ / j k       フォーカス先を 1 行 / 1 件移動",
+            "Shift+J / K    フォーカス先を 10 行 / 10 件移動",
+            "PgUp/PgDn      概要・コメントを 1 画面スクロール",
+            "g / G          フォーカス先の先頭 / 末尾へ",
             "d              Diff を開く",
             "c              コメント投稿（Enter 改行 / Ctrl+S 送信 / Esc 取消）",
             "a              approve / unapprove トグル",
@@ -2134,9 +2432,7 @@ fn render_help(frame: &mut Frame, screen: Screen, theme: &Theme) {
             "               Enter 実行, Esc 取消）",
             "o              ブラウザで開く（`open` コマンドで既定ブラウザに開く）",
             "i              本文の画像を表示（画像が無い/端末が未対応なら Status に案内）",
-            "↑↓ / j k       変更ファイル選択",
-            "PgUp/PgDn      本文スクロール（±5 行）",
-            "Shift+J / K    本文スクロール（±10 行）",
+            "L              本文・コメントのリンク一覧（Enter でブラウザ、Esc で閉じる）",
         ],
         Screen::Diff => &[
             "Tab            ファイル一覧 / 本文フォーカス切替",
@@ -2258,8 +2554,12 @@ fn render_help(frame: &mut Frame, screen: Screen, theme: &Theme) {
 }
 
 /// ジャンプパレット（`Ctrl+K`）を描画する。入力行 + ヒント行 + 候補一覧の 3 段構成。
-fn render_jump_palette(frame: &mut Frame, palette: &mut JumpPaletteState, theme: &Theme) {
-    let area = centered_rect(70, 60, frame.area());
+fn render_jump_palette(
+    frame: &mut Frame,
+    area: Rect,
+    palette: &mut JumpPaletteState,
+    theme: &Theme,
+) {
     frame.render_widget(Clear, area);
 
     let block = rounded_block(theme, theme.border_focus)
@@ -2855,7 +3155,6 @@ mod tests {
             app.detail_body_rendered_lines.is_some(),
             "初回描画で本文の実測行数が書き戻されるべき"
         );
-
         for _ in 0..200 {
             app.update(Msg::Key(KeyEvent::new(
                 KeyCode::PageDown,
@@ -2879,6 +3178,62 @@ mod tests {
             app.detail_scroll, stabilized,
             "スクロール上限で止まらず伸び続けている（clamp が破綻している）"
         );
+    }
+
+    #[test]
+    fn overview_line_count_uses_post_wrap_paragraph_height() {
+        use crate::config::Config;
+
+        let body = "日本語の長い本文とhttps://example.com/a/very/long/pathを含む行".repeat(12);
+        let description = serde_json::to_string(&body).expect("json string");
+        let pr = make_pr_with_participants(&format!(
+            r#"{{ "id": 1, "description": {description}, "participants": [] }}"#
+        ));
+        let mut app = App::new(Config::default(), None);
+        app.theme = Theme::default();
+        app.screen = Screen::PullRequestDetail;
+        app.current_pr = Some(pr);
+
+        let backend = TestBackend::new(32, 18);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("draw succeeds");
+
+        let rendered = app.detail_body_rendered_lines.unwrap_or(0);
+        assert!(rendered > 5);
+        app.detail_scroll = u16::MAX;
+        app.clamp_detail_scroll();
+        assert_eq!(
+            app.detail_scroll as usize,
+            rendered.saturating_sub(app.detail_viewport.max(1))
+        );
+    }
+
+    #[test]
+    fn overview_render_exposes_rich_document_link_positions_on_app() {
+        use crate::config::Config;
+
+        let pr = make_pr_with_participants(
+            r#"{ "id": 1, "description": "before [docs](https://example.com/docs) after", "participants": [] }"#,
+        );
+        let mut app = App::new(Config::default(), None);
+        app.theme = Theme::default();
+        app.screen = Screen::PullRequestDetail;
+        app.current_pr = Some(pr);
+
+        let backend = TestBackend::new(50, 18);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("draw succeeds");
+
+        let position = app
+            .overview_link_positions
+            .first()
+            .expect("overview link position");
+        assert_eq!(position.urls, vec!["https://example.com/docs"]);
+        assert!(position.column_range.start < position.column_range.end);
     }
 
     #[test]
@@ -2932,7 +3287,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("terminal builds");
         terminal
             .draw(|frame| {
-                render_comments(frame, frame.area(), &comments, &theme);
+                render_comments(frame, frame.area(), &comments, 0, false, &theme);
             })
             .expect("draw succeeds");
         let text = buffer_text(terminal.backend().buffer());

@@ -6,6 +6,7 @@ pub mod event;
 pub mod imageview;
 pub mod logview;
 pub mod onboarding;
+pub mod richdoc;
 pub mod theme;
 pub mod ui;
 
@@ -14,6 +15,7 @@ use std::io::{self, Stdout};
 use anyhow::{Context, Result};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -35,10 +37,18 @@ impl Tui {
         install_panic_hook();
         enable_raw_mode().context("raw mode への切り替えに失敗しました")?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)
-            .context("オルタネートスクリーンへの切り替えに失敗しました")?;
+        if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+            let _ = restore();
+            return Err(error).context("端末画面とマウスキャプチャの初期化に失敗しました");
+        }
         let backend = CrosstermBackend::new(io::stdout());
-        let terminal = Terminal::new(backend).context("端末バックエンドの初期化に失敗しました")?;
+        let terminal = match Terminal::new(backend) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                let _ = restore();
+                return Err(error).context("端末バックエンドの初期化に失敗しました");
+            }
+        };
         Ok(Self { terminal })
     }
 }
@@ -52,9 +62,9 @@ impl Drop for Tui {
 
 /// 端末を通常状態へ戻す。
 fn restore() -> io::Result<()> {
-    disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
-    Ok(())
+    let screen_result = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+    let raw_result = disable_raw_mode();
+    screen_result.and(raw_result)
 }
 
 /// パニック時に端末を復元してから既定のフックへ委譲する。

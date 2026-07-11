@@ -13,6 +13,12 @@ use thiserror::Error;
 /// 文字列化して保持する。
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ApiError {
+    /// Bitbucket の PR 添付画像が web ログインへ転送され、API token では取得できない。
+    #[error(
+        "この画像（Bitbucket 添付）は API token では取得できません。o でブラウザ表示してください"
+    )]
+    BitbucketAttachmentUnavailable,
+
     /// 401。メールアドレスまたは API token が不正。
     #[error("認証に失敗しました（メールアドレスまたは API token が不正です）")]
     Auth,

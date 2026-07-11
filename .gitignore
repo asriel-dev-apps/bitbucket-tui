@@ -4,3 +4,6 @@
 # Vendored dependencies + local cargo offline config (regenerate with `cargo vendor`)
 /vendor
 /.cargo/config.toml
+
+# Local development notes (not part of the published project)
+/.claude/

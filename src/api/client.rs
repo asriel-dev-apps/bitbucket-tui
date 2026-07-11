@@ -7,7 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use reqwest::{Client as HttpClient, Method};
+use reqwest::{Client as HttpClient, Method, RequestBuilder, Url};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -468,19 +468,24 @@ impl BitbucketClient {
         self.send_get_text(url).await
     }
 
-    /// PR 本文の画像 URL から生バイトを取得する（認証付き Basic、リダイレクトは reqwest の
-    /// 既定ポリシーで追従する）。
+    /// PR 本文の画像 URL から生バイトを取得する。
+    ///
+    /// Bitbucket ホストにだけ Basic 認証を付ける。リダイレクトは reqwest の既定ポリシーで
+    /// 追従し、別ホストへ移る場合は reqwest が Authorization を除去する。
     ///
     /// `max_bytes` を超える場合は拒否する（`Content-Length` があれば受信前に、無ければ受信後の
     /// 実サイズで判定する）。
     pub async fn get_image_bytes(&self, url: &str, max_bytes: usize) -> Result<Vec<u8>, ApiError> {
-        let response = self
-            .http
-            .get(url)
-            .basic_auth(&self.email, Some(&self.token))
+        let request = self.http.get(url);
+        let request = with_bitbucket_auth(request, url, &self.email, &self.token);
+        let response = request
             .send()
             .await
             .map_err(|error| ApiError::Network(error.to_string()))?;
+
+        if let Some(error) = image_redirect_error(response.url()) {
+            return Err(error);
+        }
 
         if !response.status().is_success() {
             return Err(response_to_error(response).await);
@@ -657,6 +662,37 @@ impl BitbucketClient {
     }
 }
 
+/// 画像 URL が Bitbucket の認証対象ホストなら Basic 認証を付ける。
+///
+/// URL を解析できない場合も認証情報を付けず、reqwest 自身の URL エラーとして扱わせる。
+fn with_bitbucket_auth(
+    request: RequestBuilder,
+    url: &str,
+    email: &str,
+    token: &str,
+) -> RequestBuilder {
+    if Url::parse(url).is_ok_and(|url| should_attach_auth(&url)) {
+        request.basic_auth(email, Some(token))
+    } else {
+        request
+    }
+}
+
+/// Authorization を送ってよい Bitbucket ホストか。
+fn should_attach_auth(url: &Url) -> bool {
+    matches!(url.host_str(), Some("bitbucket.org" | "api.bitbucket.org"))
+}
+
+/// Bitbucket の web ログイン URL か。クエリ文字列は判定に影響しない。
+fn is_bitbucket_signin_url(url: &Url) -> bool {
+    url.host_str() == Some("bitbucket.org") && url.path().trim_end_matches('/') == "/account/signin"
+}
+
+/// 画像取得後の最終 URL を、Bitbucket 添付画像固有のエラーへ変換する。
+fn image_redirect_error(url: &Url) -> Option<ApiError> {
+    is_bitbucket_signin_url(url).then_some(ApiError::BitbucketAttachmentUnavailable)
+}
+
 /// 単一ページ取得の結果（値とページ情報）。[`BitbucketClient::get_workspaces_page`] 等が返す。
 #[derive(Debug, Clone)]
 pub struct Page<T> {
@@ -830,6 +866,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::header::AUTHORIZATION;
 
     fn make_page<T>(values: Vec<T>, next: Option<&str>) -> Paginated<T> {
         Paginated {
@@ -839,6 +876,53 @@ mod tests {
             size: None,
             pagelen: None,
         }
+    }
+
+    fn image_request(url: &str) -> reqwest::Request {
+        let http = HttpClient::new();
+        with_bitbucket_auth(http.get(url), url, "me@example.com", "secret")
+            .build()
+            .expect("test request should build")
+    }
+
+    #[test]
+    fn image_auth_is_attached_only_to_bitbucket_hosts() {
+        for url in [
+            "https://bitbucket.org/workspace/repo/images/file.png",
+            "https://api.bitbucket.org/2.0/repositories/workspace/repo",
+        ] {
+            assert!(image_request(url).headers().contains_key(AUTHORIZATION));
+        }
+
+        for url in [
+            "https://images.example.com/file.png",
+            "https://bitbucket.org.evil.example/file.png",
+            "https://subdomain.bitbucket.org/file.png",
+        ] {
+            assert!(!image_request(url).headers().contains_key(AUTHORIZATION));
+        }
+    }
+
+    #[test]
+    fn image_auth_is_not_reattached_after_redirect_to_other_host() {
+        let initial = image_request("https://bitbucket.org/workspace/repo/images/file.png");
+        let redirected = image_request("https://cdn.example.com/file.png");
+
+        assert!(initial.headers().contains_key(AUTHORIZATION));
+        assert!(!redirected.headers().contains_key(AUTHORIZATION));
+    }
+
+    #[test]
+    fn signin_redirect_becomes_attachment_unavailable_error_with_exact_message() {
+        let url = Url::parse("https://bitbucket.org/account/signin/?next=%2Fimage")
+            .expect("test URL should parse");
+        let error = image_redirect_error(&url).expect("signin URL should become an error");
+
+        assert_eq!(error, ApiError::BitbucketAttachmentUnavailable);
+        assert_eq!(
+            error.to_string(),
+            "この画像（Bitbucket 添付）は API token では取得できません。o でブラウザ表示してください"
+        );
     }
 
     #[tokio::test]

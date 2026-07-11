@@ -5,7 +5,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-ratatui = "0.29"
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
@@ -23,6 +23,8 @@ base64 = "0.22"
 tui-markdown = "0.3.8"
 ratatui-image = "8.1.1"
 nucleo-matcher = "0.3.1"
+unicode-segmentation = "1"
+unicode-width = "0.2"
 # ratatui-image は 8.1.1 に固定する（ratatui 0.29 互換の最新版。9.0 以降は内部 ratatui が
 # ^0.30 になり本クレートの ratatui と型非互換＝StatefulImage が使えなくなる。本体の ratatui を
 # 0.30 系へ上げるときに合わせて更新する）。`image` は画像デコード（取得 bytes → DynamicImage）を
