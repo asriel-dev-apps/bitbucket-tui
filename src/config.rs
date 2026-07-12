@@ -25,6 +25,10 @@ pub struct Config {
     /// 未設定/未知の値は既定テーマ（Catppuccin Mocha）にフォールバックする。
     #[serde(default)]
     pub theme: Option<String>,
+    /// Diff 画面の表示モード（[`crate::tui::app::DiffViewMode::as_str`] の値、`v` で切替）。
+    /// 任意。未設定/未知の値は既定（unified）にフォールバックする。
+    #[serde(default)]
+    pub diff_view: Option<String>,
 }
 
 /// このアプリの `ProjectDirs` を返す。

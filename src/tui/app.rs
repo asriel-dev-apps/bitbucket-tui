@@ -335,6 +335,46 @@ pub enum DiffFocus {
     Body,
 }
 
+/// Diff 画面の本文表示モード（`v` で切替、`config.toml` の `diff_view` に永続化）。
+///
+/// [`DiffState::cursor`]/`scroll` はどちらのモードでも「現在アクティブなモードの行列
+/// （unified なら `ParsedDiff::lines`、split なら `ParsedDiff::split_lines`）上のインデックス」
+/// として扱う（`DiffState::total_lines`/`active_file_starts` がモードに応じて切り替える）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiffViewMode {
+    /// 通常のユニファイド diff 表示（1 カラム）。
+    #[default]
+    Unified,
+    /// 左=旧ファイル/右=新ファイルの並列表示（2 カラム）。
+    Split,
+}
+
+impl DiffViewMode {
+    /// `config.toml` へ保存する文字列表現。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DiffViewMode::Unified => "unified",
+            DiffViewMode::Split => "split",
+        }
+    }
+
+    /// `config.toml` から読み込んだ文字列をモードへ変換する。未知の値は既定（unified）。
+    pub fn from_config_str(value: &str) -> DiffViewMode {
+        match value {
+            "split" => DiffViewMode::Split,
+            _ => DiffViewMode::Unified,
+        }
+    }
+
+    /// もう一方のモードへ切り替える（`v`）。
+    fn toggled(self) -> DiffViewMode {
+        match self {
+            DiffViewMode::Unified => DiffViewMode::Split,
+            DiffViewMode::Split => DiffViewMode::Unified,
+        }
+    }
+}
+
 /// Diff 画面の表示状態（スクロール・現在行カーソル・ファイル境界ジャンプ・サイドバー選択）。
 #[derive(Debug, Clone, Default)]
 pub struct DiffState {
@@ -354,6 +394,11 @@ pub struct DiffState {
     /// 現在行ハイライトはこのキャッシュに焼き込まず、描画時に viewport 内の該当行だけ
     /// スタイルを上書きする（`ui::render_diff_body`）。
     pub rendered_lines: Option<Vec<Line<'static>>>,
+    /// split 表示（左=旧ファイル/右=新ファイル）用の着色済み行ペアの遅延キャッシュ。
+    /// `rendered_lines` と同じ理由・同じ無効化ルール（テーマ変更時に `None` へ戻す）で
+    /// 一度だけ構築し使い回す（`ui::render_diff_body_split`）。要素は
+    /// `parsed.split_lines` と同じ並び・同じ長さ（`(左ペインの行, 右ペインの行)`）。
+    pub rendered_split: Option<Vec<(Line<'static>, Line<'static>)>>,
     /// サイドバーで選択中のファイルインデックス（`parsed.files` へのインデックス）。
     ///
     /// `next_file`/`prev_file`（`n`/`N`）とサイドバー選択（`Tab` でフォーカス移動後の
@@ -361,24 +406,45 @@ pub struct DiffState {
     /// サイドバーの選択が追従し、その逆も成り立つ）。
     pub file_index: usize,
     /// 現在行（本文フォーカス時の ↑↓/jk/Shift+J/K/PgUp/PgDn/g/G/n/N が動かす「今見ている行」）。
-    /// `comment_anchor`/位置表示（`ファイルパス:行番号`）の基準にもなる。
+    /// `comment_anchor`/位置表示（`ファイルパス:行番号`）の基準にもなる。`view_mode` に応じて
+    /// unified 行インデックス（[`ParsedDiff::lines`]）か split 行インデックス
+    /// （[`ParsedDiff::split_lines`]）のどちらかを指す（[`DiffState::total_lines`] 参照）。
     pub cursor: usize,
     /// 画面内フォーカス（ファイル一覧 / 本文）。
     pub focus: DiffFocus,
+    /// 本文の表示モード（unified / split）。`v` で切替。
+    pub view_mode: DiffViewMode,
 }
 
 impl DiffState {
+    /// 現在のモード（`view_mode`）でアクティブな行列の総行数。
+    fn total_lines(&self) -> usize {
+        match self.view_mode {
+            DiffViewMode::Unified => self.parsed.lines.len(),
+            DiffViewMode::Split => self.parsed.split_lines.len(),
+        }
+    }
+
+    /// 現在のモードでアクティブなファイル境界（`scroll`/`cursor` と同じ行列上の
+    /// インデックス列）。
+    fn active_file_starts(&self) -> &[usize] {
+        match self.view_mode {
+            DiffViewMode::Unified => &self.parsed.file_starts,
+            DiffViewMode::Split => &self.parsed.split_file_starts,
+        }
+    }
+
     fn max_scroll(&self) -> usize {
-        self.parsed.len().saturating_sub(self.viewport.max(1))
+        self.total_lines().saturating_sub(self.viewport.max(1))
     }
 
     /// 現在行（`cursor`）を `delta` 行分移動する（負値で上、正値で下）。総行数の範囲内に
     /// クランプし、移動後は viewport 内に収まるよう `scroll` を自動調整する。
     fn move_cursor(&mut self, delta: i64) {
-        if self.parsed.is_empty() {
+        if self.total_lines() == 0 {
             return;
         }
-        let max_index = self.parsed.len() - 1;
+        let max_index = self.total_lines() - 1;
         let next = (self.cursor as i64 + delta).clamp(0, max_index as i64);
         self.cursor = next as usize;
         self.ensure_cursor_visible();
@@ -392,7 +458,7 @@ impl DiffState {
 
     /// 現在行を末尾へ（`G`/`End`）。
     fn cursor_to_bottom(&mut self) {
-        self.cursor = self.parsed.len().saturating_sub(1);
+        self.cursor = self.total_lines().saturating_sub(1);
         self.ensure_cursor_visible();
     }
 
@@ -412,8 +478,7 @@ impl DiffState {
     /// （`cursor`）ともにそのファイルの先頭へ同期する。
     fn next_file(&mut self) {
         if let Some((index, &start)) = self
-            .parsed
-            .file_starts
+            .active_file_starts()
             .iter()
             .enumerate()
             .find(|&(_, &start)| start > self.scroll)
@@ -426,8 +491,7 @@ impl DiffState {
     /// （`cursor`）ともにそのファイルの先頭へ同期する。
     fn prev_file(&mut self) {
         if let Some((index, &start)) = self
-            .parsed
-            .file_starts
+            .active_file_starts()
             .iter()
             .enumerate()
             .rev()
@@ -440,7 +504,11 @@ impl DiffState {
     /// サイドバーで指定インデックスのファイルを選択し、本文の `scroll`/現在行 `cursor` を
     /// 先頭行に合わせる。範囲外は何もしない（パニックしない）。
     fn select_file(&mut self, index: usize) {
-        if let Some(start) = self.parsed.files.get(index).map(|file| file.start) {
+        let start = match self.view_mode {
+            DiffViewMode::Unified => self.parsed.files.get(index).map(|file| file.start),
+            DiffViewMode::Split => self.parsed.split_file_starts.get(index).copied(),
+        };
+        if let Some(start) = start {
             self.jump_to_file(index, start);
         }
     }
@@ -449,7 +517,7 @@ impl DiffState {
     fn jump_to_file(&mut self, index: usize, start: usize) {
         self.file_index = index;
         self.scroll = start.min(self.max_scroll());
-        self.cursor = start.min(self.parsed.len().saturating_sub(1));
+        self.cursor = start.min(self.total_lines().saturating_sub(1));
     }
 
     /// サイドバー選択を 1 つ下へ（末尾で停止）。
@@ -475,6 +543,58 @@ impl DiffState {
             DiffFocus::Files => DiffFocus::Body,
             DiffFocus::Body => DiffFocus::Files,
         };
+    }
+
+    /// 本文の表示モードを `mode` へ切り替える（`v`）。現在行を新モードの対応する行へ変換し
+    /// （unified⇔split の同じ unified 行を指すよう [`SplitLine`] の左右から逆引きする）、
+    /// viewport 内に収まるよう `scroll` を調整し直す。既に同じモードなら何もしない。
+    fn set_view_mode(&mut self, mode: DiffViewMode) {
+        if self.view_mode == mode {
+            return;
+        }
+        self.cursor = self.convert_cursor_for_mode(self.cursor, mode);
+        self.view_mode = mode;
+        self.ensure_cursor_visible();
+    }
+
+    /// `cursor`（現在の `view_mode` 上のインデックス）を `target` モード上の対応インデックスへ
+    /// 変換する。対応が取れない場合（想定外の不整合）は `0` にフォールバックする。
+    fn convert_cursor_for_mode(&self, cursor: usize, target: DiffViewMode) -> usize {
+        match (self.view_mode, target) {
+            (DiffViewMode::Unified, DiffViewMode::Split) => self
+                .parsed
+                .split_lines
+                .iter()
+                .position(|row| row.left == Some(cursor) || row.right == Some(cursor))
+                .unwrap_or(0),
+            (DiffViewMode::Split, DiffViewMode::Unified) => self
+                .parsed
+                .split_lines
+                .get(cursor)
+                .and_then(|row| row.right.or(row.left))
+                .unwrap_or(0),
+            _ => cursor,
+        }
+    }
+
+    /// 現在行が属するファイルの表示名（`view_mode` に応じて unified/split いずれかの
+    /// 行から解決する）。
+    pub fn current_file(&self) -> Option<&str> {
+        match self.view_mode {
+            DiffViewMode::Unified => self.parsed.file_for_line(self.cursor),
+            DiffViewMode::Split => self.parsed.split_file_for_line(self.cursor),
+        }
+    }
+
+    /// 現在行のインラインコメント投稿アンカー（`view_mode` に応じて unified/split いずれかの
+    /// 規則で算出する。split の規則は「新側があれば新側、無ければ旧側」で、これは
+    /// [`ParsedDiff::split_comment_anchor`] が unified と同じ既存規則へ委譲することで
+    /// 実現している）。
+    pub fn current_comment_anchor(&self) -> Option<CommentAnchor> {
+        match self.view_mode {
+            DiffViewMode::Unified => self.parsed.comment_anchor(self.cursor),
+            DiffViewMode::Split => self.parsed.split_comment_anchor(self.cursor),
+        }
     }
 }
 
@@ -1188,6 +1308,9 @@ pub struct App {
     pub theme: Theme,
     /// 現在のテーマ名（`config.theme` の永続化・巡回の起点に使う）。
     pub theme_name: ThemeName,
+    /// Diff 画面の表示モード（`config.diff_view` の永続化の起点。`v` で切替。新しく
+    /// diff を読み込むたび、この値で `DiffState::view_mode` を初期化する）。
+    pub diff_view_mode: DiffViewMode,
     /// 直近描画フレームのペイン・一覧・モーダル・ヒント配置。
     pub layout: AppLayout,
     pub me: Me,
@@ -1466,12 +1589,18 @@ impl App {
             .map(ThemeName::from_config_str)
             .unwrap_or_default();
         let theme = theme_name.theme();
+        let diff_view_mode = config
+            .diff_view
+            .as_deref()
+            .map(DiffViewMode::from_config_str)
+            .unwrap_or_default();
         Self {
             screen: Screen::Onboarding,
             config,
             client,
             theme,
             theme_name,
+            diff_view_mode,
             layout: AppLayout::default(),
             me,
             onboarding,
@@ -1682,9 +1811,11 @@ impl App {
                         viewport: 0,
                         title: format!("#{id}"),
                         rendered_lines: None,
+                        rendered_split: None,
                         file_index: 0,
                         cursor: 0,
                         focus: DiffFocus::Body,
+                        view_mode: self.diff_view_mode,
                     });
                 }
                 Command::None
@@ -1857,9 +1988,11 @@ impl App {
                         viewport: 0,
                         title: short_hash_str(&spec),
                         rendered_lines: None,
+                        rendered_split: None,
                         file_index: 0,
                         cursor: 0,
                         focus: DiffFocus::Body,
+                        view_mode: self.diff_view_mode,
                     });
                 }
                 Command::None
@@ -2424,14 +2557,15 @@ impl App {
     }
 
     /// テーマを次へ巡回する（`Ctrl+T`）。`config.toml` へ永続化し、Diff の着色済み行
-    /// キャッシュ（[`DiffState::rendered_lines`]）を無効化して次回描画で新テーマ色を
-    /// 再構築させる（無効化しないと旧テーマの色のまま表示され続ける）。
+    /// キャッシュ（[`DiffState::rendered_lines`]/[`DiffState::rendered_split`]）を無効化して
+    /// 次回描画で新テーマ色を再構築させる（無効化しないと旧テーマの色のまま表示され続ける）。
     fn cycle_theme(&mut self) -> Command {
         self.theme_name = self.theme_name.next();
         self.theme = self.theme_name.theme();
 
         if let Some(diff) = self.diff.as_mut() {
             diff.rendered_lines = None;
+            diff.rendered_split = None;
         }
 
         self.config.theme = Some(self.theme_name.as_str().to_string());
@@ -3841,6 +3975,7 @@ impl App {
                 return Command::None;
             }
             KeyCode::Char('c') => return self.open_inline_comment_editor(),
+            KeyCode::Char('v') => return self.toggle_diff_view_mode(),
             _ => {}
         }
 
@@ -3893,11 +4028,29 @@ impl App {
         let Some(diff) = self.diff.as_ref() else {
             return Command::None;
         };
-        let Some(anchor) = diff.parsed.comment_anchor(diff.cursor) else {
+        let Some(anchor) = diff.current_comment_anchor() else {
             self.status = Status::Error("この行にはコメントできません".to_string());
             return Command::None;
         };
         self.comment_editor = Some(CommentEditor::inline(anchor));
+        Command::None
+    }
+
+    /// Diff 画面の表示モード（unified/split）を切り替える（`v`）。`config.toml` へ永続化し、
+    /// 開いている diff があれば現在行を新モードの対応する行へ変換しつつ切り替える
+    /// （[`DiffState::set_view_mode`]）。着色済み行キャッシュ（`rendered_lines`/
+    /// `rendered_split`）は無効化しない: モードごとに別フィールドで独立にキャッシュしており、
+    /// 一度構築した側は再度そのモードへ戻った際にそのまま再利用できるため。
+    fn toggle_diff_view_mode(&mut self) -> Command {
+        self.diff_view_mode = self.diff_view_mode.toggled();
+        if let Some(diff) = self.diff.as_mut() {
+            diff.set_view_mode(self.diff_view_mode);
+        }
+        self.config.diff_view = Some(self.diff_view_mode.as_str().to_string());
+        if let Err(error) = self.config.save() {
+            // 設定保存の失敗は致命ではない（他の config 保存箇所と同じ方針）。
+            tracing::warn!(%error, "Diff 表示モード設定の保存に失敗しました");
+        }
         Command::None
     }
 
@@ -5391,20 +5544,23 @@ mod tests {
             viewport: 0,
             title: "#1".to_string(),
             rendered_lines: Some(Vec::new()),
+            rendered_split: Some(Vec::new()),
             file_index: 0,
             cursor: 0,
             focus: DiffFocus::Body,
+            view_mode: DiffViewMode::Unified,
         });
 
         app.update(Msg::Key(ctrl(KeyCode::Char('t'))));
 
+        let diff = app.diff.as_ref().expect("diff は保持されたまま");
         assert!(
-            app.diff
-                .as_ref()
-                .expect("diff は保持されたまま")
-                .rendered_lines
-                .is_none(),
+            diff.rendered_lines.is_none(),
             "テーマ切替後は着色済み行キャッシュを無効化するべき"
+        );
+        assert!(
+            diff.rendered_split.is_none(),
+            "テーマ切替後は split 表示の着色済み行キャッシュも無効化するべき"
         );
     }
 
@@ -6272,6 +6428,225 @@ diff --git a/two.txt b/two.txt\n\
         assert_eq!(diff.scroll, 0);
     }
 
+    // ---- split 表示（`v`。#Diff-split-view） ----
+
+    #[test]
+    fn diff_v_key_toggles_view_mode_between_unified_and_split() {
+        let mut app = diff_app_with_lines(10, 10);
+        assert_eq!(
+            app.diff.as_ref().expect("diff").view_mode,
+            DiffViewMode::Unified
+        );
+
+        app.update(Msg::Key(key(KeyCode::Char('v'))));
+        assert_eq!(
+            app.diff.as_ref().expect("diff").view_mode,
+            DiffViewMode::Split
+        );
+        assert_eq!(app.diff_view_mode, DiffViewMode::Split);
+
+        app.update(Msg::Key(key(KeyCode::Char('v'))));
+        assert_eq!(
+            app.diff.as_ref().expect("diff").view_mode,
+            DiffViewMode::Unified
+        );
+        assert_eq!(app.diff_view_mode, DiffViewMode::Unified);
+    }
+
+    #[test]
+    fn diff_v_key_persists_view_mode_to_config() {
+        let mut app = diff_app_with_lines(10, 10);
+        app.update(Msg::Key(key(KeyCode::Char('v'))));
+        assert_eq!(app.config.diff_view.as_deref(), Some("split"));
+
+        app.update(Msg::Key(key(KeyCode::Char('v'))));
+        assert_eq!(app.config.diff_view.as_deref(), Some("unified"));
+    }
+
+    #[test]
+    fn app_new_initializes_diff_view_mode_from_config() {
+        let config = Config {
+            diff_view: Some("split".to_string()),
+            ..Config::default()
+        };
+        let app = App::new(config, None);
+        assert_eq!(app.diff_view_mode, DiffViewMode::Split);
+    }
+
+    #[test]
+    fn diff_loaded_uses_persisted_diff_view_mode() {
+        let mut app = review_app();
+        app.current_pr = Some(make_pr(9, "OPEN"));
+        app.screen = Screen::Diff;
+        app.diff_view_mode = DiffViewMode::Split;
+
+        app.update(Msg::DiffLoaded {
+            id: 9,
+            text: " context\n".to_string(),
+        });
+
+        assert_eq!(
+            app.diff.as_ref().expect("diff").view_mode,
+            DiffViewMode::Split
+        );
+    }
+
+    #[test]
+    fn diff_v_key_maps_cursor_to_corresponding_split_row_and_back() {
+        let mut app = review_app();
+        app.current_pr = Some(make_pr(9, "OPEN"));
+        app.screen = Screen::Diff;
+        app.diff_return = Screen::PullRequestDetail;
+        let text = "diff --git a/x b/x\n@@ -1 +1 @@\n-old\n+new\n".to_string();
+        app.update(Msg::DiffLoaded { id: 9, text });
+        {
+            let diff = app.diff.as_mut().expect("diff");
+            diff.viewport = 10;
+            diff.cursor = 3; // unified インデックス 3 = "+new"
+        }
+
+        app.update(Msg::Key(key(KeyCode::Char('v'))));
+        let diff = app.diff.as_ref().expect("diff");
+        assert_eq!(diff.view_mode, DiffViewMode::Split);
+        // unified: 0 diff--git / 1 @@ / 2 -old / 3 +new。
+        // split_lines: [(0,0),(1,1),(2,3)]（削除・追加が同じペア行にまとまる）。
+        assert_eq!(
+            diff.cursor, 2,
+            "unified の cursor=3 は split のペア行(2)へ変換される"
+        );
+
+        app.update(Msg::Key(key(KeyCode::Char('v'))));
+        let diff = app.diff.as_ref().expect("diff");
+        assert_eq!(diff.view_mode, DiffViewMode::Unified);
+        assert_eq!(
+            diff.cursor, 3,
+            "split から戻すと元の unified 行へ復元される"
+        );
+    }
+
+    #[test]
+    fn diff_cursor_to_bottom_uses_split_total_lines_not_unified_when_in_split_mode() {
+        let mut app = review_app();
+        app.current_pr = Some(make_pr(9, "OPEN"));
+        app.screen = Screen::Diff;
+        let text = "diff --git a/x b/x\n@@ -1,3 +1,1 @@\n-a\n-b\n-c\n+x\n".to_string();
+        app.update(Msg::DiffLoaded { id: 9, text });
+        {
+            let diff = app.diff.as_mut().expect("diff");
+            diff.viewport = 10;
+            diff.view_mode = DiffViewMode::Split;
+        }
+
+        app.update(Msg::Key(key(KeyCode::Char('G'))));
+        let diff = app.diff.as_ref().expect("diff");
+        // 3 つの削除と 1 つの追加が 3 行にペアリングされるため、split の総行数は unified
+        // より少ない（5 行 vs 6 行）。`G` は split の総行数基準で末尾へ移動するべき。
+        assert_eq!(diff.parsed.lines.len(), 6);
+        assert_eq!(diff.parsed.split_lines.len(), 5);
+        assert_eq!(diff.cursor, 4);
+    }
+
+    #[test]
+    fn diff_next_file_key_uses_split_file_boundaries_in_split_mode() {
+        let mut app = review_app();
+        app.current_pr = Some(make_pr(9, "OPEN"));
+        app.screen = Screen::Diff;
+        let text = "diff --git a/one.txt b/one.txt\n\
+--- a/one.txt\n\
++++ b/one.txt\n\
+@@ -1,1 +1,1 @@\n\
+-old one\n\
++new one\n\
+diff --git a/two.txt b/two.txt\n\
+--- a/two.txt\n\
++++ b/two.txt\n\
+@@ -1,1 +1,1 @@\n\
+-old two\n\
++new two\n"
+            .to_string();
+        app.update(Msg::DiffLoaded { id: 9, text });
+        // viewport は既定の 0 のまま（`max_scroll` を大きく保ち、ファイルジャンプ先の scroll
+        // がクランプされないようにする。既存の unified 版テストと同じ流儀）。
+        if let Some(diff) = app.diff.as_mut() {
+            diff.view_mode = DiffViewMode::Split;
+        }
+
+        app.update(Msg::Key(key(KeyCode::Char('n'))));
+        let diff = app.diff.as_ref().expect("diff");
+        assert_eq!(diff.file_index, 1);
+        let expected_start = diff.parsed.split_file_starts[1];
+        assert_eq!(diff.scroll, expected_start);
+        assert_eq!(diff.cursor, expected_start);
+    }
+
+    #[test]
+    fn diff_c_key_in_split_mode_uses_new_side_when_row_has_added_line() {
+        let mut app = review_app();
+        app.current_pr = Some(make_pr(9, "OPEN"));
+        app.screen = Screen::Diff;
+        app.diff_return = Screen::PullRequestDetail;
+        let text = "diff --git a/x b/x\n@@ -1 +1 @@\n-old\n+new\n".to_string();
+        app.update(Msg::DiffLoaded { id: 9, text });
+        {
+            let diff = app.diff.as_mut().expect("diff");
+            diff.viewport = 10;
+            diff.view_mode = DiffViewMode::Split;
+            diff.cursor = 2; // split 行(2,3) = "-old"/"+new" のペア行
+        }
+
+        app.update(Msg::Key(key(KeyCode::Char('c'))));
+        let editor = app.comment_editor.as_ref().expect("inline editor opens");
+        let anchor = editor.inline.as_ref().expect("anchor present");
+        assert_eq!(anchor.side, CommentSide::To);
+        assert_eq!(anchor.line, 1);
+    }
+
+    #[test]
+    fn diff_c_key_in_split_mode_uses_old_side_when_row_is_removed_only() {
+        let mut app = review_app();
+        app.current_pr = Some(make_pr(9, "OPEN"));
+        app.screen = Screen::Diff;
+        app.diff_return = Screen::PullRequestDetail;
+        let text = "diff --git a/x b/x\n@@ -1,1 +0,0 @@\n-removed only\n".to_string();
+        app.update(Msg::DiffLoaded { id: 9, text });
+        {
+            let diff = app.diff.as_mut().expect("diff");
+            diff.viewport = 10;
+            diff.view_mode = DiffViewMode::Split;
+            diff.cursor = 2; // split 行(Some(2), None) = 追加ブロックを伴わない削除のみ
+        }
+
+        app.update(Msg::Key(key(KeyCode::Char('c'))));
+        let editor = app.comment_editor.as_ref().expect("inline editor opens");
+        let anchor = editor.inline.as_ref().expect("anchor present");
+        assert_eq!(anchor.side, CommentSide::From);
+        assert_eq!(anchor.line, 1);
+    }
+
+    #[test]
+    fn diff_mouse_wheel_moves_cursor_in_split_mode_bounded_by_split_total_lines() {
+        let mut app = review_app();
+        app.current_pr = Some(make_pr(9, "OPEN"));
+        app.screen = Screen::Diff;
+        let text = "diff --git a/x b/x\n@@ -1,3 +1,1 @@\n-a\n-b\n-c\n+x\n".to_string();
+        app.update(Msg::DiffLoaded { id: 9, text });
+        {
+            let diff = app.diff.as_mut().expect("diff");
+            diff.viewport = 10;
+            diff.view_mode = DiffViewMode::Split;
+        }
+        app.layout
+            .panes
+            .push((PaneKind::DiffBody, Rect::new(0, 0, 40, 10)));
+
+        app.update(Msg::Mouse(mouse(MouseEventKind::ScrollDown, 5, 5)));
+        let diff = app.diff.as_ref().expect("diff");
+        // split_lines は 5 行（3 削除 + 1 追加が 3 行にペアリングされる）。3 行分下へ、
+        // かつフォーカスも本文へ切り替わる（既存の unified と同じ挙動）。
+        assert_eq!(diff.cursor, 3);
+        assert_eq!(diff.focus, DiffFocus::Body);
+    }
+
     // ---- インラインコメント（`c`。#Diff-inline-comment） ----
 
     #[test]
@@ -6286,9 +6661,11 @@ diff --git a/two.txt b/two.txt\n\
             viewport: 10,
             title: "abc1234".to_string(),
             rendered_lines: None,
+            rendered_split: None,
             file_index: 0,
             cursor: 3, // "+new"（追加行）
             focus: DiffFocus::Body,
+            view_mode: DiffViewMode::Unified,
         });
 
         let cmd = app.update(Msg::Key(key(KeyCode::Char('c'))));
@@ -6309,9 +6686,11 @@ diff --git a/two.txt b/two.txt\n\
             viewport: 10,
             title: "#9".to_string(),
             rendered_lines: None,
+            rendered_split: None,
             file_index: 0,
             cursor: 3, // "+new"（追加行、コメント可能）
             focus: DiffFocus::Body,
+            view_mode: DiffViewMode::Unified,
         });
 
         app.update(Msg::Key(key(KeyCode::Char('c'))));
@@ -6334,9 +6713,11 @@ diff --git a/two.txt b/two.txt\n\
             viewport: 10,
             title: "#9".to_string(),
             rendered_lines: None,
+            rendered_split: None,
             file_index: 0,
             cursor: 1, // "@@ -1 +1 @@"（ハンクヘッダ、コメント不可）
             focus: DiffFocus::Body,
+            view_mode: DiffViewMode::Unified,
         });
 
         let cmd = app.update(Msg::Key(key(KeyCode::Char('c'))));
@@ -6357,9 +6738,11 @@ diff --git a/two.txt b/two.txt\n\
             viewport: 10,
             title: "#9".to_string(),
             rendered_lines: None,
+            rendered_split: None,
             file_index: 0,
             cursor: 2, // "-old"（削除行）
             focus: DiffFocus::Body,
+            view_mode: DiffViewMode::Unified,
         });
 
         app.update(Msg::Key(key(KeyCode::Char('c'))));
@@ -7933,9 +8316,11 @@ diff --git a/two.txt b/two.txt\n\
             viewport: 5,
             title: "#1".to_string(),
             rendered_lines: None,
+            rendered_split: None,
             file_index: 0,
             cursor: 0,
             focus: DiffFocus::Body,
+            view_mode: DiffViewMode::Unified,
         });
 
         // 現在行が 10 行分下がり、viewport(5) に収まるよう最小限だけ自動スクロールする

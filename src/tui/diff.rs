@@ -114,6 +114,13 @@ pub struct ParsedDiff {
     pub file_starts: Vec<usize>,
     /// ファイルごとの区分（名前・行範囲）。サイドバー描画・選択に使う。
     pub files: Vec<DiffFile>,
+    /// split 表示（左=旧ファイル/右=新ファイル）用の行ペア列。`parse` 時に一度だけ構築する
+    /// （`DiffState::rendered_split` キャッシュの元データ。以後の再構築は行わない）。
+    pub split_lines: Vec<SplitLine>,
+    /// `file_starts` の各要素を `split_lines` 上のインデックスへ変換した並列配列
+    /// （`file_starts[i]` のファイル境界が split 表示では `split_lines` の何行目に現れるか。
+    /// `n`/`N` ファイルジャンプの split 版が使う）。
+    pub split_file_starts: Vec<usize>,
 }
 
 impl ParsedDiff {
@@ -159,6 +166,122 @@ impl ParsedDiff {
             DiffLineKind::FileHeader | DiffLineKind::Hunk | DiffLineKind::Meta => None,
         }
     }
+
+    /// split 表示の行インデックスからファイルの表示名を解決する（[`Self::file_for_line`] の
+    /// split 版。[`SplitLine::anchor_index`] で unified 行インデックスへ変換してから委譲する）。
+    pub fn split_file_for_line(&self, split_index: usize) -> Option<&str> {
+        let anchor = self.split_lines.get(split_index)?.anchor_index()?;
+        self.file_for_line(anchor)
+    }
+
+    /// split 表示の行インデックスからインラインコメント投稿アンカーを算出する
+    /// （[`Self::comment_anchor`] の split 版）。「行ペアの新側があれば新側、無ければ
+    /// 旧側」という規則は [`SplitLine::anchor_index`] が新側優先で unified 行インデックスへ
+    /// 変換することで既存の `comment_anchor` にそのまま帰着する。
+    pub fn split_comment_anchor(&self, split_index: usize) -> Option<CommentAnchor> {
+        let anchor = self.split_lines.get(split_index)?.anchor_index()?;
+        self.comment_anchor(anchor)
+    }
+}
+
+/// split 表示（左=旧ファイル/右=新ファイル）用の 1 行ペア。
+///
+/// `left`/`right` は元の unified 行列（[`ParsedDiff::lines`]）のインデックス。存在しない側は
+/// `None`（filler、空行として表示する）。文脈行・ファイルヘッダ/ハンクヘッダ/メタ行は
+/// 左右とも同じインデックスを指す（同じ [`DiffLine`] を両側に表示する。メタ行は左右で内容を
+/// 分けようがなく、文脈行は 1 つの `DiffLine` が旧/新両方の行番号を保持しているため）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SplitLine {
+    /// 旧ファイル側（左ペイン）に対応する [`ParsedDiff::lines`] のインデックス。
+    pub left: Option<usize>,
+    /// 新ファイル側（右ペイン）に対応する [`ParsedDiff::lines`] のインデックス。
+    pub right: Option<usize>,
+}
+
+impl SplitLine {
+    /// コメントアンカー算出・ファイル境界判定の基準にする unified 行インデックス。
+    /// 新側（`right`）があればそちらを優先する（「追加/文脈行は新側、削除行は旧側」という
+    /// [`ParsedDiff::comment_anchor`] の既存規則へ、変換なしにそのまま委譲するため）。
+    fn anchor_index(&self) -> Option<usize> {
+        self.right.or(self.left)
+    }
+}
+
+/// unified diff の行列から split 表示用の行ペア列を作る純関数。
+///
+/// 仕様:
+/// - 文脈行・ファイルヘッダ/ハンクヘッダ/メタ行は左右に同じ行を割り当てる（1 行 = 1 ペア）。
+/// - 削除行の連続ブロックと、それに続く追加行の連続ブロックは、i 番目の削除行と i 番目の
+///   追加行を同じペアにする（`git diff` は 1 箇所の変更を「削除ブロック→追加ブロック」の
+///   順で出力するため、この隣接関係だけで対応付けが取れる）。
+/// - 削除/追加の件数が異なる場合、多い方の余りは反対側を filler（`None`）にする。
+/// - 対応する削除ブロックを伴わない追加行のみのブロック（純粋な新規行）は左を filler にする。
+pub fn build_split_lines(lines: &[DiffLine]) -> Vec<SplitLine> {
+    let mut result = Vec::with_capacity(lines.len());
+    let mut index = 0;
+    while index < lines.len() {
+        match lines[index].kind {
+            DiffLineKind::Removed => {
+                let removed_start = index;
+                let removed_end = consume_run(lines, removed_start, DiffLineKind::Removed);
+                let added_start = removed_end;
+                let added_end = consume_run(lines, added_start, DiffLineKind::Added);
+                let removed_count = removed_end - removed_start;
+                let added_count = added_end - added_start;
+                for offset in 0..removed_count.max(added_count) {
+                    result.push(SplitLine {
+                        left: (offset < removed_count).then_some(removed_start + offset),
+                        right: (offset < added_count).then_some(added_start + offset),
+                    });
+                }
+                index = added_end;
+            }
+            DiffLineKind::Added => {
+                // 直前に削除ブロックが無い（純粋な新規行の）追加ブロック。
+                let added_start = index;
+                let added_end = consume_run(lines, added_start, DiffLineKind::Added);
+                for line_index in added_start..added_end {
+                    result.push(SplitLine {
+                        left: None,
+                        right: Some(line_index),
+                    });
+                }
+                index = added_end;
+            }
+            _ => {
+                result.push(SplitLine {
+                    left: Some(index),
+                    right: Some(index),
+                });
+                index += 1;
+            }
+        }
+    }
+    result
+}
+
+/// `start` から同じ種別 `kind` が連続する区間の終端（排他的）インデックスを返す。
+fn consume_run(lines: &[DiffLine], start: usize, kind: DiffLineKind) -> usize {
+    let mut end = start;
+    while end < lines.len() && lines[end].kind == kind {
+        end += 1;
+    }
+    end
+}
+
+/// 各 unified 行インデックスが属する split 行インデックスへの逆引き表を作る
+/// （`split_lines` を 1 回走査するだけの O(rows) 実装。`parse` から一度だけ呼ばれる）。
+fn split_row_index_for_unified(split_lines: &[SplitLine], lines_len: usize) -> Vec<usize> {
+    let mut index = vec![0usize; lines_len];
+    for (row_index, row) in split_lines.iter().enumerate() {
+        if let Some(left) = row.left {
+            index[left] = row_index;
+        }
+        if let Some(right) = row.right {
+            index[right] = row_index;
+        }
+    }
+    index
 }
 
 /// ユニファイド diff テキストをパースする。
@@ -228,10 +351,19 @@ pub fn parse(text: &str) -> ParsedDiff {
 
     let files = build_files(&lines, &file_starts, used_fallback);
 
+    let split_lines = build_split_lines(&lines);
+    let unified_to_split = split_row_index_for_unified(&split_lines, lines.len());
+    let split_file_starts: Vec<usize> = file_starts
+        .iter()
+        .map(|&start| unified_to_split.get(start).copied().unwrap_or(0))
+        .collect();
+
     ParsedDiff {
         lines,
         file_starts,
         files,
+        split_lines,
+        split_file_starts,
     }
 }
 
@@ -650,5 +782,271 @@ diff --git a/two.txt b/two.txt\n\
 -old two\n\
 +new two\n";
         parse(text)
+    }
+
+    // ---- split 表示用の行ペアリング（build_split_lines） ----
+
+    /// テスト用の最小 `DiffLine`（行番号は使わないテストでは `None` のまま）。
+    fn diff_line(kind: DiffLineKind, text: &str) -> DiffLine {
+        DiffLine {
+            kind,
+            text: text.to_string(),
+            old_no: None,
+            new_no: None,
+        }
+    }
+
+    #[test]
+    fn build_split_lines_context_row_maps_both_sides_to_same_index() {
+        let lines = vec![diff_line(DiffLineKind::Context, " ctx")];
+        let split = build_split_lines(&lines);
+        assert_eq!(
+            split,
+            vec![SplitLine {
+                left: Some(0),
+                right: Some(0)
+            }]
+        );
+    }
+
+    #[test]
+    fn build_split_lines_meta_and_header_rows_map_both_sides_to_same_index() {
+        let lines = vec![
+            diff_line(DiffLineKind::FileHeader, "diff --git a/x b/x"),
+            diff_line(DiffLineKind::Meta, "index 111..222 100644"),
+            diff_line(DiffLineKind::Hunk, "@@ -1,1 +1,1 @@"),
+        ];
+        let split = build_split_lines(&lines);
+        assert_eq!(
+            split,
+            vec![
+                SplitLine {
+                    left: Some(0),
+                    right: Some(0)
+                },
+                SplitLine {
+                    left: Some(1),
+                    right: Some(1)
+                },
+                SplitLine {
+                    left: Some(2),
+                    right: Some(2)
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn build_split_lines_pairs_removed_and_added_blocks_by_offset() {
+        let lines = vec![
+            diff_line(DiffLineKind::Removed, "-a"),
+            diff_line(DiffLineKind::Removed, "-b"),
+            diff_line(DiffLineKind::Added, "+a2"),
+            diff_line(DiffLineKind::Added, "+b2"),
+        ];
+        let split = build_split_lines(&lines);
+        assert_eq!(
+            split,
+            vec![
+                SplitLine {
+                    left: Some(0),
+                    right: Some(2)
+                },
+                SplitLine {
+                    left: Some(1),
+                    right: Some(3)
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn build_split_lines_fills_right_side_when_removed_block_is_longer() {
+        let lines = vec![
+            diff_line(DiffLineKind::Removed, "-a"),
+            diff_line(DiffLineKind::Removed, "-b"),
+            diff_line(DiffLineKind::Removed, "-c"),
+            diff_line(DiffLineKind::Added, "+a2"),
+        ];
+        let split = build_split_lines(&lines);
+        assert_eq!(
+            split,
+            vec![
+                SplitLine {
+                    left: Some(0),
+                    right: Some(3)
+                },
+                SplitLine {
+                    left: Some(1),
+                    right: None
+                },
+                SplitLine {
+                    left: Some(2),
+                    right: None
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn build_split_lines_fills_left_side_when_added_block_is_longer() {
+        let lines = vec![
+            diff_line(DiffLineKind::Removed, "-a"),
+            diff_line(DiffLineKind::Added, "+a2"),
+            diff_line(DiffLineKind::Added, "+b2"),
+        ];
+        let split = build_split_lines(&lines);
+        assert_eq!(
+            split,
+            vec![
+                SplitLine {
+                    left: Some(0),
+                    right: Some(1)
+                },
+                SplitLine {
+                    left: None,
+                    right: Some(2)
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn build_split_lines_pure_addition_block_without_preceding_removal_fills_left() {
+        let lines = vec![
+            diff_line(DiffLineKind::Context, " ctx"),
+            diff_line(DiffLineKind::Added, "+new"),
+        ];
+        let split = build_split_lines(&lines);
+        assert_eq!(
+            split,
+            vec![
+                SplitLine {
+                    left: Some(0),
+                    right: Some(0)
+                },
+                SplitLine {
+                    left: None,
+                    right: Some(1)
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn split_lines_span_multiple_hunks_within_same_file() {
+        let text = "diff --git a/x b/x\n\
+--- a/x\n\
++++ b/x\n\
+@@ -1,1 +1,1 @@\n\
+-old1\n\
++new1\n\
+@@ -10,1 +9,1 @@\n\
+-old2\n\
++new2\n";
+        let parsed = parse(text);
+        // インデックス: 0 diff--git/1 ---/2 +++/3 @@(1)/4 -old1/5 +new1/6 @@(2)/7 -old2/8 +new2。
+        let paired: Vec<&SplitLine> = parsed
+            .split_lines
+            .iter()
+            .filter(|row| row.left != row.right)
+            .collect();
+        assert_eq!(paired.len(), 2);
+        assert_eq!(paired[0].left, Some(4));
+        assert_eq!(paired[0].right, Some(5));
+        assert_eq!(paired[1].left, Some(7));
+        assert_eq!(paired[1].right, Some(8));
+    }
+
+    #[test]
+    fn split_file_starts_map_file_boundaries_across_multiple_files() {
+        let parsed = multiple_files_diff_for_file_lookup();
+        assert_eq!(parsed.split_file_starts.len(), parsed.file_starts.len());
+
+        let first_file_row = parsed.split_file_starts[0];
+        let second_file_row = parsed.split_file_starts[1];
+        assert_eq!(parsed.split_file_for_line(first_file_row), Some("one.txt"));
+        assert_eq!(parsed.split_file_for_line(second_file_row), Some("two.txt"));
+    }
+
+    /// 逆引き（split 行 → unified 行インデックス）: 各 unified 行はちょうど 1 つの split 行
+    /// （の左または右）にのみ現れること（取りこぼし・重複が無いこと）を確認する。
+    #[test]
+    fn build_split_lines_every_unified_index_maps_back_from_exactly_one_split_row() {
+        let text = "diff --git a/x b/x\n\
+--- a/x\n\
++++ b/x\n\
+@@ -1,3 +1,4 @@\n\
+ context a\n\
+-removed b\n\
++added c\n\
++added d\n";
+        let parsed = parse(text);
+        let mut seen = vec![false; parsed.lines.len()];
+        for row in &parsed.split_lines {
+            if let Some(left) = row.left {
+                assert!(!seen[left], "unified index {left} counted twice (left)");
+                seen[left] = true;
+            }
+            if let Some(right) = row.right
+                && row.left != Some(right)
+            {
+                assert!(!seen[right], "unified index {right} counted twice (right)");
+                seen[right] = true;
+            }
+        }
+        assert!(
+            seen.iter().all(|&marked| marked),
+            "every unified line must map back from exactly one split row"
+        );
+    }
+
+    // ---- split 表示のコメントアンカー / ファイル名解決 ----
+
+    fn sample_diff_for_split_anchor() -> ParsedDiff {
+        let text = "diff --git a/x b/x\n\
+--- a/x\n\
++++ b/x\n\
+@@ -10,3 +20,4 @@\n\
+ context a\n\
+-removed b\n\
++added c\n\
++added d\n";
+        parse(text)
+    }
+
+    #[test]
+    fn split_comment_anchor_uses_new_side_when_right_is_present() {
+        let parsed = sample_diff_for_split_anchor();
+        // split_lines[5] は「-removed b」と「+added c」のペア行（右側優先）。
+        let anchor = parsed
+            .split_comment_anchor(5)
+            .expect("paired row has anchor");
+        assert_eq!(anchor.side, CommentSide::To);
+        assert_eq!(anchor.line, 21);
+    }
+
+    #[test]
+    fn split_comment_anchor_falls_back_to_old_side_when_right_is_filler() {
+        // 追加ブロックを伴わない削除のみのケース（右側が filler）。
+        let text = "diff --git a/x b/x\n@@ -1,1 +0,0 @@\n-removed only\n";
+        let parsed = parse(text);
+        let anchor = parsed
+            .split_comment_anchor(2)
+            .expect("removed-only row has anchor");
+        assert_eq!(anchor.side, CommentSide::From);
+        assert_eq!(anchor.line, 1);
+    }
+
+    #[test]
+    fn split_comment_anchor_out_of_range_index_is_none() {
+        let parsed = sample_diff_for_split_anchor();
+        assert_eq!(parsed.split_comment_anchor(9999), None);
+    }
+
+    #[test]
+    fn split_file_for_line_out_of_range_index_is_none() {
+        let parsed = sample_diff_for_split_anchor();
+        assert_eq!(parsed.split_file_for_line(9999), None);
     }
 }

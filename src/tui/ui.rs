@@ -23,11 +23,11 @@ use crate::api::{
     PipelineStatus, PipelineStep, PullRequest, SrcEntry,
 };
 use crate::tui::app::{
-    App, CommentEditor, ConfirmModal, DetailFocus, DiffFocus, DiffState, HintLayout, ImageHit,
-    JumpPaletteState, LinkPalette, ListKind, ListLayout, MergeModal, ModalKind, ModalLayout,
-    PageJumpModal, PaneKind, Screen, SelectList, Status,
+    App, CommentEditor, ConfirmModal, DetailFocus, DiffFocus, DiffState, DiffViewMode, HintLayout,
+    ImageHit, JumpPaletteState, LinkPalette, ListKind, ListLayout, MergeModal, ModalKind,
+    ModalLayout, PageJumpModal, PaneKind, Screen, SelectList, Status,
 };
-use crate::tui::diff::DiffLineKind;
+use crate::tui::diff::{DiffLineKind, ParsedDiff};
 use crate::tui::onboarding::Field;
 use crate::tui::richdoc::{self, DocBlock, RichDocument};
 use crate::tui::theme::Theme;
@@ -1128,13 +1128,24 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
     // 枠線ぶんを差し引いたビューポート高さを保持（スクロール上限計算に使う）。
     let viewport = cols[1].height.saturating_sub(2) as usize;
     diff.viewport = viewport;
-    let max_scroll = diff.parsed.len().saturating_sub(viewport.max(1));
+    // `scroll`/`cursor` の総行数は表示モードによって異なる（unified=`lines`、split=
+    // `split_lines`）。`DiffState::total_lines`（app 側の私有ヘルパ）と同じ計算をここでも
+    // 行う（`pub` フィールド経由で複製している。App 内部の状態遷移ロジックとは独立に、
+    // 描画側もモードに応じた総行数を知る必要があるため）。
+    let total_lines = match diff.view_mode {
+        DiffViewMode::Unified => diff.parsed.lines.len(),
+        DiffViewMode::Split => diff.parsed.split_lines.len(),
+    };
+    let max_scroll = total_lines.saturating_sub(viewport.max(1));
     if diff.scroll > max_scroll {
         diff.scroll = max_scroll;
     }
 
     render_diff_sidebar(frame, cols[0], diff, &theme);
-    render_diff_body(frame, cols[1], diff, &theme);
+    match diff.view_mode {
+        DiffViewMode::Unified => render_diff_body(frame, cols[1], diff, &theme),
+        DiffViewMode::Split => render_diff_body_split(frame, cols[1], diff, &theme),
+    }
     app.layout.panes.extend([
         (PaneKind::DiffFiles, cols[0]),
         (PaneKind::DiffBody, cols[1]),
@@ -1263,6 +1274,89 @@ fn render_diff_body(frame: &mut Frame, area: Rect, diff: &mut DiffState, theme: 
     frame.render_widget(paragraph, area);
 }
 
+/// split 表示（左=旧ファイル/右=新ファイル）の本文を描画する。
+///
+/// `render_diff_body`（unified）と同じ Phase1 の性能方針を踏襲する: 着色済み行ペアは
+/// `DiffState::rendered_split` に一度だけ構築してキャッシュし（diff ロード時・テーマ切替時
+/// のみ無効化）、毎フレームは可視範囲（viewport 分）だけを切り出して描画する
+/// （O(viewport)。全行を Paragraph へ渡さない）。長い行はそれぞれのペイン幅で自動的に
+/// クリップされる（`Paragraph` は `.wrap()` を付けない限り折り返さず、area 幅を超えた
+/// 分は単純に描画されない。水平スクロールが不要な今回はこれで十分）。
+fn render_diff_body_split(frame: &mut Frame, area: Rect, diff: &mut DiffState, theme: &Theme) {
+    let total = diff.parsed.split_lines.len();
+    let position = diff_cursor_position_label(diff);
+    let suffix = format!(" ({total} 行){position} ");
+
+    let rows = diff
+        .rendered_split
+        .get_or_insert_with(|| build_split_rendered_lines(&diff.parsed, theme));
+
+    let (start, end) = diff_visible_range(diff.scroll, diff.viewport, rows.len());
+    let mut visible_left: Vec<Line> = Vec::with_capacity(end - start);
+    let mut visible_right: Vec<Line> = Vec::with_capacity(end - start);
+    for (offset, (left, right)) in rows[start..end].iter().enumerate() {
+        if start + offset == diff.cursor {
+            visible_left.push(highlighted_diff_line(left, theme));
+            visible_right.push(highlighted_diff_line(right, theme));
+        } else {
+            visible_left.push(left.clone());
+            visible_right.push(right.clone());
+        }
+    }
+
+    let focused = diff.focus == DiffFocus::Body;
+    let cols =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
+    let left_paragraph = Paragraph::new(visible_left)
+        .block(themed_block(theme, focused).title(format!(" diff {} 旧{suffix}", diff.title)));
+    let right_paragraph = Paragraph::new(visible_right)
+        .block(themed_block(theme, focused).title(format!(" diff {} 新{suffix}", diff.title)));
+    frame.render_widget(left_paragraph, cols[0]);
+    frame.render_widget(right_paragraph, cols[1]);
+}
+
+/// [`DiffState::rendered_split`] キャッシュの中身を構築する（diff ロード時・テーマ切替時に
+/// 一度だけ呼ばれる）。`parsed.split_lines` と同じ並び・同じ長さの `(左行, 右行)` を返す。
+fn build_split_rendered_lines(
+    parsed: &ParsedDiff,
+    theme: &Theme,
+) -> Vec<(Line<'static>, Line<'static>)> {
+    parsed
+        .split_lines
+        .iter()
+        .map(|row| {
+            (
+                split_pane_line(parsed, row.left, true, theme),
+                split_pane_line(parsed, row.right, false, theme),
+            )
+        })
+        .collect()
+}
+
+/// split 表示 1 セル分の着色済み `Line` を作る。
+///
+/// `index` が `None`（対応する unified 行が無い filler）なら空行を返す。`use_old` で行番号
+/// ガターに `old_no`（左=旧ファイル側）/`new_no`（右=新ファイル側）のどちらを出すかを選ぶ。
+fn split_pane_line(
+    parsed: &ParsedDiff,
+    index: Option<usize>,
+    use_old: bool,
+    theme: &Theme,
+) -> Line<'static> {
+    let Some(line) = index.and_then(|index| parsed.lines.get(index)) else {
+        return Line::from("");
+    };
+    let number = if use_old { line.old_no } else { line.new_no };
+    let gutter = match number {
+        Some(no) => format!("{no:>4} "),
+        None => "     ".to_string(),
+    };
+    Line::from(Span::styled(
+        format!("{gutter}{}", line.text),
+        diff_line_style(theme, line.kind),
+    ))
+}
+
 /// 現在行を選択色（`theme.selection_bg`/`selection_fg`）で上書きした複製の `Line` を返す。
 /// 元の `Line`（キャッシュ由来）は変更しない。
 fn highlighted_diff_line(line: &Line, theme: &Theme) -> Line<'static> {
@@ -1279,11 +1373,13 @@ fn highlighted_diff_line(line: &Line, theme: &Theme) -> Line<'static> {
 ///
 /// コメント不可（メタ/ヘッダ/ハンク行）の場合はファイルパスのみ、ファイル境界すら
 /// 判定できない場合（空 diff 等）は空文字を返す。先頭に区切り用の半角スペースを含む。
+/// `diff.view_mode` に応じて unified/split いずれかの規則で解決する
+/// （[`DiffState::current_file`]/[`DiffState::current_comment_anchor`]）。
 fn diff_cursor_position_label(diff: &DiffState) -> String {
-    let Some(path) = diff.parsed.file_for_line(diff.cursor) else {
+    let Some(path) = diff.current_file() else {
         return String::new();
     };
-    match diff.parsed.comment_anchor(diff.cursor) {
+    match diff.current_comment_anchor() {
         Some(anchor) => {
             let side = match anchor.side {
                 CommentSide::To => "新",
@@ -2123,7 +2219,8 @@ fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("n/N", "ファイル境界"),
             ("PgUp/PgDn", "1画面"),
             ("g/G", "先頭/末尾"),
-            ("c", "行にコメント(PR差分のみ)"),
+            ("v", "表示切替(unified/split)"),
+            ("c", "コメント"),
             ("Esc", "戻る"),
         ],
         Screen::Pipelines => vec![
@@ -2441,6 +2538,7 @@ fn render_help(frame: &mut Frame, area: Rect, screen: Screen, theme: &Theme) {
             "PgUp/PgDn / f/b 現在行を 1 画面ぶん移動",
             "g / Home, G / End 現在行を先頭 / 末尾へ",
             "n / N          次 / 前のファイル境界へ（現在行もその先頭へ、フォーカス問わず）",
+            "v              表示モード切替（unified ⇔ split。設定に永続化）",
             "c              現在行にインラインコメント投稿（PR 差分のみ。Ctrl+S 送信 / Esc 取消）",
             "               コミット差分では投稿できません",
         ],
@@ -2652,9 +2750,11 @@ mod tests {
             viewport: 0,
             title: "#1".to_string(),
             rendered_lines: None,
+            rendered_split: None,
             file_index: 0,
             cursor: 0,
             focus: DiffFocus::Body,
+            view_mode: DiffViewMode::Unified,
         }
     }
 
@@ -2679,9 +2779,11 @@ mod tests {
             viewport: 0,
             title: "#1".to_string(),
             rendered_lines: None,
+            rendered_split: None,
             file_index: 0,
             cursor: 0,
             focus: DiffFocus::Body,
+            view_mode: DiffViewMode::Unified,
         }
     }
 
@@ -2928,9 +3030,11 @@ mod tests {
             viewport: 10,
             title: "#9".to_string(),
             rendered_lines: None,
+            rendered_split: None,
             file_index: 0,
             cursor: 5, // "+new"（追加行 → 新ファイル側の行番号）
             focus: DiffFocus::Body,
+            view_mode: DiffViewMode::Unified,
         };
         let theme = Theme::default();
 
@@ -2946,6 +3050,231 @@ mod tests {
         let content = buffer_text(terminal.backend().buffer());
         assert!(content.contains("x:1"), "position label missing: {content}");
         assert!(content.contains('新'), "side marker missing: {content}");
+    }
+
+    // ---- split 表示（render_diff_body_split） ----
+
+    /// バッファ全体から `needle` を探し、見つかった先頭セルの座標を返す（複数行にまたがる
+    /// 文字列は対象外）。左右どちらのペインに描画されたかを列位置で判定するのに使う。
+    fn find_text_position(buffer: &Buffer, needle: &str) -> Option<(u16, u16)> {
+        let chars: Vec<char> = needle.chars().collect();
+        let area = buffer.area;
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                let matches = chars.iter().enumerate().all(|(offset, expected)| {
+                    let cx = x + offset as u16;
+                    cx < area.right()
+                        && buffer
+                            .cell((cx, y))
+                            .is_some_and(|cell| cell.symbol() == expected.to_string())
+                });
+                if matches {
+                    return Some((x, y));
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn render_diff_body_split_shows_old_text_on_left_and_new_text_on_right() {
+        let text = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,1 +1,1 @@\n-old text\n+new text\n"
+            .to_string();
+        let mut diff = DiffState {
+            parsed: parse_diff(&text),
+            scroll: 0,
+            viewport: 10,
+            title: "#1".to_string(),
+            rendered_lines: None,
+            rendered_split: None,
+            file_index: 0,
+            cursor: 0,
+            focus: DiffFocus::Body,
+            view_mode: DiffViewMode::Split,
+        };
+        let theme = Theme::default();
+
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_diff_body_split(frame, area, &mut diff, &theme);
+            })
+            .expect("draw succeeds");
+
+        let buffer = terminal.backend().buffer();
+        let mid_x = buffer.area.width / 2;
+        let (old_x, _) = find_text_position(buffer, "old text").expect("old text visible");
+        let (new_x, _) = find_text_position(buffer, "new text").expect("new text visible");
+        assert!(
+            old_x < mid_x,
+            "old text should render in the left (old) pane: x={old_x}, mid={mid_x}"
+        );
+        assert!(
+            new_x >= mid_x,
+            "new text should render in the right (new) pane: x={new_x}, mid={mid_x}"
+        );
+    }
+
+    #[test]
+    fn render_diff_body_split_caches_rows_and_reuses_allocation_across_frames() {
+        let mut diff = make_diff_state(300);
+        diff.view_mode = DiffViewMode::Split;
+        diff.viewport = 15;
+        diff.scroll = 0;
+        let theme = Theme::default();
+
+        let backend = TestBackend::new(60, 17);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_diff_body_split(frame, area, &mut diff, &theme);
+            })
+            .expect("first draw succeeds");
+
+        let cached = diff
+            .rendered_split
+            .as_ref()
+            .expect("cache built on first render");
+        assert_eq!(cached.len(), diff.parsed.split_lines.len());
+        let first_ptr = cached.as_ptr();
+
+        // scroll を変えて再描画してもキャッシュは再構築されず、同じアロケーションを使い回す。
+        diff.scroll = 200;
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_diff_body_split(frame, area, &mut diff, &theme);
+            })
+            .expect("second draw succeeds");
+        let second_ptr = diff
+            .rendered_split
+            .as_ref()
+            .expect("cache still present")
+            .as_ptr();
+        assert_eq!(
+            first_ptr, second_ptr,
+            "split 表示の着色済み行キャッシュは一度だけ構築され、以後は再利用されるべき"
+        );
+    }
+
+    #[test]
+    fn render_diff_body_split_only_draws_viewport_worth_of_lines() {
+        let mut diff = make_diff_state(50);
+        diff.view_mode = DiffViewMode::Split;
+        diff.viewport = 5;
+        diff.scroll = 3;
+        let theme = Theme::default();
+
+        // 幅十分・高さ = 可視 5 行 + 上下ボーダー。
+        let backend = TestBackend::new(60, 7);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_diff_body_split(frame, area, &mut diff, &theme);
+            })
+            .expect("draw succeeds");
+
+        let content = buffer_text(terminal.backend().buffer());
+        // scroll=3, viewport=5 → 表示されるのは行 3..8。
+        assert!(content.contains("context line 3"));
+        assert!(content.contains("context line 7"));
+        // 範囲外（viewport を超える行）は表示されない。
+        assert!(!content.contains("context line 8"));
+        assert!(!content.contains("context line 2"));
+    }
+
+    #[test]
+    fn render_diff_body_split_rebuilds_cache_with_new_theme_colors_after_invalidation() {
+        let mut diff = make_diff_state(5);
+        diff.view_mode = DiffViewMode::Split;
+        diff.viewport = 5;
+        let catppuccin = Theme::default();
+
+        let backend = TestBackend::new(60, 7);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_diff_body_split(frame, area, &mut diff, &catppuccin);
+            })
+            .expect("first draw succeeds");
+        assert!(diff.rendered_split.is_some());
+
+        // テーマ切替相当（`App::cycle_theme` がやること）。
+        diff.rendered_split = None;
+        let nord = ThemeName::Nord.theme();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_diff_body_split(frame, area, &mut diff, &nord);
+            })
+            .expect("second draw succeeds");
+        assert!(
+            diff.rendered_split.is_some(),
+            "無効化後はキャッシュが再構築されるべき"
+        );
+    }
+
+    #[test]
+    fn render_diff_body_split_highlights_current_cursor_row_on_both_panes() {
+        let mut diff = make_diff_state(5);
+        diff.view_mode = DiffViewMode::Split;
+        diff.viewport = 5;
+        diff.cursor = 2;
+        let theme = Theme::default();
+
+        let backend = TestBackend::new(60, 7);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_diff_body_split(frame, area, &mut diff, &theme);
+            })
+            .expect("draw succeeds");
+
+        let buffer = terminal.backend().buffer();
+        // 左ペインの本文先頭セル（枠線(1) + パディング(1)）。cursor=2 行目はコンテンツの
+        // 3 行目（y = 1(境界) + cursor）。
+        let left_cell = buffer.cell((2, 1 + 2)).expect("left cursor cell exists");
+        assert_eq!(left_cell.fg, theme.selection_fg);
+        assert_eq!(left_cell.bg, theme.selection_bg);
+
+        // 右ペイン（幅 60 の半分 = x:30 から。枠線(1) + パディング(1)）。
+        let right_cell = buffer.cell((32, 1 + 2)).expect("right cursor cell exists");
+        assert_eq!(right_cell.fg, theme.selection_fg);
+        assert_eq!(right_cell.bg, theme.selection_bg);
+
+        // 他の行（先頭の文脈行）はハイライトされない。
+        let other_left = buffer.cell((2, 1)).expect("other row cell exists");
+        assert_ne!(other_left.bg, theme.selection_bg);
+    }
+
+    #[test]
+    fn render_diff_split_mode_renders_sidebar_and_both_panes() {
+        let mut diff = make_multi_file_diff_state(2, 3);
+        diff.view_mode = DiffViewMode::Split;
+        let mut app = app_with_diff(diff);
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_diff(frame, area, &mut app);
+            })
+            .expect("draw succeeds");
+
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("file0.txt"));
+        assert!(content.contains("file1.txt"));
+        assert!(content.contains("file0 line 0"));
+        // split モードでは新/旧のペインタイトルが両方出る。
+        assert!(content.contains('旧'));
+        assert!(content.contains('新'));
     }
 
     /// `diff` を持つ最小構成の `App`（Diff 画面の 2 ペイン描画テスト用）。
