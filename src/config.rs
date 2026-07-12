@@ -29,6 +29,15 @@ pub struct Config {
     /// 任意。未設定/未知の値は既定（unified）にフォールバックする。
     #[serde(default)]
     pub diff_view: Option<String>,
+    /// Diff 画面のファイル一覧サイドバーの表示/非表示（`t` で切替）。任意。未設定は既定
+    /// （表示）にフォールバックする。
+    #[serde(default)]
+    pub diff_sidebar_visible: Option<bool>,
+    /// Diff 画面のファイル一覧サイドバーの幅（セル数）。境界のマウスドラッグで変更した場合に
+    /// 保存される。任意。未設定は既定の幅比率（[`crate::tui::app::DIFF_SIDEBAR_DEFAULT_PERCENT`]）
+    /// にフォールバックする。
+    #[serde(default)]
+    pub diff_sidebar_width: Option<u16>,
 }
 
 /// このアプリの `ProjectDirs` を返す。

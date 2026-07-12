@@ -1103,30 +1103,33 @@ fn comment_inline_anchor(comment: &Comment) -> Option<String> {
     }
 }
 
-/// サイドバー（ファイル一覧）の幅比率。右の本文が主ペインなので控えめに 30%。
-const DIFF_SIDEBAR_PERCENT: u16 = 30;
-
 fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = app.theme;
     if app.diff.as_ref().is_none_or(|diff| diff.parsed.is_empty()) {
         render_placeholder(frame, area, &app.status, "差分がありません", &theme);
         return;
     }
+    let sidebar_visible = app.diff_sidebar_visible;
+    let sidebar_width = app.diff_sidebar_render_width(area.width);
     let Some(diff) = app.diff.as_mut() else {
         render_placeholder(frame, area, &app.status, "差分がありません", &theme);
         return;
     };
 
-    // 左: ファイル一覧サイドバー / 右: 差分本文（Phase1 のキャッシュ＋viewport スライス描画を
-    // 維持するため、本文の再構築ロジックは `render_diff_body` に閉じたまま変更しない）。
-    let cols = Layout::horizontal([
-        Constraint::Percentage(DIFF_SIDEBAR_PERCENT),
-        Constraint::Percentage(100 - DIFF_SIDEBAR_PERCENT),
-    ])
-    .split(area);
+    // 左: ファイル一覧サイドバー（`t` で表示/非表示切替、境界のマウスドラッグで幅調整。
+    // `App::diff_sidebar_visible`/`diff_sidebar_width`） / 右: 差分本文（Phase1 のキャッシュ＋
+    // viewport スライス描画を維持するため、本文の再構築ロジックは `render_diff_body` に
+    // 閉じたまま変更しない）。サイドバー非表示中は本文が全幅になる。
+    let (sidebar_area, body_area) = if sidebar_visible {
+        let cols =
+            Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(0)]).split(area);
+        (Some(cols[0]), cols[1])
+    } else {
+        (None, area)
+    };
 
     // 枠線ぶんを差し引いたビューポート高さを保持（スクロール上限計算に使う）。
-    let viewport = cols[1].height.saturating_sub(2) as usize;
+    let viewport = body_area.height.saturating_sub(2) as usize;
     diff.viewport = viewport;
     // `scroll`/`cursor` の総行数は表示モードによって異なる（unified=`lines`、split=
     // `split_lines`）。`DiffState::total_lines`（app 側の私有ヘルパ）と同じ計算をここでも
@@ -1141,23 +1144,30 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
         diff.scroll = max_scroll;
     }
 
-    render_diff_sidebar(frame, cols[0], diff, &theme);
-    match diff.view_mode {
-        DiffViewMode::Unified => render_diff_body(frame, cols[1], diff, &theme),
-        DiffViewMode::Split => render_diff_body_split(frame, cols[1], diff, &theme),
+    if let Some(sidebar_area) = sidebar_area {
+        render_diff_sidebar(frame, sidebar_area, diff, &theme);
     }
+    match diff.view_mode {
+        DiffViewMode::Unified => render_diff_body(frame, body_area, diff, &theme),
+        DiffViewMode::Split => render_diff_body_split(frame, body_area, diff, &theme),
+    }
+
+    let Some(sidebar_area) = sidebar_area else {
+        app.layout.panes.push((PaneKind::DiffBody, body_area));
+        return;
+    };
     app.layout.panes.extend([
-        (PaneKind::DiffFiles, cols[0]),
-        (PaneKind::DiffBody, cols[1]),
+        (PaneKind::DiffFiles, sidebar_area),
+        (PaneKind::DiffBody, body_area),
     ]);
-    let visible_height = usize::from(cols[0].height.saturating_sub(2)).max(1);
+    let visible_height = usize::from(sidebar_area.height.saturating_sub(2)).max(1);
     let first_visible = diff
         .file_index
         .saturating_add(1)
         .saturating_sub(visible_height);
     app.layout.lists.push(ListLayout {
         kind: ListKind::DiffFiles,
-        area: list_inner(cols[0]),
+        area: list_inner(sidebar_area),
         first_visible,
     });
 }
@@ -2220,6 +2230,7 @@ fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("PgUp/PgDn", "1画面"),
             ("g/G", "先頭/末尾"),
             ("v", "表示切替(unified/split)"),
+            ("t", "ファイル一覧 表示/非表示"),
             ("c", "コメント"),
             ("Esc", "戻る"),
         ],
@@ -2539,6 +2550,7 @@ fn render_help(frame: &mut Frame, area: Rect, screen: Screen, theme: &Theme) {
             "g / Home, G / End 現在行を先頭 / 末尾へ",
             "n / N          次 / 前のファイル境界へ（現在行もその先頭へ、フォーカス問わず）",
             "v              表示モード切替（unified ⇔ split。設定に永続化）",
+            "t              ファイル一覧 表示/非表示（境界のドラッグでも幅調整可。設定に永続化）",
             "c              現在行にインラインコメント投稿（PR 差分のみ。Ctrl+S 送信 / Esc 取消）",
             "               コミット差分では投稿できません",
         ],
@@ -3283,6 +3295,122 @@ mod tests {
         app.screen = Screen::Diff;
         app.diff = Some(diff);
         app
+    }
+
+    #[test]
+    fn render_diff_hides_sidebar_and_uses_full_width_when_toggled_off() {
+        let mut app = app_with_diff(make_multi_file_diff_state(2, 3));
+        app.diff_sidebar_visible = false;
+
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_diff(frame, area, &mut app);
+            })
+            .expect("draw succeeds");
+
+        // サイドバーの枠（タイトル）は出ず、本文だけが全幅で描画される
+        // （diff 本文自体にはヘッダ行 `+++ b/file0.txt` 等が含まれるため、ファイル名の
+        // 有無ではなくサイドバー固有のタイトル文字列で判定する）。
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(!content.contains("ファイル (2)"));
+        assert!(content.contains("file0 line 0"));
+
+        assert_eq!(
+            app.layout.panes,
+            vec![(PaneKind::DiffBody, Rect::new(0, 0, 60, 12))],
+            "非表示中は DiffFiles ペインを登録しない"
+        );
+        assert!(
+            app.layout.lists.is_empty(),
+            "非表示中はファイル一覧のヒットテストも登録しない"
+        );
+    }
+
+    #[test]
+    fn render_diff_split_mode_hides_sidebar_and_uses_full_width_when_toggled_off() {
+        let mut diff = make_multi_file_diff_state(2, 3);
+        diff.view_mode = DiffViewMode::Split;
+        let mut app = app_with_diff(diff);
+        app.diff_sidebar_visible = false;
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_diff(frame, area, &mut app);
+            })
+            .expect("draw succeeds");
+
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(!content.contains("ファイル (2)"));
+        assert!(content.contains('旧'));
+        assert!(content.contains('新'));
+        assert_eq!(
+            app.layout.panes,
+            vec![(PaneKind::DiffBody, Rect::new(0, 0, 80, 12))]
+        );
+    }
+
+    #[test]
+    fn render_diff_uses_saved_sidebar_width_when_present() {
+        let mut app = app_with_diff(make_multi_file_diff_state(2, 3));
+        app.diff_sidebar_width = Some(25);
+
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_diff(frame, area, &mut app);
+            })
+            .expect("draw succeeds");
+
+        let sidebar_pane = app
+            .layout
+            .panes
+            .iter()
+            .find(|(kind, _)| *kind == PaneKind::DiffFiles)
+            .map(|(_, area)| *area)
+            .expect("sidebar pane registered");
+        assert_eq!(sidebar_pane.width, 25);
+        let body_pane = app
+            .layout
+            .panes
+            .iter()
+            .find(|(kind, _)| *kind == PaneKind::DiffBody)
+            .map(|(_, area)| *area)
+            .expect("body pane registered");
+        assert_eq!(body_pane.x, 25);
+        assert_eq!(body_pane.width, 35);
+    }
+
+    #[test]
+    fn render_diff_clamps_saved_sidebar_width_to_max_percent() {
+        let mut app = app_with_diff(make_multi_file_diff_state(2, 3));
+        app.diff_sidebar_width = Some(1000);
+
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_diff(frame, area, &mut app);
+            })
+            .expect("draw succeeds");
+
+        let sidebar_pane = app
+            .layout
+            .panes
+            .iter()
+            .find(|(kind, _)| *kind == PaneKind::DiffFiles)
+            .map(|(_, area)| *area)
+            .expect("sidebar pane registered");
+        // 全体 60 の 70% = 42 が上限。
+        assert_eq!(sidebar_pane.width, 42);
     }
 
     #[test]

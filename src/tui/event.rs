@@ -61,6 +61,8 @@ pub async fn run(tui: &mut Tui, mut app: App) -> Result<()> {
                         if matches!(
                             mouse.kind,
                             MouseEventKind::Down(MouseButton::Left)
+                                | MouseEventKind::Drag(MouseButton::Left)
+                                | MouseEventKind::Up(MouseButton::Left)
                                 | MouseEventKind::ScrollUp
                                 | MouseEventKind::ScrollDown
                         ) && !dispatch(app.update(Msg::Mouse(mouse)), &api_tx) => break,

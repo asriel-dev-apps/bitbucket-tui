@@ -375,6 +375,34 @@ impl DiffViewMode {
     }
 }
 
+/// Diff サイドバー（ファイル一覧）の既定幅比率。[`App::diff_sidebar_width`] が未ドラッグ
+/// （`None`）のときに使う。右の本文が主ペインなので控えめに 30%。
+pub const DIFF_SIDEBAR_DEFAULT_PERCENT: u16 = 30;
+
+/// マウスドラッグでサイドバーを縮められる下限（セル数）。ドラッグでこれ未満まで縮めると
+/// 自動的に非表示へ切り替える（[`App::on_mouse_drag`]。ユーザ要望「一点以上小さくしたら
+/// 非表示に」）。
+pub const DIFF_SIDEBAR_MIN_WIDTH: u16 = 12;
+
+/// マウスドラッグでサイドバーを広げられる上限（全体幅に対する割合、%）。
+const DIFF_SIDEBAR_MAX_PERCENT: u16 = 70;
+
+/// Diff 画面全体の幅 `total`（セル数）と、保存済みの希望幅 `desired`
+/// （`config.toml` の `diff_sidebar_width`。`None` は未ドラッグ＝既定比率）から、実際に
+/// 描画すべきサイドバー幅（セル数）を求める。`[DIFF_SIDEBAR_MIN_WIDTH, 全体の
+/// DIFF_SIDEBAR_MAX_PERCENT%]` へクランプする（`total` が極端に狭く上限が下限を下回る場合は
+/// 上限を優先する。下限を割り込んだからといって非表示にはしない＝非表示判定はドラッグ操作
+/// 側 [`App::on_mouse_drag`] の責務であり、ここは純粋な描画幅の算出のみを担う）。
+pub fn resolve_diff_sidebar_width(total: u16, desired: Option<u16>) -> u16 {
+    let max_width = ((u32::from(total) * u32::from(DIFF_SIDEBAR_MAX_PERCENT)) / 100) as u16;
+    let max_width = max_width.min(total);
+    let min_width = DIFF_SIDEBAR_MIN_WIDTH.min(max_width);
+    let base = desired.unwrap_or_else(|| {
+        ((u32::from(total) * u32::from(DIFF_SIDEBAR_DEFAULT_PERCENT)) / 100) as u16
+    });
+    base.clamp(min_width, max_width)
+}
+
 /// Diff 画面の表示状態（スクロール・現在行カーソル・ファイル境界ジャンプ・サイドバー選択）。
 #[derive(Debug, Clone, Default)]
 pub struct DiffState {
@@ -1311,6 +1339,19 @@ pub struct App {
     /// Diff 画面の表示モード（`config.diff_view` の永続化の起点。`v` で切替。新しく
     /// diff を読み込むたび、この値で `DiffState::view_mode` を初期化する）。
     pub diff_view_mode: DiffViewMode,
+    /// Diff 画面のファイル一覧サイドバーの表示/非表示（`t` で切替。`config.diff_sidebar_visible`
+    /// へ永続化。既定は表示）。非表示中は本文が全幅になり、`Tab` でのフォーカス移動もサイド
+    /// バーへは行かない（[`App::on_key_diff`]）。
+    pub diff_sidebar_visible: bool,
+    /// Diff 画面のファイル一覧サイドバーの幅（セル数）。`None` は未ドラッグ＝既定比率
+    /// （[`DIFF_SIDEBAR_DEFAULT_PERCENT`]）を使う。マウスドラッグで変更すると `Some` になり
+    /// `config.diff_sidebar_width` へ永続化する（実際の描画幅は [`resolve_diff_sidebar_width`]
+    /// が `DIFF_SIDEBAR_MIN_WIDTH`〜全体の70%へクランプする。[`App::diff_sidebar_render_width`]）。
+    pub diff_sidebar_width: Option<u16>,
+    /// Diff サイドバー境界のドラッグ中かどうか（マウス `Down`→`Drag`→`Up` の間だけ `true`）。
+    /// ドラッグ中は他のクリック処理（一覧行選択等）を発火させない
+    /// （[`App::on_mouse_left`]/[`App::on_mouse_drag`]/[`App::on_mouse_up`]）。
+    pub diff_sidebar_dragging: bool,
     /// 直近描画フレームのペイン・一覧・モーダル・ヒント配置。
     pub layout: AppLayout,
     pub me: Me,
@@ -1594,6 +1635,8 @@ impl App {
             .as_deref()
             .map(DiffViewMode::from_config_str)
             .unwrap_or_default();
+        let diff_sidebar_visible = config.diff_sidebar_visible.unwrap_or(true);
+        let diff_sidebar_width = config.diff_sidebar_width;
         Self {
             screen: Screen::Onboarding,
             config,
@@ -1601,6 +1644,9 @@ impl App {
             theme,
             theme_name,
             diff_view_mode,
+            diff_sidebar_visible,
+            diff_sidebar_width,
+            diff_sidebar_dragging: false,
             layout: AppLayout::default(),
             me,
             onboarding,
@@ -2174,12 +2220,18 @@ impl App {
     }
 
     /// 直近フレームの [`AppLayout`] を使ってマウス入力を既存のキー操作へ変換する。
+    ///
+    /// `Drag`/`Up` は Diff サイドバーの幅調整専用（[`App::on_mouse_drag`]/[`App::on_mouse_up`]）。
+    /// それ以外のドラッグ中の移動・離指は無視する（`event::run` 側もこの 2 種類の
+    /// `MouseEventKind` だけを追加で `Msg::Mouse` へ変換する）。
     fn on_mouse(&mut self, mouse: MouseEvent) -> Command {
         let point = (mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::ScrollUp => self.on_mouse_wheel(point, false),
             MouseEventKind::ScrollDown => self.on_mouse_wheel(point, true),
             MouseEventKind::Down(MouseButton::Left) => self.on_mouse_left(point),
+            MouseEventKind::Drag(MouseButton::Left) => self.on_mouse_drag(point),
+            MouseEventKind::Up(MouseButton::Left) => self.on_mouse_up(point),
             _ => Command::None,
         }
     }
@@ -2284,6 +2336,14 @@ impl App {
             return Command::None;
         }
 
+        // Diff サイドバーと本文の境界列（±1 セル）は他のクリック処理より優先してドラッグ開始
+        // とみなす（一覧行選択・ペインフォーカス切替等を発火させない）。M5 のペイン/一覧
+        // ヒットテストと同じ `self.layout` 経由の座標判定に乗せる。
+        if self.diff_sidebar_visible && self.diff_sidebar_boundary_hit(point) {
+            self.diff_sidebar_dragging = true;
+            return Command::None;
+        }
+
         if let Some(image) = self
             .layout
             .overview_images
@@ -2359,6 +2419,87 @@ impl App {
         {
             return self.on_key(hint.key);
         }
+        Command::None
+    }
+
+    /// マウス座標が Diff サイドバーと本文の境界列（±1 セル）に乗っているかを判定する
+    /// （[`App::on_mouse_left`] からのドラッグ開始判定に使う）。両ペインが `self.layout.panes`
+    /// に無ければ（Diff 画面以外、またはサイドバー非表示）常に `false`。
+    fn diff_sidebar_boundary_hit(&self, point: (u16, u16)) -> bool {
+        let Some(&(_, files_rect)) = self
+            .layout
+            .panes
+            .iter()
+            .find(|(kind, _)| *kind == PaneKind::DiffFiles)
+        else {
+            return false;
+        };
+        let Some(&(_, body_rect)) = self
+            .layout
+            .panes
+            .iter()
+            .find(|(kind, _)| *kind == PaneKind::DiffBody)
+        else {
+            return false;
+        };
+        if point.1 < files_rect.y || point.1 >= files_rect.y.saturating_add(files_rect.height) {
+            return false;
+        }
+        point.0.abs_diff(body_rect.x) <= 1
+    }
+
+    /// マウスドラッグ（`Down` 済みの境界列を追従）。Diff サイドバーの幅調整専用
+    /// （[`App::on_mouse`]）。
+    fn on_mouse_drag(&mut self, point: (u16, u16)) -> Command {
+        if !self.diff_sidebar_dragging {
+            return Command::None;
+        }
+        self.update_diff_sidebar_drag(point);
+        Command::None
+    }
+
+    /// ドラッグ中のサイドバー幅を `point` の列位置から再計算する。サイドバー左端
+    /// （`DiffFiles` ペインの `x`）からの相対列数をそのまま新しい幅とする。
+    /// `DIFF_SIDEBAR_MIN_WIDTH` 未満まで縮めた場合は幅を更新せず非表示へ切り替える
+    /// （直前の幅は次回表示（`t`）のために保つ）。
+    fn update_diff_sidebar_drag(&mut self, point: (u16, u16)) {
+        let Some(&(_, files_rect)) = self
+            .layout
+            .panes
+            .iter()
+            .find(|(kind, _)| *kind == PaneKind::DiffFiles)
+        else {
+            return;
+        };
+        let Some(&(_, body_rect)) = self
+            .layout
+            .panes
+            .iter()
+            .find(|(kind, _)| *kind == PaneKind::DiffBody)
+        else {
+            return;
+        };
+        let total = files_rect.width.saturating_add(body_rect.width);
+        let raw = point.0.saturating_sub(files_rect.x);
+        if raw < DIFF_SIDEBAR_MIN_WIDTH {
+            self.diff_sidebar_visible = false;
+            if let Some(diff) = self.diff.as_mut() {
+                diff.focus = DiffFocus::Body;
+            }
+            return;
+        }
+        self.diff_sidebar_width = Some(resolve_diff_sidebar_width(total, Some(raw)));
+    }
+
+    /// マウスボタンを離した（`Up`）。Diff サイドバーのドラッグ中であれば幅・表示状態を
+    /// `config.toml` へ確定保存する（[`App::persist_diff_sidebar`]）。ドラッグ中でなければ
+    /// 何もしない（他画面・他操作の `Up` は無視する）。
+    fn on_mouse_up(&mut self, _point: (u16, u16)) -> Command {
+        if !self.diff_sidebar_dragging {
+            return Command::None;
+        }
+        self.diff_sidebar_dragging = false;
+        self.persist_diff_sidebar();
         Command::None
     }
 
@@ -3969,13 +4110,17 @@ impl App {
                 return Command::None;
             }
             KeyCode::Tab => {
-                if let Some(diff) = self.diff.as_mut() {
+                // サイドバーが非表示の間はファイル一覧へフォーカスを移せない（本文固定）。
+                if self.diff_sidebar_visible
+                    && let Some(diff) = self.diff.as_mut()
+                {
                     diff.toggle_focus();
                 }
                 return Command::None;
             }
             KeyCode::Char('c') => return self.open_inline_comment_editor(),
             KeyCode::Char('v') => return self.toggle_diff_view_mode(),
+            KeyCode::Char('t') => return self.toggle_diff_sidebar(),
             _ => {}
         }
 
@@ -4052,6 +4197,38 @@ impl App {
             tracing::warn!(%error, "Diff 表示モード設定の保存に失敗しました");
         }
         Command::None
+    }
+
+    /// Diff 画面のファイル一覧サイドバーの表示/非表示を切り替える（`t`）。非表示にする際は
+    /// フォーカスを本文へ固定する（サイドバーが無い間は `Tab` でファイル一覧へ移れない。
+    /// [`App::on_key_diff`] の `Tab` 分岐も同じ不変条件を守る）。`config.toml` へ即時永続化する
+    /// （他のトグル系設定と同じ方針。[`App::persist_diff_sidebar`]）。
+    fn toggle_diff_sidebar(&mut self) -> Command {
+        self.diff_sidebar_visible = !self.diff_sidebar_visible;
+        if !self.diff_sidebar_visible
+            && let Some(diff) = self.diff.as_mut()
+        {
+            diff.focus = DiffFocus::Body;
+        }
+        self.persist_diff_sidebar();
+        Command::None
+    }
+
+    /// Diff サイドバーの表示状態・幅を `config.toml` へ保存する（`t` トグル
+    /// [`App::toggle_diff_sidebar`]・ドラッグ確定 [`App::on_mouse_up`] の双方から呼ぶ）。
+    fn persist_diff_sidebar(&mut self) {
+        self.config.diff_sidebar_visible = Some(self.diff_sidebar_visible);
+        self.config.diff_sidebar_width = self.diff_sidebar_width;
+        if let Err(error) = self.config.save() {
+            // 設定保存の失敗は致命ではない（他の config 保存箇所と同じ方針）。
+            tracing::warn!(%error, "Diff サイドバー設定の保存に失敗しました");
+        }
+    }
+
+    /// [`App::diff_sidebar_width`] から、幅 `total` の Diff 画面で実際に描画すべきサイドバー幅
+    /// （セル数）を求める（[`resolve_diff_sidebar_width`] 参照）。`ui::render_diff` から使う。
+    pub fn diff_sidebar_render_width(&self, total: u16) -> u16 {
+        resolve_diff_sidebar_width(total, self.diff_sidebar_width)
     }
 
     // ---- パイプライン監視（M2） ----
@@ -6471,6 +6648,272 @@ diff --git a/two.txt b/two.txt\n\
         };
         let app = App::new(config, None);
         assert_eq!(app.diff_view_mode, DiffViewMode::Split);
+    }
+
+    // ---- Diff サイドバーの表示/非表示・幅調整（`t`・境界ドラッグ） ----
+
+    #[test]
+    fn resolve_diff_sidebar_width_uses_default_percent_when_none() {
+        assert_eq!(resolve_diff_sidebar_width(60, None), 18); // 60 の 30%。
+    }
+
+    #[test]
+    fn resolve_diff_sidebar_width_clamps_desired_up_to_min_width() {
+        assert_eq!(
+            resolve_diff_sidebar_width(60, Some(1)),
+            DIFF_SIDEBAR_MIN_WIDTH
+        );
+    }
+
+    #[test]
+    fn resolve_diff_sidebar_width_clamps_desired_down_to_max_percent() {
+        // 全体 60 の 70% = 42 が上限。
+        assert_eq!(resolve_diff_sidebar_width(60, Some(1000)), 42);
+    }
+
+    #[test]
+    fn resolve_diff_sidebar_width_never_panics_when_total_narrower_than_min() {
+        // 全体幅が極端に狭い場合は下限より上限を優先し、パニックしない。
+        assert_eq!(resolve_diff_sidebar_width(5, None), 3);
+        assert_eq!(resolve_diff_sidebar_width(0, None), 0);
+    }
+
+    #[test]
+    fn app_new_initializes_diff_sidebar_from_config() {
+        let config = Config {
+            diff_sidebar_visible: Some(false),
+            diff_sidebar_width: Some(24),
+            ..Config::default()
+        };
+        let app = App::new(config, None);
+        assert!(!app.diff_sidebar_visible);
+        assert_eq!(app.diff_sidebar_width, Some(24));
+    }
+
+    #[test]
+    fn app_new_defaults_diff_sidebar_visible_when_config_unset() {
+        let app = App::new(Config::default(), None);
+        assert!(app.diff_sidebar_visible, "既定は表示");
+        assert_eq!(app.diff_sidebar_width, None);
+    }
+
+    #[test]
+    fn diff_t_key_toggles_sidebar_visibility_and_persists_immediately() {
+        let mut app = diff_app_with_lines(10, 10);
+        assert!(app.diff_sidebar_visible);
+
+        app.update(Msg::Key(key(KeyCode::Char('t'))));
+        assert!(!app.diff_sidebar_visible);
+        assert_eq!(app.config.diff_sidebar_visible, Some(false));
+
+        app.update(Msg::Key(key(KeyCode::Char('t'))));
+        assert!(app.diff_sidebar_visible);
+        assert_eq!(app.config.diff_sidebar_visible, Some(true));
+    }
+
+    #[test]
+    fn diff_t_key_hidden_forces_focus_to_body_and_blocks_tab_until_reshown() {
+        let mut app = diff_app_with_lines(10, 10);
+        app.update(Msg::Key(key(KeyCode::Tab))); // フォーカスをファイル一覧へ。
+        assert_eq!(app.diff.as_ref().expect("diff").focus, DiffFocus::Files);
+
+        app.update(Msg::Key(key(KeyCode::Char('t'))));
+        assert!(!app.diff_sidebar_visible);
+        assert_eq!(
+            app.diff.as_ref().expect("diff").focus,
+            DiffFocus::Body,
+            "非表示にした時点で本文へ固定する"
+        );
+
+        // 非表示中は Tab を押してもファイル一覧へは戻らない。
+        app.update(Msg::Key(key(KeyCode::Tab)));
+        assert_eq!(app.diff.as_ref().expect("diff").focus, DiffFocus::Body);
+
+        // カーソル移動キーは通常どおり本文を動かす。
+        app.update(Msg::Key(key(KeyCode::Char('j'))));
+        assert_eq!(app.diff.as_ref().expect("diff").cursor, 1);
+
+        // 再表示すれば Tab でファイル一覧へ戻れる。
+        app.update(Msg::Key(key(KeyCode::Char('t'))));
+        app.update(Msg::Key(key(KeyCode::Tab)));
+        assert_eq!(app.diff.as_ref().expect("diff").focus, DiffFocus::Files);
+    }
+
+    #[test]
+    fn diff_t_key_restores_previous_width_on_reshow() {
+        let mut app = diff_app_with_lines(10, 10);
+        app.diff_sidebar_width = Some(20);
+
+        app.update(Msg::Key(key(KeyCode::Char('t')))); // 非表示。
+        assert_eq!(
+            app.diff_sidebar_width,
+            Some(20),
+            "幅は非表示にしても変わらない"
+        );
+
+        app.update(Msg::Key(key(KeyCode::Char('t')))); // 再表示。
+        assert_eq!(
+            app.diff_sidebar_width,
+            Some(20),
+            "再表示時に直前の幅が保たれている"
+        );
+    }
+
+    #[test]
+    fn diff_sidebar_drag_from_boundary_resizes_width_and_persists_on_up() {
+        let mut app = diff_app_with_lines(10, 10);
+        app.layout
+            .panes
+            .push((PaneKind::DiffFiles, Rect::new(0, 0, 18, 10)));
+        app.layout
+            .panes
+            .push((PaneKind::DiffBody, Rect::new(18, 0, 42, 10)));
+
+        // 境界列（body_rect.x = 18）で Down するとドラッグが始まる。
+        app.update(Msg::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            18,
+            5,
+        )));
+        assert!(app.diff_sidebar_dragging);
+
+        // 列 25 までドラッグすると幅がその場で追従する（保存はまだされない）。
+        app.update(Msg::Mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            25,
+            5,
+        )));
+        assert_eq!(app.diff_sidebar_width, Some(25));
+        assert_eq!(
+            app.config.diff_sidebar_width, None,
+            "Up するまでは config へ保存されない"
+        );
+
+        app.update(Msg::Mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            25,
+            5,
+        )));
+        assert!(!app.diff_sidebar_dragging);
+        assert_eq!(app.config.diff_sidebar_width, Some(25));
+        assert_eq!(app.config.diff_sidebar_visible, Some(true));
+    }
+
+    #[test]
+    fn diff_sidebar_drag_clamps_width_to_max_percent() {
+        let mut app = diff_app_with_lines(10, 10);
+        app.layout
+            .panes
+            .push((PaneKind::DiffFiles, Rect::new(0, 0, 18, 10)));
+        app.layout
+            .panes
+            .push((PaneKind::DiffBody, Rect::new(18, 0, 42, 10)));
+
+        app.update(Msg::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            18,
+            5,
+        )));
+        app.update(Msg::Mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            59,
+            5,
+        )));
+        // 全体 60 の 70% = 42 が上限。
+        assert_eq!(app.diff_sidebar_width, Some(42));
+    }
+
+    #[test]
+    fn diff_sidebar_drag_below_min_hides_sidebar_and_keeps_previous_width() {
+        let mut app = diff_app_with_lines(10, 10);
+        app.diff_sidebar_width = Some(20);
+        app.layout
+            .panes
+            .push((PaneKind::DiffFiles, Rect::new(0, 0, 20, 10)));
+        app.layout
+            .panes
+            .push((PaneKind::DiffBody, Rect::new(20, 0, 40, 10)));
+
+        app.update(Msg::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            20,
+            5,
+        )));
+        assert!(app.diff_sidebar_dragging);
+
+        app.update(Msg::Mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            5,
+            5,
+        )));
+        assert!(
+            !app.diff_sidebar_visible,
+            "MIN 未満まで縮めたら非表示になる"
+        );
+        assert_eq!(
+            app.diff_sidebar_width,
+            Some(20),
+            "直前の幅は変えずに保つ（再表示のため）"
+        );
+        assert_eq!(app.diff.as_ref().expect("diff").focus, DiffFocus::Body);
+
+        app.update(Msg::Mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            5,
+            5,
+        )));
+        assert_eq!(app.config.diff_sidebar_visible, Some(false));
+        assert_eq!(app.config.diff_sidebar_width, Some(20));
+    }
+
+    #[test]
+    fn diff_sidebar_boundary_down_does_not_trigger_pane_focus_switch() {
+        let mut app = diff_app_with_lines(10, 10);
+        app.layout
+            .panes
+            .push((PaneKind::DiffFiles, Rect::new(0, 0, 18, 10)));
+        app.layout
+            .panes
+            .push((PaneKind::DiffBody, Rect::new(18, 0, 42, 10)));
+        app.diff.as_mut().expect("diff").focus = DiffFocus::Body;
+
+        app.update(Msg::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            18,
+            5,
+        )));
+        // 境界ドラッグ扱いになり、通常のペインクリック（フォーカス切替）は発火しない。
+        assert_eq!(app.diff.as_ref().expect("diff").focus, DiffFocus::Body);
+        assert!(app.diff_sidebar_dragging);
+    }
+
+    #[test]
+    fn diff_sidebar_drag_does_nothing_when_sidebar_hidden() {
+        let mut app = diff_app_with_lines(10, 10);
+        app.diff_sidebar_visible = false;
+        app.layout
+            .panes
+            .push((PaneKind::DiffBody, Rect::new(0, 0, 60, 10)));
+
+        app.update(Msg::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            0,
+            5,
+        )));
+        assert!(!app.diff_sidebar_dragging);
+    }
+
+    #[test]
+    fn diff_mouse_up_without_drag_is_inert() {
+        let mut app = diff_app_with_lines(10, 10);
+        let before = app.config.diff_sidebar_width;
+        app.update(Msg::Mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            0,
+            0,
+        )));
+        assert!(!app.diff_sidebar_dragging);
+        assert_eq!(app.config.diff_sidebar_width, before);
     }
 
     #[test]
