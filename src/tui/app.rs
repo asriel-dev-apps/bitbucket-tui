@@ -745,10 +745,14 @@ pub enum Msg {
         branches: Vec<Branch>,
         page_info: PageInfo,
     },
-    /// コミット履歴の取得完了。
+    /// コミット履歴の 1 ページの取得完了。
     CommitsLoaded {
         revision: Option<String>,
         commits: Vec<Commit>,
+        /// 次ページ取得用の `next` URL（無ければ次ページなし）。
+        next: Option<String>,
+        /// このページのページ番号（現在ページとの照合に使う）。
+        page: u32,
     },
     /// コミット詳細の取得完了。
     CommitDetailLoaded { hash: String, commit: Box<Commit> },
@@ -923,12 +927,17 @@ pub enum Command {
         repo: String,
         page: u32,
     },
-    /// コミット履歴を取得する（`revision` 省略時は既定ブランチ）。
+    /// コミット履歴の 1 ページを取得する（`revision` 省略時は既定ブランチ）。
+    ///
+    /// commits は `page` 番号ジャンプ非対応のため `cursor`（前ページ応答の `next` URL、
+    /// 先頭ページは `None`）で辿る。`page` は表示・応答照合用のページ番号。
     LoadCommits {
         client: BitbucketClient,
         workspace: String,
         repo: String,
         revision: Option<String>,
+        cursor: Option<String>,
+        page: u32,
     },
     /// コミット詳細を取得する。
     LoadCommitDetail {
@@ -1449,6 +1458,14 @@ pub struct App {
     pub commits: SelectList<Commit>,
     /// Commits 画面が表示中の revision（ブランチ名/ハッシュ、既定は `None`）。
     pub commits_revision: Option<String>,
+    /// Commits 画面の現在ページ番号（1 始まり、ページャ表示用）。
+    pub commits_page: u32,
+    /// 現在ページの次ページ取得用 `next` URL（無ければ次ページなし）。commits は `page` 番号
+    /// ジャンプ非対応のため cursor（`next` URL）で前後する。
+    pub commits_next_url: Option<String>,
+    /// 前ページへ戻るための cursor スタック。各要素は「そのページを取得した cursor」
+    /// （先頭ページは `None`）で、末尾が現在ページの cursor。
+    pub commits_page_cursors: Vec<Option<String>>,
     pub current_commit: Option<Commit>,
     /// CommitDetail のメッセージスクロール量。
     pub commit_scroll: u16,
@@ -1696,6 +1713,9 @@ impl App {
             branches_cache: RevisitCache::default(),
             commits: SelectList::default(),
             commits_revision: None,
+            commits_page: 1,
+            commits_next_url: None,
+            commits_page_cursors: vec![None],
             current_commit: None,
             commit_scroll: 0,
             source: None,
@@ -2011,10 +2031,17 @@ impl App {
                 }
                 Command::None
             }
-            Msg::CommitsLoaded { revision, commits } => {
-                if self.commits_revision == revision {
+            Msg::CommitsLoaded {
+                revision,
+                commits,
+                next,
+                page,
+            } => {
+                // 取得中に別 revision/ページへ切り替えていた場合は画面反映を破棄する（文脈ガード）。
+                if self.commits_revision == revision && self.commits_page == page {
                     self.clear_loading();
                     self.commits.set_items(commits);
+                    self.commits_next_url = next;
                 }
                 Command::None
             }
@@ -4829,20 +4856,29 @@ impl App {
     fn open_commits(&mut self, revision: String) -> Command {
         self.screen = Screen::Commits;
         self.commits_revision = Some(revision);
-        self.commits.set_items(Vec::new());
         self.current_commit = None;
-        self.reload_commits()
+        self.commits_page = 1;
+        self.commits_next_url = None;
+        self.commits_page_cursors = vec![None];
+        self.load_commits_current()
     }
 
-    /// 現在の revision でコミット履歴を再取得する。
-    fn reload_commits(&mut self) -> Command {
+    /// 現在ページ（cursor スタック末尾）のコミット履歴取得コマンドを組み立てる。
+    ///
+    /// [`Self::open_commits`]（先頭ページ）・`[`/`]`（前後移動）・`r`（現在ページ再取得）の
+    /// 共通経路。commits は `page` 番号ジャンプ非対応のため、branches のような番号キャッシュは
+    /// 持たず、末尾 cursor で毎回 `next` を辿って取得する。
+    fn load_commits_current(&mut self) -> Command {
         let Some((client, workspace, repo)) = self.review_context() else {
             self.status = Status::Error("認証クライアントが未初期化です".to_string());
             return Command::None;
         };
+        self.commits.set_items(Vec::new());
         let revision = self.commits_revision.clone();
+        let cursor = self.commits_page_cursors.last().cloned().flatten();
+        let page = self.commits_page;
         self.status = Status::Loading(format!(
-            "コミット履歴を取得中…（{}）",
+            "コミット履歴を取得中…（{} / {page} ページ目）",
             revision.as_deref().unwrap_or("既定ブランチ")
         ));
         Command::LoadCommits {
@@ -4850,6 +4886,43 @@ impl App {
             workspace,
             repo,
             revision,
+            cursor,
+            page,
+        }
+    }
+
+    /// 現在ページのコミット履歴を再取得する（`r` キー）。
+    fn reload_commits(&mut self) -> Command {
+        self.load_commits_current()
+    }
+
+    /// 次ページへ（`]`）。`next` URL が無ければ何もしない。
+    fn commits_next_page(&mut self) -> Command {
+        let Some(next) = self.commits_next_url.clone() else {
+            return Command::None;
+        };
+        self.commits_page_cursors.push(Some(next));
+        self.commits_page += 1;
+        self.load_commits_current()
+    }
+
+    /// 前ページへ（`[`）。先頭ページでは何もしない。
+    fn commits_prev_page(&mut self) -> Command {
+        if self.commits_page <= 1 {
+            return Command::None;
+        }
+        self.commits_page_cursors.pop();
+        self.commits_page -= 1;
+        self.load_commits_current()
+    }
+
+    /// Commits 画面のページャ表示用 [`PageInfo`]。commits は cursor ベースのため総ページ数は
+    /// 常に不明（`None`）で、次ページ有無は `next` URL の有無で判定する。
+    pub fn commits_page_info(&self) -> PageInfo {
+        PageInfo {
+            page: self.commits_page,
+            total_pages: None,
+            has_next: self.commits_next_url.is_some(),
         }
     }
 
@@ -4881,6 +4954,8 @@ impl App {
                 self.commits.select_prev_by(10);
                 Command::None
             }
+            KeyCode::Char('[') => self.commits_prev_page(),
+            KeyCode::Char(']') => self.commits_next_page(),
             KeyCode::Char('r') => self.reload_commits(),
             KeyCode::Enter => self.open_commit_detail(),
             _ => Command::None,
@@ -8144,8 +8219,11 @@ diff --git a/two.txt b/two.txt\n\
         app.update(Msg::CommitsLoaded {
             revision: Some("main".to_string()),
             commits: vec![make_commit("aaaa1111", "x"), make_commit("bbbb2222", "y")],
+            next: Some("cursor-2".to_string()),
+            page: 1,
         });
         assert_eq!(app.commits.items.len(), 2);
+        assert_eq!(app.commits_next_url.as_deref(), Some("cursor-2"));
     }
 
     #[test]
@@ -8156,8 +8234,157 @@ diff --git a/two.txt b/two.txt\n\
         app.update(Msg::CommitsLoaded {
             revision: Some("other".to_string()),
             commits: vec![make_commit("zzzz9999", "z")],
+            next: None,
+            page: 1,
         });
         assert!(app.commits.items.is_empty());
+    }
+
+    /// 開いた瞬間は先頭ページ（cursor なし・page 1）にリセットされる（前回の残り状態を持ち越さない）。
+    #[test]
+    fn opening_commits_resets_to_first_page_with_no_cursor() {
+        let mut app = review_app();
+        app.screen = Screen::Branches;
+        app.branches
+            .set_items(vec![make_branch("main", "aaaa1111")]);
+        // 前回のページ移動状態を汚しておく。
+        app.commits_page = 5;
+        app.commits_next_url = Some("stale".to_string());
+        app.commits_page_cursors = vec![None, Some("stale".to_string())];
+
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+        assert_eq!(app.screen, Screen::Commits);
+        assert_eq!(app.commits_page, 1);
+        assert!(app.commits_next_url.is_none());
+        assert_eq!(app.commits_page_cursors, vec![None]);
+        match cmd {
+            Command::LoadCommits { cursor, page, .. } => {
+                assert!(cursor.is_none());
+                assert_eq!(page, 1);
+            }
+            other => panic!("expected LoadCommits, got {other:?}"),
+        }
+    }
+
+    /// `]` は現在ページの `next` URL を cursor として次ページを取得し、ページ番号を進める。
+    #[test]
+    fn commits_next_page_follows_next_url_and_increments_page() {
+        let mut app = review_app();
+        app.screen = Screen::Commits;
+        app.commits_revision = Some("main".to_string());
+        app.update(Msg::CommitsLoaded {
+            revision: Some("main".to_string()),
+            commits: vec![make_commit("aaaa1111", "x")],
+            next: Some("https://api.example/commits?ctx=abc".to_string()),
+            page: 1,
+        });
+
+        let cmd = app.update(Msg::Key(key(KeyCode::Char(']'))));
+        assert_eq!(app.commits_page, 2);
+        assert!(app.commits.items.is_empty());
+        assert!(matches!(app.status, Status::Loading(_)));
+        match cmd {
+            Command::LoadCommits { cursor, page, .. } => {
+                assert_eq!(
+                    cursor.as_deref(),
+                    Some("https://api.example/commits?ctx=abc")
+                );
+                assert_eq!(page, 2);
+            }
+            other => panic!("expected LoadCommits, got {other:?}"),
+        }
+    }
+
+    /// 次ページ URL が無ければ `]` は何もしない（末尾ページの空振り防止）。
+    #[test]
+    fn commits_next_page_does_nothing_without_next_url() {
+        let mut app = review_app();
+        app.screen = Screen::Commits;
+        app.commits_revision = Some("main".to_string());
+        app.update(Msg::CommitsLoaded {
+            revision: Some("main".to_string()),
+            commits: vec![make_commit("aaaa1111", "x")],
+            next: None,
+            page: 1,
+        });
+        let cmd = app.update(Msg::Key(key(KeyCode::Char(']'))));
+        assert_eq!(app.commits_page, 1);
+        assert!(matches!(cmd, Command::None));
+    }
+
+    /// `[` は cursor スタックを 1 つ戻し、前ページを再取得する（先頭ページは cursor なし）。
+    #[test]
+    fn commits_prev_page_pops_cursor_and_returns_to_previous_page() {
+        let mut app = review_app();
+        app.screen = Screen::Commits;
+        app.commits_revision = Some("main".to_string());
+        // 1 → 2 ページへ進む。
+        app.update(Msg::CommitsLoaded {
+            revision: Some("main".to_string()),
+            commits: vec![make_commit("aaaa1111", "x")],
+            next: Some("cursor-2".to_string()),
+            page: 1,
+        });
+        app.update(Msg::Key(key(KeyCode::Char(']'))));
+        assert_eq!(app.commits_page, 2);
+        app.update(Msg::CommitsLoaded {
+            revision: Some("main".to_string()),
+            commits: vec![make_commit("bbbb2222", "y")],
+            next: Some("cursor-3".to_string()),
+            page: 2,
+        });
+
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('['))));
+        assert_eq!(app.commits_page, 1);
+        match cmd {
+            Command::LoadCommits { cursor, page, .. } => {
+                assert!(cursor.is_none());
+                assert_eq!(page, 1);
+            }
+            other => panic!("expected LoadCommits, got {other:?}"),
+        }
+    }
+
+    /// 先頭ページで `[` は何もしない（cursor スタックを底割れさせない）。
+    #[test]
+    fn commits_prev_page_does_nothing_on_first_page() {
+        let mut app = review_app();
+        app.screen = Screen::Commits;
+        app.commits_revision = Some("main".to_string());
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('['))));
+        assert_eq!(app.commits_page, 1);
+        assert!(matches!(cmd, Command::None));
+    }
+
+    /// ページ移動中に届いた別ページの応答は現在ページと一致しないため反映しない（文脈ガード）。
+    #[test]
+    fn commits_loaded_ignored_when_page_does_not_match_current() {
+        let mut app = review_app();
+        app.screen = Screen::Commits;
+        app.commits_revision = Some("main".to_string());
+        app.commits_page = 2;
+        app.update(Msg::CommitsLoaded {
+            revision: Some("main".to_string()),
+            commits: vec![make_commit("stale111", "old")],
+            next: None,
+            page: 1,
+        });
+        assert!(app.commits.items.is_empty());
+    }
+
+    /// ページャ表示用 `PageInfo` は総ページ数を持たず、次ページ有無を `next` URL で判定する。
+    #[test]
+    fn commits_page_info_reflects_page_and_next_url() {
+        let mut app = review_app();
+        app.commits_page = 3;
+        app.commits_next_url = Some("cursor".to_string());
+        let info = app.commits_page_info();
+        assert_eq!(info.page, 3);
+        assert!(info.total_pages.is_none());
+        assert!(info.has_next);
+
+        app.commits_next_url = None;
+        assert!(!app.commits_page_info().has_next);
     }
 
     #[test]

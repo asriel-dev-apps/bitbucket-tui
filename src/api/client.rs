@@ -380,24 +380,39 @@ impl BitbucketClient {
         })
     }
 
-    /// コミット履歴を取得する。
+    /// コミット履歴の 1 ページを取得する。
     ///
-    /// `revision`（ブランチ名/ハッシュ）を省略すると既定ブランチの履歴になる。
-    /// ブランチ名に含まれ得る `/` はパスセパレータとして温存する。
-    pub async fn list_commits(
+    /// commits エンドポイントは他の一覧（workspaces/repositories/pull_requests/branches）と
+    /// 異なり `page` 番号によるランダムアクセスをサポートせず、応答の `next` URL を辿る
+    /// （cursor 方式）。そのため単一ページ取得の生応答（`Paginated<Commit>`）を返し、
+    /// 呼び出し側が `values` と `next`（次ページ取得用 cursor）を扱う。
+    ///
+    /// `cursor` が `Some` なら前ページ応答の `next` URL をそのまま辿る（クエリ込みの完全 URL）。
+    /// `None`（先頭ページ）なら `revision`（ブランチ名/ハッシュ、省略時は既定ブランチ）から
+    /// 開始 URL を組み立て、`pagelen` 固定 [`PAGE_SIZE`] で取得する。ブランチ名に含まれ得る
+    /// `/` はパスセパレータとして温存する。
+    pub async fn get_commits_page(
         &self,
         workspace: &str,
         repo: &str,
         revision: Option<&str>,
-    ) -> Result<Vec<Commit>, ApiError> {
-        let path = match revision {
-            Some(rev) => format!(
-                "/repositories/{workspace}/{repo}/commits/{}",
-                encode_path(rev)
-            ),
-            None => format!("/repositories/{workspace}/{repo}/commits"),
-        };
-        self.get_paged(&path, &[("pagelen", "50")]).await
+        cursor: Option<&str>,
+    ) -> Result<Paginated<Commit>, ApiError> {
+        match cursor {
+            Some(url) => self.send_get(url.to_string(), Vec::new()).await,
+            None => {
+                let path = match revision {
+                    Some(rev) => format!(
+                        "/repositories/{workspace}/{repo}/commits/{}",
+                        encode_path(rev)
+                    ),
+                    None => format!("/repositories/{workspace}/{repo}/commits"),
+                };
+                let url = format!("{BASE_URL}{path}");
+                self.send_get(url, vec![("pagelen".to_string(), PAGE_SIZE.to_string())])
+                    .await
+            }
+        }
     }
 
     /// コミット詳細を取得する（単数 `commit` エンドポイント）。

@@ -1736,21 +1736,36 @@ fn branch_row(branch: &Branch, theme: &Theme) -> Line<'static> {
 
 fn render_commits(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = app.theme;
+    let (list_area, pager_area) = split_list_and_pager(area);
+
     if app.commits.items.is_empty() {
-        render_placeholder(frame, area, &app.status, "コミットがありません", &theme);
-        return;
+        render_placeholder(
+            frame,
+            list_area,
+            &app.status,
+            "コミットがありません",
+            &theme,
+        );
+    } else {
+        let items: Vec<ListItem> = app
+            .commits
+            .items
+            .iter()
+            .map(|commit| ListItem::new(commit_row(commit, &theme)))
+            .collect();
+        let revision = app.commits_revision.as_deref().unwrap_or("既定ブランチ");
+        let title = format!(" コミット [{revision}] ({}) ", app.commits.items.len());
+        let list = list_widget(&theme, items, title);
+        frame.render_stateful_widget(list, list_area, &mut app.commits.state);
     }
-    let items: Vec<ListItem> = app
-        .commits
-        .items
-        .iter()
-        .map(|commit| ListItem::new(commit_row(commit, &theme)))
-        .collect();
-    let revision = app.commits_revision.as_deref().unwrap_or("既定ブランチ");
-    let title = format!(" コミット [{revision}] ({}) ", app.commits.items.len());
-    let list = list_widget(&theme, items, title);
-    frame.render_stateful_widget(list, area, &mut app.commits.state);
-    record_list(app, ListKind::Commits, area, app.commits.state.offset());
+
+    render_pager(frame, pager_area, app.commits_page_info(), &theme);
+    record_list(
+        app,
+        ListKind::Commits,
+        list_area,
+        app.commits.state.offset(),
+    );
 }
 
 fn commit_row(commit: &Commit, theme: &Theme) -> Line<'static> {
@@ -2279,6 +2294,7 @@ fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("Shift+J/K", "10件移動"),
             ("Enter", "詳細"),
             ("r", "再読込"),
+            ("[/]", "前/次ページ"),
             ("Esc", "戻る"),
         ],
         Screen::CommitDetail => vec![
@@ -4147,6 +4163,24 @@ mod tests {
             .draw(|frame| {
                 let area = frame.area();
                 render_pipelines(frame, area, &mut app);
+            })
+            .expect("draw succeeds even with empty list");
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("page 2"));
+    }
+
+    #[test]
+    fn render_commits_with_pager_does_not_panic_and_shows_page_label() {
+        let mut app = App::new(crate::config::Config::default(), None);
+        app.commits.set_items(vec![]);
+        app.commits_page = 2;
+        app.commits_next_url = Some("https://api.example/commits?ctx=abc".to_string());
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_commits(frame, area, &mut app);
             })
             .expect("draw succeeds even with empty list");
         let content = buffer_text(terminal.backend().buffer());

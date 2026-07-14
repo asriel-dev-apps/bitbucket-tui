@@ -507,14 +507,21 @@ fn dispatch(command: Command, api_tx: &mpsc::Sender<Msg>) -> bool {
             workspace,
             repo,
             revision,
+            cursor,
+            page,
         } => {
             let tx = api_tx.clone();
             tokio::spawn(async move {
                 let msg = match client
-                    .list_commits(&workspace, &repo, revision.as_deref())
+                    .get_commits_page(&workspace, &repo, revision.as_deref(), cursor.as_deref())
                     .await
                 {
-                    Ok(commits) => Msg::CommitsLoaded { revision, commits },
+                    Ok(result) => Msg::CommitsLoaded {
+                        revision,
+                        commits: result.values,
+                        next: result.next,
+                        page,
+                    },
                     Err(error) => Msg::LoadFailed(error),
                 };
                 let _ = tx.send(msg).await;
