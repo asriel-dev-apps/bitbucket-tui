@@ -23,10 +23,11 @@ use crate::api::{
     PipelineStatus, PipelineStep, PullRequest, SrcEntry,
 };
 use crate::tui::app::{
-    App, CommentEditor, CommentRow, CommentRowKind, ConfirmModal, DeleteCommentModal, DetailFocus,
-    DiffFocus, DiffState, DiffViewMode, DisplayRow, HintLayout, ImageHit, JumpPaletteState,
-    LinkPalette, ListKind, ListLayout, MergeModal, ModalKind, ModalLayout, PageJumpModal, PaneKind,
-    Screen, SelectList, Status,
+    App, CommentAction, CommentActionHit, CommentEditor, CommentRow, CommentRowKind, ConfirmModal,
+    DeleteCommentModal, DetailFocus, DiffFocus, DiffState, DiffViewMode, DisplayRow, HintLayout,
+    ImageHit, JumpPaletteState, LinkPalette, ListKind, ListLayout, MergeModal, ModalKind,
+    ModalLayout, PageJumpModal, PaneKind, Screen, SelectList, Status, comment_action_labels,
+    format_when, now_unix,
 };
 use crate::tui::diff::{DiffLineKind, FileStatus, ParsedDiff, SidebarRow};
 use crate::tui::onboarding::Field;
@@ -90,6 +91,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if let Some(modal) = &app.delete_comment_modal {
         let area = centered_rect(60, 30, frame.area());
         render_delete_comment_modal(frame, area, modal, &app.theme);
+        // モーダルとして登録し、モーダル外のクリック（アクションリンク等）を遮断する。
+        app.layout.modal = Some(ModalLayout {
+            kind: ModalKind::DeleteCommentConfirm,
+            area,
+        });
     }
     if let Some(modal) = &app.merge_modal {
         let area = centered_rect(60, 55, frame.area());
@@ -1067,7 +1073,7 @@ fn render_comments(
         ));
         if let Some(created) = comment.created_on.as_deref() {
             header.push(Span::styled(
-                format!("  {}", created.chars().take(10).collect::<String>()),
+                format!("  {}", format_when(created, now_unix())),
                 Style::new().dim(),
             ));
         }
@@ -1146,10 +1152,11 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
     if let Some(sidebar_area) = sidebar_area {
         render_diff_sidebar(frame, sidebar_area, diff, &theme);
     }
-    match diff.view_mode {
+    let action_hits = match diff.view_mode {
         DiffViewMode::Unified => render_diff_body(frame, body_area, diff, &theme),
         DiffViewMode::Split => render_diff_body_split(frame, body_area, diff, &theme),
-    }
+    };
+    app.layout.comment_actions = action_hits;
 
     let Some(sidebar_area) = sidebar_area else {
         app.layout.panes.push((PaneKind::DiffBody, body_area));
@@ -1234,7 +1241,7 @@ fn render_diff_sidebar(frame: &mut Frame, area: Rect, diff: &DiffState, theme: &
 }
 
 /// サイドバーのツリー 1 行を [`ListItem`] に整形する。フォルダは淡色 + `name/`、ファイルは
-/// `basename  +A -R  💬N`（値が 0 の要素は省略）。深さぶんインデントし、`content_width` に
+/// `basename  +A -R  🗨N`（値が 0 の要素は省略）。深さぶんインデントし、`content_width` に
 /// 収まるよう名前を中略して統計・バッジが右端で切れないようにする。
 fn sidebar_row_item(
     row: &SidebarRow,
@@ -1298,7 +1305,7 @@ fn sidebar_row_item(
                 .unwrap_or(0);
             if count > 0 {
                 suffix.push(Span::styled(
-                    format!("  💬{count}"),
+                    format!("  🗨{count}"),
                     Style::new().fg(theme.info),
                 ));
             }
@@ -1367,7 +1374,12 @@ fn diff_visible_range(scroll: usize, viewport: usize, len: usize) -> (usize, usi
     (start, end)
 }
 
-fn render_diff_body(frame: &mut Frame, area: Rect, diff: &mut DiffState, theme: &Theme) {
+fn render_diff_body(
+    frame: &mut Frame,
+    area: Rect,
+    diff: &mut DiffState,
+    theme: &Theme,
+) -> Vec<CommentActionHit> {
     // 着色済み diff 行は diff ロード時・テーマ切替時に一度だけ構築して使い回す（`parsed.lines`
     // と同じ並び・同じ長さ）。コメント行は `display_rows` として畳み込み、`scroll`/`cursor` は
     // その表示行の添字を指す。per-frame コストは O(viewport)。
@@ -1393,9 +1405,11 @@ fn render_diff_body(frame: &mut Frame, area: Rect, diff: &mut DiffState, theme: 
     let inner_width = area.width.saturating_sub(2) as usize;
     let focused_comment = diff.cursor_comment().map(|(_, comment_id)| comment_id);
     let focused_thread = diff.cursor_comment().map(|(thread_root, _)| thread_root);
+    let now = now_unix();
     let mut visible: Vec<Line> = Vec::with_capacity(viewport);
+    let mut hits: Vec<CommentActionHit> = Vec::new();
     let Some(lines) = diff.rendered_lines.as_ref() else {
-        return;
+        return hits;
     };
 
     if diff.display_rows.is_empty() {
@@ -1431,7 +1445,18 @@ fn render_diff_body(frame: &mut Frame, area: Rect, diff: &mut DiffState, theme: 
                         theme,
                         focused_comment,
                         focused_thread,
+                        now,
                     ));
+                    // アクション行はクリック用ヒットボックスも収集する（内容開始列 =
+                    // 枠線 1 + パディング 1 + ボックス左枠 "│ " 2 = area.x + 4）。
+                    collect_action_hits(
+                        &mut hits,
+                        comment_row,
+                        theme,
+                        inner_width,
+                        area.x.saturating_add(4),
+                        area.y.saturating_add(1).saturating_add(offset as u16),
+                    );
                 }
             }
         }
@@ -1439,6 +1464,7 @@ fn render_diff_body(frame: &mut Frame, area: Rect, diff: &mut DiffState, theme: 
 
     let paragraph = Paragraph::new(visible).block(themed_block(theme, focused).title(title));
     frame.render_widget(paragraph, area);
+    hits
 }
 
 /// コメントボックスの 1 行を整形する。枠（`┌─┐│└─┘`）で囲む。カーソルが乗っているスレッドは
@@ -1449,6 +1475,7 @@ fn comment_box_line(
     theme: &Theme,
     focused_comment: Option<u64>,
     focused_thread: Option<u64>,
+    now: i64,
 ) -> Line<'static> {
     let width = inner_width.max(4);
     // 選択中コメントは背景ハイライト、選択中スレッドは枠全体をアクセント色にする。
@@ -1475,12 +1502,13 @@ fn comment_box_line(
             resolved,
         } => {
             let budget = width.saturating_sub(4);
-            let marker = if *reply { "↳ " } else { "💬 " };
+            let marker = if *reply { "↳ " } else { "🗨 " };
             // 枠がずれないよう、固定部（marker/when/解決）を差し引いて著者名をクリップする。
+            // `when` は生の created_on。相対時刻はこの場（毎フレーム）で整形する。
             let when_part = if when.is_empty() {
                 String::new()
             } else {
-                format!("  {when}")
+                format!("  {}", format_when(when, now))
             };
             let resolved_part = if *resolved { "  ✓解決" } else { "" };
             let fixed = UnicodeWidthStr::width(marker)
@@ -1502,6 +1530,54 @@ fn comment_box_line(
             }
             comment_box_content_line(content, budget, border, hot, theme)
         }
+        CommentRowKind::Actions {
+            reply,
+            root,
+            mine,
+            resolved,
+        } => {
+            let budget = width.saturating_sub(4);
+            let (line, _) = comment_actions_line(*reply, *root, *mine, *resolved, theme);
+            let content_width: usize = line
+                .spans
+                .iter()
+                .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                .sum();
+            let mut content = line.spans;
+            // 幅超過時はリンクを丸ごと落とさず clip（稀: 極端に狭いペイン）。
+            if content_width > budget {
+                let flat: String = content.iter().map(|span| span.content.as_ref()).collect();
+                content = vec![Span::styled(
+                    clip_to_width(&flat, budget),
+                    Style::new().fg(theme.info),
+                )];
+            }
+            comment_box_content_line(content, budget, border, hot, theme)
+        }
+        CommentRowKind::Collapsed {
+            author,
+            count,
+            resolved,
+        } => {
+            // 折りたたみ 1 行表示（Enter/クリックで展開）。枠は付けない。
+            let text = if *resolved {
+                format!("▸ ✓ {author} resolved this thread ({count})")
+            } else {
+                format!("▸ 🗨 {author} · thread ({count})")
+            };
+            let shown = clip_to_width(&text, width.max(1));
+            let style = if *resolved {
+                Style::new().fg(theme.success)
+            } else {
+                Style::new().fg(theme.muted)
+            };
+            let line = Line::from(Span::styled(shown, style));
+            if hot {
+                line.style(Style::new().bg(theme.selection_bg))
+            } else {
+                line
+            }
+        }
         CommentRowKind::Body { reply, text } => {
             let budget = width.saturating_sub(4);
             let indent = if *reply { "  " } else { "" };
@@ -1509,6 +1585,81 @@ fn comment_box_line(
             let content = vec![Span::styled(shown, Style::new().fg(theme.fg))];
             comment_box_content_line(content, budget, border, hot, theme)
         }
+    }
+}
+
+/// アクションリンク行の内容（`Reply · Resolve · Edit · Delete`）と、各リンクの
+/// 「内容先頭からの列オフセット・表示幅」を組む（描画とクリック判定で共有する）。
+fn comment_actions_line(
+    reply: bool,
+    root: bool,
+    mine: bool,
+    resolved: bool,
+    theme: &Theme,
+) -> (Line<'static>, Vec<(CommentAction, u16, u16)>) {
+    let indent = if reply { "    " } else { "  " };
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(indent.to_string())];
+    let mut segments = Vec::new();
+    let mut offset = UnicodeWidthStr::width(indent) as u16;
+    for (i, (action, label)) in comment_action_labels(root, mine, resolved)
+        .into_iter()
+        .enumerate()
+    {
+        if i > 0 {
+            let sep = " · ";
+            spans.push(Span::styled(sep.to_string(), Style::new().fg(theme.muted)));
+            offset += UnicodeWidthStr::width(sep) as u16;
+        }
+        let label_width = UnicodeWidthStr::width(label) as u16;
+        segments.push((action, offset, label_width));
+        spans.push(Span::styled(
+            label.to_string(),
+            Style::new().fg(theme.info).underlined(),
+        ));
+        offset += label_width;
+    }
+    (Line::from(spans), segments)
+}
+
+/// アクションリンクのヒットボックスを収集する（`base_x` = ボックス内容の開始列、`y` = 行の
+/// 絶対行）。内容が枠幅を超える場合はリンク位置が clip とずれるため収集しない。
+fn collect_action_hits(
+    hits: &mut Vec<CommentActionHit>,
+    row: &CommentRow,
+    theme: &Theme,
+    inner_width: usize,
+    base_x: u16,
+    y: u16,
+) {
+    let CommentRowKind::Actions {
+        reply,
+        root,
+        mine,
+        resolved,
+    } = &row.kind
+    else {
+        return;
+    };
+    let Some(comment_id) = row.comment_id else {
+        return;
+    };
+    let budget = inner_width.max(4).saturating_sub(4);
+    let (line, segments) = comment_actions_line(*reply, *root, *mine, *resolved, theme);
+    let content_width: usize = line
+        .spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    if content_width > budget {
+        return;
+    }
+    for (action, offset, width) in segments {
+        hits.push(CommentActionHit {
+            area: Rect::new(base_x + offset, y, width, 1),
+            action,
+            comment_id,
+            thread_root: row.thread_root,
+        });
     }
 }
 
@@ -1567,7 +1718,12 @@ fn clip_to_width(text: &str, budget: usize) -> String {
 /// （O(viewport)。全行を Paragraph へ渡さない）。長い行はそれぞれのペイン幅で自動的に
 /// クリップされる（`Paragraph` は `.wrap()` を付けない限り折り返さず、area 幅を超えた
 /// 分は単純に描画されない。水平スクロールが不要な今回はこれで十分）。
-fn render_diff_body_split(frame: &mut Frame, area: Rect, diff: &mut DiffState, theme: &Theme) {
+fn render_diff_body_split(
+    frame: &mut Frame,
+    area: Rect,
+    diff: &mut DiffState,
+    theme: &Theme,
+) -> Vec<CommentActionHit> {
     let total = diff.parsed.split_lines.len();
     let position = diff_cursor_position_label(diff);
     let suffix = format!(" ({total} 行){position} ");
@@ -1583,10 +1739,12 @@ fn render_diff_body_split(frame: &mut Frame, area: Rect, diff: &mut DiffState, t
     let right_inner = cols[1].width.saturating_sub(2) as usize;
     let focused_comment = diff.cursor_comment().map(|(_, comment_id)| comment_id);
     let focused_thread = diff.cursor_comment().map(|(thread_root, _)| thread_root);
+    let now = now_unix();
     let mut visible_left: Vec<Line> = Vec::with_capacity(viewport);
     let mut visible_right: Vec<Line> = Vec::with_capacity(viewport);
+    let mut hits: Vec<CommentActionHit> = Vec::new();
     let Some(rows) = diff.rendered_split.as_ref() else {
-        return;
+        return hits;
     };
 
     if diff.display_rows.is_empty() {
@@ -1625,7 +1783,18 @@ fn render_diff_body_split(frame: &mut Frame, area: Rect, diff: &mut DiffState, t
                         theme,
                         focused_comment,
                         focused_thread,
+                        now,
                     ));
+                    // アクション行のクリック用ヒットボックス（右カラム内容開始列 = 右カラム
+                    // 枠線 1 + パディング 1 + ボックス左枠 2 = cols[1].x + 4）。
+                    collect_action_hits(
+                        &mut hits,
+                        comment_row,
+                        theme,
+                        right_inner,
+                        cols[1].x.saturating_add(4),
+                        cols[1].y.saturating_add(1).saturating_add(offset as u16),
+                    );
                 }
             }
         }
@@ -1637,6 +1806,7 @@ fn render_diff_body_split(frame: &mut Frame, area: Rect, diff: &mut DiffState, t
         .block(themed_block(theme, focused).title(format!(" diff {} 新{suffix}", diff.title)));
     frame.render_widget(left_paragraph, cols[0]);
     frame.render_widget(right_paragraph, cols[1]);
+    hits
 }
 
 /// [`DiffState::rendered_split`] キャッシュの中身を構築する（diff ロード時・テーマ切替時に
@@ -2596,6 +2766,7 @@ fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("e", "編集"),
             ("d", "削除"),
             ("R", "解決"),
+            ("Enter", "折りたたみ"),
             ("Esc", "戻る"),
         ],
         Screen::Pipelines => vec![
@@ -2924,7 +3095,9 @@ fn render_help(frame: &mut Frame, area: Rect, screen: Screen, theme: &Theme) {
             "t              ファイル一覧 表示/非表示（境界のドラッグでも幅調整可。設定に永続化）",
             "c              現在行にインラインコメント投稿（PR 差分のみ。Ctrl+S 送信 / Esc 取消）",
             "↑↓             コメント行にもカーソルが乗り、コメントを選択できる",
-            "r / e / d / R  選択中コメントに 返信 / 編集 / 削除 / 解決トグル（PR 差分のみ）",
+            "r / e / d / R  選択中コメントに 返信 / 編集 / 削除 / 解決トグル（PR 差分のみ。",
+            "               編集/削除は自分のコメントのみ。Reply 等のリンクはクリックでも動作）",
+            "Enter          スレッドの折りたたみ/展開（解決済みは自動で折りたたみ）",
             "               コミット差分ではコメント操作できません",
         ],
         Screen::Repositories => &[
@@ -3120,6 +3293,8 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
 
+    use std::collections::HashMap;
+
     use crate::api::Comment;
     use crate::tui::app::{CommentLayout, build_comment_layout};
     use crate::tui::diff::parse as parse_diff;
@@ -3145,6 +3320,7 @@ mod tests {
             comment_layout: CommentLayout::default(),
             sidebar_rows: Vec::new(),
             display_rows: Vec::new(),
+            thread_collapse: HashMap::new(),
         }
     }
 
@@ -3177,6 +3353,7 @@ mod tests {
             comment_layout: CommentLayout::default(),
             sidebar_rows: Vec::new(),
             display_rows: Vec::new(),
+            thread_collapse: HashMap::new(),
         }
     }
 
@@ -3431,6 +3608,7 @@ mod tests {
             comment_layout: CommentLayout::default(),
             sidebar_rows: Vec::new(),
             display_rows: Vec::new(),
+            thread_collapse: HashMap::new(),
         };
         let theme = Theme::default();
 
@@ -3457,7 +3635,7 @@ mod tests {
                         "created_on": "2026-05-27T00:00:00Z",
                         "inline": { "path": "x.rs", "to": 1 } }"#;
         let comment: Comment = serde_json::from_str(json).expect("valid inline comment json");
-        let comment_layout = build_comment_layout(&parsed, &[comment]);
+        let comment_layout = build_comment_layout(&parsed, &[comment], &Default::default());
         let mut diff = DiffState {
             parsed,
             viewport: 12,
@@ -3470,7 +3648,9 @@ mod tests {
         let backend = TestBackend::new(60, 12);
         let mut terminal = Terminal::new(backend).expect("terminal builds");
         terminal
-            .draw(|frame| render_diff_body(frame, frame.area(), &mut diff, &theme))
+            .draw(|frame| {
+                render_diff_body(frame, frame.area(), &mut diff, &theme);
+            })
             .expect("draw succeeds");
         let content = buffer_text(terminal.backend().buffer());
         assert!(content.contains("Bob"), "comment author missing: {content}");
@@ -3487,6 +3667,82 @@ mod tests {
         assert!(
             content.contains('└'),
             "box bottom border missing: {content}"
+        );
+        // アクションリンク行（Reply）と 🗨 アイコンも出る。
+        assert!(content.contains("Reply"), "action links missing: {content}");
+        assert!(content.contains('🗨'), "bubble icon missing: {content}");
+    }
+
+    #[test]
+    fn render_diff_body_collects_action_hitboxes() {
+        let parsed = parse_diff("diff --git a/x.rs b/x.rs\n@@ -0,0 +1 @@\n+new line\n");
+        let json = r#"{ "id": 1, "content": { "raw": "hi" },
+                        "user": { "display_name": "Bob" }, "deleted": false,
+                        "created_on": "2026-05-27T00:00:00Z",
+                        "inline": { "path": "x.rs", "to": 1 } }"#;
+        let comment: Comment = serde_json::from_str(json).expect("valid inline comment json");
+        let comment_layout = build_comment_layout(&parsed, &[comment], &Default::default());
+        let mut diff = DiffState {
+            parsed,
+            viewport: 12,
+            view_mode: DiffViewMode::Unified,
+            comment_layout,
+            ..Default::default()
+        };
+        diff.rebuild_display_rows();
+        let theme = Theme::default();
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        let mut hits = Vec::new();
+        terminal
+            .draw(|frame| {
+                hits = render_diff_body(frame, frame.area(), &mut diff, &theme);
+            })
+            .expect("draw succeeds");
+        // ルート 1 件・他人のコメント → Reply と Resolve の 2 リンク。
+        let actions: Vec<CommentAction> = hits.iter().map(|hit| hit.action).collect();
+        assert_eq!(actions, vec![CommentAction::Reply, CommentAction::Resolve]);
+        assert!(hits.iter().all(|hit| hit.comment_id == 1));
+        // ヒットボックスの行はボックス内のアクション行（枠+diff3行+Top+Header+Body の次 = y7）。
+        assert!(hits.iter().all(|hit| hit.area.height == 1));
+    }
+
+    #[test]
+    fn render_diff_body_shows_collapsed_row_for_resolved_thread() {
+        let parsed = parse_diff("diff --git a/x.rs b/x.rs\n@@ -0,0 +1 @@\n+new line\n");
+        let json = r#"{ "id": 1, "content": { "raw": "done" },
+                        "user": { "display_name": "Bob" }, "deleted": false,
+                        "created_on": "2026-05-27T00:00:00Z",
+                        "inline": { "path": "x.rs", "to": 1 },
+                        "resolution": {} }"#;
+        let comment: Comment = serde_json::from_str(json).expect("valid resolved comment json");
+        let comment_layout = build_comment_layout(&parsed, &[comment], &Default::default());
+        let mut diff = DiffState {
+            parsed,
+            viewport: 12,
+            view_mode: DiffViewMode::Unified,
+            comment_layout,
+            ..Default::default()
+        };
+        diff.rebuild_display_rows();
+        let theme = Theme::default();
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                render_diff_body(frame, frame.area(), &mut diff, &theme);
+            })
+            .expect("draw succeeds");
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(
+            content.contains("resolved this thread"),
+            "collapsed summary missing: {content}"
+        );
+        // 展開表示（枠・本文）は出ない。
+        assert!(!content.contains('┌'), "box should be collapsed: {content}");
+        assert!(
+            !content.contains("done"),
+            "body should be hidden: {content}"
         );
     }
 
@@ -3515,6 +3771,7 @@ mod tests {
             comment_layout: layout,
             sidebar_rows,
             display_rows: Vec::new(),
+            thread_collapse: HashMap::new(),
         };
         let theme = Theme::default();
         let backend = TestBackend::new(40, 12);
@@ -3526,7 +3783,7 @@ mod tests {
         assert!(content.contains("lib"), "folder row missing: {content}");
         assert!(content.contains("a.rs"), "file row missing: {content}");
         assert!(content.contains("+1"), "added stat missing: {content}");
-        assert!(content.contains('💬'), "comment badge missing: {content}");
+        assert!(content.contains('🗨'), "comment badge missing: {content}");
         // 変更ファイルの状態マーカー（M）。
         assert!(content.contains('M'), "status marker missing: {content}");
     }
@@ -3566,7 +3823,7 @@ mod tests {
                         "created_on": "2026-05-27T00:00:00Z",
                         "inline": { "path": "x.rs", "to": 1 } }"#;
         let comment: Comment = serde_json::from_str(json).expect("valid inline comment json");
-        let comment_layout = build_comment_layout(&parsed, &[comment]);
+        let comment_layout = build_comment_layout(&parsed, &[comment], &Default::default());
         let mut diff = DiffState {
             parsed,
             viewport: 12,
@@ -3579,7 +3836,9 @@ mod tests {
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).expect("terminal builds");
         terminal
-            .draw(|frame| render_diff_body_split(frame, frame.area(), &mut diff, &theme))
+            .draw(|frame| {
+                render_diff_body_split(frame, frame.area(), &mut diff, &theme);
+            })
             .expect("draw succeeds");
         let content = buffer_text(terminal.backend().buffer());
         assert!(content.contains("Bob"), "comment author missing: {content}");
@@ -3633,6 +3892,7 @@ mod tests {
             comment_layout: CommentLayout::default(),
             sidebar_rows: Vec::new(),
             display_rows: Vec::new(),
+            thread_collapse: HashMap::new(),
         };
         let theme = Theme::default();
 

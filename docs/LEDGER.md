@@ -101,6 +101,18 @@
 - **多角レビュー反映**: 正当性重視の多角的なコードレビューで検出した以下を修正。(1) split で「置換の削除側（`from`）」コメントが消える→各 split 行が左右両 unified 行のコメントを集める（重複除去）。(2) 他人コメントの `e`/`d` を `user_is_me`（`App.me`）でクライアント側ブロック。(3) コメント取得/変更で表示行が増減してもカーソルが元 diff 行に留まるよう `rebuild_diff_derived` で変更前 unified 行を取得→`reanchor_cursor_to_unified`。(4) PgUp/PgDn を focusable 数でなく表示行 viewport ぶん移動（`page_cursor`）。(5) `G` は最後の diff 行に着地（末尾コメント行でなく＝`c` が使える）。(6) `n`/`N` を diff 行空間の O(files) 比較に。(7) サイドバーのフォルダ行にマーカー桁を空けてファイルと桁揃え。(8) コメント枠ヘッダの著者名クリップで枠ずれ防止＋選択スレッドは枠色アクセント。(9) 未使用化した `split_file_for_line` を削除。(10) `detect_file_status` は最初のハンクで打ち切り。
 - テスト 509→527。fmt/clippy(-D warnings)/test(--offline) green。
 
+## M6 拡張第 3 弾 実装メモ (2026-07-16): 相対時刻・アクションリンク・折りたたみ
+
+実運用フィードバック第 2 陣（ユーザー回答: アイコン=🗨 モノクロ吹き出し / 時刻=英語短縮 2h ago / 折りたたみキー=Enter）。
+
+- **相対時刻**: `parse_rfc3339_unix`（依存追加を避けた最小 RFC3339 パーサ。`days_from_civil` で日数変換、`±HH:MM`/`Z`/小数秒対応）+ `format_when`（24h 以内は just now / Nm ago / Nh ago、超・パース不能は日付先頭 10 文字へフォールバック）。コメントボックスのヘッダと PR 詳細のコメントペインで使用。表示は `comment_layout` 再構築時に確定（開きっぱなしでは更新されないが、コメント取得のたびに再計算される）。
+- **アイコン**: 💬（カラー絵文字）→ 🗨（U+1F5E8、多くの端末でモノクロ輪郭描画）。サイドバーの `🗨N` バッジとコメントヘッダ。端末による描画幅差は既知の軽微リスク。
+- **アクションリンク行**: 各コメントの末尾に `Reply · Resolve/Reopen（ルートのみ） · Edit · Delete（自分のみ）` を表示（`CommentRowKind::Actions`、リンク並びは `comment_action_labels` を描画とクリック判定で共有）。描画時に `collect_action_hits` がヒットボックス（unified=`area.x+4`、split=右カラム `cols[1].x+4` 起点）を `AppLayout.comment_actions` へ毎フレーム収集し、`on_mouse_left` が最優先でディスパッチ（クリックで対象コメントへカーソルも移動）。キー操作（r/e/d/R）は by-id 関数（`reply_to_comment`/`edit_comment_by_id`/`request_delete_by_id`/`resolve_thread`）に委譲して共通化。**`r` の返信先は選択中コメント id（ネスト返信。従来はスレッドルート固定）**。
+- **折りたたみ**: `DiffState.thread_collapse: HashMap<u64,bool>`（手動上書き）+ 既定「解決済みなら折りたたみ」。折りたたみ中は 1 行のサマリ（`▸ ✓ {author} resolved this thread (N)` / `▸ 🗨 {author} · thread (N)`）で focusable。Enter（`toggle_thread_collapse`）とクリックでトグルし、`R` で解決すると再取得後に自動で折りたたまれる。展開の手動上書きはコメント再取得後も保持。
+- **本文クリック**: `click_body_row` — diff 行クリックでカーソル移動、コメント行クリックでそのコメントを選択、コラプス行クリックで展開（ペイン枠 1 行を差し引いた表示行写像）。
+- **多角レビュー反映**: (1) 削除確認モーダルを `layout.modal` に登録し、表示中はモーダル外のアクションリンクを遮断（未登録だと確認待ちの裏で別コメントの Delete リンクが押せて誤削除し得た）。破壊的モーダルのクリック決定不可の対象にも追加。(2) スレッドの解決状態が変わったら折りたたみの手動上書きを破棄（展開したまま再解決しても自動コラプスへ戻る）。(3) 相対時刻を焼き込みから描画時整形へ変更（`CommentView.when` は生の created_on を保持し、`comment_box_line` が毎フレーム `format_when`。PR 詳細ペインと常に一致）。(4) `format_when` は 5 分を超える未来（時計ずれ超過）を「just now」にせず日付へフォールバック。(5) 返信ヘッダにカーソルがある状態で解決→自動コラプスされた場合、カーソルは同スレッドのコラプス行へ再アンカー（diff 行へ落ちて R の再トグルが効かなくなるのを防止）。🗨 の端末依存幅（絵文字表示端末で 2 セル描画され枠が 1 列ずれ得る）はアイコン選定時に合意済みのトレードオフとして許容。
+- テスト 527→543（時刻パース/ラベル構成/自動コラプス/トグル/クリックディスパッチ/描画/モーダルゲート/上書き破棄/再アンカー）。fmt/clippy(-D warnings)/test(--offline) green。**resolve/edit/delete の実 API 挙動は未検証の仮定のまま**。
+
 ## 画像表示 実装メモ (2026-07-11)
 
 - **ratatui-image のバージョン非互換（着手前の精読で発覚）**: `vendor/ratatui-image/Cargo.toml` は `ratatui = "^0.30.1"`(`default-features=false, features=[]`)に依存し、`cargo tree -e features -p ratatui-image`/`cargo tree --invert ratatui@0.30.2` で確認すると `ratatui@0.30.2` が本クレートの `ratatui@0.29.0`（直接依存）とは別インスタンスとして解決される（`vendor/` にも `ratatui-0.29.0`/`ratatui`(=0.30.2 相当。新しい ratatui は `ratatui-core`/`ratatui-widgets`/`ratatui-crossterm` 等に分割された facade クレート) の 2 系統が実在）。`ratatui_image::Image`/`StatefulImage` はいずれも 0.30 系の `ratatui::widgets::{Widget,StatefulWidget}` を実装しており、`f.render_widget`/`f.render_stateful_widget`（本クレートの 0.29 系 `Frame`）へ渡すには 0.30 系の `Buffer`/`Rect` を経由する必要があるが、`ratatui-image` は `pub use ratatui;` のような再エクスポートをしていない。したがって呼び出し側が 0.30 系の型を名指しするには、Cargo.toml に `ratatui`（0.30 系）を別名で追加依存する以外に方法が無い。これは本依頼のゲート「Cargo.toml は `image` 追加以外変更しない」に反するため、**`StatefulImage`/`Image` ウィジェットは不採用**とした。同様の理由（クレート境界を跨いだ型の名指しが必要）で `Resize::resize`/`Picker::new_protocol`/`new_resize_protocol` 等、`ratatui::layout::{Rect,Size}` を引数に取る API も使っていない。
