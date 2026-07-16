@@ -296,6 +296,14 @@ impl ConfirmModal {
     }
 }
 
+/// コメント削除の確認モーダル状態（`d` で開き、Enter で確定・Esc で取消）。
+#[derive(Debug, Clone)]
+pub struct DeleteCommentModal {
+    /// 削除対象のコメント id。
+    pub comment_id: u64,
+    pub submitting: bool,
+}
+
 /// コメント投稿の簡易エディタ状態。
 ///
 /// `inline` が `Some` なら Diff 画面の特定行への返信（インラインコメント）、`None` なら
@@ -309,6 +317,8 @@ pub struct CommentEditor {
     pub inline: Option<CommentAnchor>,
     /// `Some(root_id)` なら既存スレッドへの返信（`parent` を送る）。`inline` とは排他で使う。
     pub reply_to: Option<u64>,
+    /// `Some(comment_id)` なら既存コメントの編集（本文を上書き）。他と排他で使う。
+    pub editing: Option<u64>,
 }
 
 impl CommentEditor {
@@ -319,20 +329,25 @@ impl CommentEditor {
     /// インラインコメント用のエディタを作る（対象アンカー付き＝新規スレッド）。
     fn inline(anchor: CommentAnchor) -> Self {
         Self {
-            text: String::new(),
-            submitting: false,
             inline: Some(anchor),
-            reply_to: None,
+            ..Self::default()
         }
     }
 
     /// 既存スレッドへの返信用エディタを作る（`root_id` は返信先スレッドのルートコメント id）。
     fn reply(root_id: u64) -> Self {
         Self {
-            text: String::new(),
-            submitting: false,
-            inline: None,
             reply_to: Some(root_id),
+            ..Self::default()
+        }
+    }
+
+    /// 既存コメントの編集用エディタを作る（現在の本文をプリフィルする）。
+    fn edit(comment_id: u64, text: String) -> Self {
+        Self {
+            text,
+            editing: Some(comment_id),
+            ..Self::default()
         }
     }
 }
@@ -344,28 +359,90 @@ impl CommentEditor {
 /// `ui` 側が種別から解決する。
 #[derive(Debug, Clone, Default)]
 pub struct CommentLayout {
-    /// unified 行インデックス → その行の直下に差し込むコメント行群。
-    pub by_line: BTreeMap<usize, Vec<CommentLine>>,
-    /// unified 行インデックス → 代表スレッド（その行の最初のスレッド）のルートコメント id。
-    /// `r` の返信先に使う。
-    pub reply_targets: BTreeMap<usize, u64>,
+    /// unified 行インデックス → その行にアンカーされたスレッド群（表示順）。
+    pub threads_by_line: BTreeMap<usize, Vec<CommentThreadView>>,
     /// ファイルごとの inline コメント総数（サイドバーのバッジ用。`parsed.files` と同順・同長）。
     pub file_comment_counts: Vec<usize>,
 }
 
-/// [`CommentLayout::by_line`] の 1 行。色は持たず、`ui` 側が種別から解決する。
+/// 1 スレッド（ルート + 返信）の表示ビュー。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CommentLine {
-    /// スレッド/返信のヘッダ（著者名 + 日付）。`reply` なら 1 段インデント。
+pub struct CommentThreadView {
+    /// ルートコメント id（Resolve の対象・スレッド識別）。
+    pub root_id: u64,
+    /// 解決済みか。
+    pub resolved: bool,
+    /// ルート→返信の順（`created_on` 昇順）のコメント。
+    pub comments: Vec<CommentView>,
+}
+
+/// 1 コメントの表示ビュー（色は持たず、`ui` が解決する）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentView {
+    pub id: u64,
+    pub author: String,
+    pub when: String,
+    /// 本文行（改行で分割済み）。
+    pub body: Vec<String>,
+    /// 返信（ルートでない）なら 1 段インデント。
+    pub reply: bool,
+}
+
+/// Diff 本文の 1 表示行。[`DiffState::scroll`]/[`DiffState::cursor`] はこの配列の添字。
+/// コメント行を diff 行と同じ並びに畳み込むことで、`↑↓` がコメントにも乗り、スクロールも
+/// 一様に扱える（`display_rows` が空のときは diff 行と 1:1 とみなすフォールバック）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DisplayRow {
+    /// diff 行。unified なら `parsed.lines` 添字、split なら `parsed.split_lines` 添字。
+    Diff(usize),
+    /// コメントボックスの 1 行。
+    Comment(CommentRow),
+}
+
+/// コメントボックスの 1 行（枠上/ヘッダ/本文/枠下）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentRow {
+    /// スレッドのルートコメント id（Resolve・ハイライト範囲の識別）。
+    pub thread_root: u64,
+    /// この行が属するコメント id（Header/Body のみ。枠線は `None`）。Edit/Delete/Reply の対象。
+    pub comment_id: Option<u64>,
+    pub kind: CommentRowKind,
+}
+
+/// コメントボックス行の種別。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommentRowKind {
+    /// 枠上端。
+    Top,
+    /// ヘッダ（著者 · 日付・解決状態）。カーソル停止対象。
     Header {
         reply: bool,
         author: String,
         when: String,
+        resolved: bool,
     },
-    /// 本文 1 行。`reply` なら 1 段インデント。
+    /// 本文 1 行。
     Body { reply: bool, text: String },
-    /// スレッド末尾の区切り（空行）。
-    Blank,
+    /// 枠下端。
+    Bottom,
+}
+
+impl DisplayRow {
+    /// カーソルが停止できる行か（diff 行、またはコメントのヘッダ）。
+    pub fn is_focusable(&self) -> bool {
+        match self {
+            DisplayRow::Diff(_) => true,
+            DisplayRow::Comment(row) => matches!(row.kind, CommentRowKind::Header { .. }),
+        }
+    }
+
+    /// この行が指す diff 行インデックス（Diff 行のみ。Comment 行は `None`）。
+    pub fn diff_index(&self) -> Option<usize> {
+        match self {
+            DisplayRow::Diff(index) => Some(*index),
+            DisplayRow::Comment(_) => None,
+        }
+    }
 }
 
 /// `parsed` と `comments` から Diff 本文へインライン表示するスレッド配置を構築する。
@@ -376,8 +453,7 @@ pub enum CommentLine {
 ///   見つからなければそのファイルの先頭行へフォールバックする（情報を落とさない）。
 pub fn build_comment_layout(parsed: &ParsedDiff, comments: &[Comment]) -> CommentLayout {
     let mut layout = CommentLayout {
-        by_line: BTreeMap::new(),
-        reply_targets: BTreeMap::new(),
+        threads_by_line: BTreeMap::new(),
         file_comment_counts: vec![0; parsed.files.len()],
     };
     if parsed.files.is_empty() || comments.is_empty() {
@@ -425,32 +501,97 @@ pub fn build_comment_layout(parsed: &ParsedDiff, comments: &[Comment]) -> Commen
         if let Some(count) = layout.file_comment_counts.get_mut(file_index) {
             *count += thread.len();
         }
-        layout.reply_targets.entry(line).or_insert(root_id);
 
-        let rows = layout.by_line.entry(line).or_default();
-        for comment in thread {
-            // 「返信」判定はスレッドのルートかどうかで決める（`parent.is_some()` だと、
-            // 親が削除/未取得でルートに昇格したコメントに誤って返信マーカーが付く）。
-            let reply = comment.id != root_id;
-            rows.push(CommentLine::Header {
-                reply,
+        let comments_view: Vec<CommentView> = thread
+            .iter()
+            .map(|comment| CommentView {
+                id: comment.id,
                 author: comment.author_name().to_string(),
                 when: comment
                     .created_on
                     .as_deref()
                     .map(|c| c.chars().take(10).collect())
                     .unwrap_or_default(),
+                body: comment.raw().lines().map(|l| l.to_string()).collect(),
+                // 「返信」判定はスレッドのルートかどうか（`parent.is_some()` だと、親が
+                // 削除/未取得でルートに昇格したコメントに誤って返信扱いになる）。
+                reply: comment.id != root_id,
+            })
+            .collect();
+
+        layout
+            .threads_by_line
+            .entry(line)
+            .or_default()
+            .push(CommentThreadView {
+                root_id,
+                resolved: root.is_resolved(),
+                comments: comments_view,
             });
-            for body_line in comment.raw().lines() {
-                rows.push(CommentLine::Body {
-                    reply,
-                    text: body_line.to_string(),
-                });
-            }
-        }
-        rows.push(CommentLine::Blank);
     }
     layout
+}
+
+/// コメントレイアウトを表示行列（[`DisplayRow`]）へ展開する。表示行 `display_index`（unified
+/// なら `parsed.lines` 添字、split なら `parsed.split_lines` 添字）の順に `Diff` 行を並べ、その
+/// 直後へ `anchor_lines[display_index]` の各 unified 行にアンカーされたスレッドのボックス行を
+/// 差し込む。split の 1 行は旧側・新側の 2 つの unified 行を持ち得る（置換の削除側コメントを
+/// 落とさないため両方を集める。重複は 1 度だけ）。
+fn build_display_rows(anchor_lines: &[Vec<usize>], layout: &CommentLayout) -> Vec<DisplayRow> {
+    let mut rows = Vec::with_capacity(anchor_lines.len());
+    for (display_index, unified_lines) in anchor_lines.iter().enumerate() {
+        rows.push(DisplayRow::Diff(display_index));
+        let mut seen: Vec<usize> = Vec::new();
+        for &unified_line in unified_lines {
+            if seen.contains(&unified_line) {
+                continue;
+            }
+            seen.push(unified_line);
+            let Some(threads) = layout.threads_by_line.get(&unified_line) else {
+                continue;
+            };
+            for thread in threads {
+                push_thread_rows(&mut rows, thread);
+            }
+        }
+    }
+    rows
+}
+
+/// 1 スレッドを表示行列へ展開する（枠上 → 各コメントの[ヘッダ + 本文] → 枠下）。
+fn push_thread_rows(rows: &mut Vec<DisplayRow>, thread: &CommentThreadView) {
+    rows.push(DisplayRow::Comment(CommentRow {
+        thread_root: thread.root_id,
+        comment_id: None,
+        kind: CommentRowKind::Top,
+    }));
+    for comment in &thread.comments {
+        rows.push(DisplayRow::Comment(CommentRow {
+            thread_root: thread.root_id,
+            comment_id: Some(comment.id),
+            kind: CommentRowKind::Header {
+                reply: comment.reply,
+                author: comment.author.clone(),
+                when: comment.when.clone(),
+                resolved: thread.resolved,
+            },
+        }));
+        for body_line in &comment.body {
+            rows.push(DisplayRow::Comment(CommentRow {
+                thread_root: thread.root_id,
+                comment_id: Some(comment.id),
+                kind: CommentRowKind::Body {
+                    reply: comment.reply,
+                    text: body_line.clone(),
+                },
+            }));
+        }
+    }
+    rows.push(DisplayRow::Comment(CommentRow {
+        thread_root: thread.root_id,
+        comment_id: None,
+        kind: CommentRowKind::Bottom,
+    }));
 }
 
 /// コメントの親チェーンを辿ってスレッドのルートコメント id を返す（循環・欠落に耐性）。
@@ -658,19 +799,31 @@ pub struct DiffState {
     /// サイドバーのフォルダ階層ツリー表示行列（`DiffLoaded` 時に [`build_sidebar_rows`] で構築）。
     /// 空のときは `parsed.files` のフラット順にフォールバックする。
     pub sidebar_rows: Vec<SidebarRow>,
+    /// 本文の表示行列（diff 行 + インラインコメント行）。`scroll`/`cursor` はこの添字。
+    /// `comment_layout`/`view_mode` から [`DiffState::rebuild_display_rows`] で組む。空のときは
+    /// diff 行と 1:1 とみなす（コメント無し・未構築のフォールバック）。
+    pub display_rows: Vec<DisplayRow>,
 }
 
 impl DiffState {
-    /// 現在のモード（`view_mode`）でアクティブな行列の総行数。
-    fn total_lines(&self) -> usize {
+    /// 現在モードの diff 行数（`display_rows` を持たないときの 1:1 フォールバック用）。
+    fn diff_line_count(&self) -> usize {
         match self.view_mode {
             DiffViewMode::Unified => self.parsed.lines.len(),
             DiffViewMode::Split => self.parsed.split_lines.len(),
         }
     }
 
-    /// 現在のモードでアクティブなファイル境界（`scroll`/`cursor` と同じ行列上の
-    /// インデックス列）。
+    /// 表示行の総数（`scroll`/`cursor` の範囲）。`display_rows` が空なら diff 行と 1:1。
+    fn total_rows(&self) -> usize {
+        if self.display_rows.is_empty() {
+            self.diff_line_count()
+        } else {
+            self.display_rows.len()
+        }
+    }
+
+    /// 現在のモードでアクティブなファイル境界（diff 行インデックス列）。
     fn active_file_starts(&self) -> &[usize] {
         match self.view_mode {
             DiffViewMode::Unified => &self.parsed.file_starts,
@@ -678,134 +831,200 @@ impl DiffState {
         }
     }
 
-    /// 指定 unified 行の直下に差し込むコメント行数（描画で挟む「余分な視覚行」）。
-    /// split 表示・コメント無しでは 0（＝従来の「1 行 = 1 視覚行」に一致する）。
-    fn extra_rows(&self, line: usize) -> usize {
-        if self.view_mode != DiffViewMode::Unified {
-            return 0;
-        }
-        self.comment_layout
-            .by_line
-            .get(&line)
-            .map_or(0, |rows| rows.len())
+    /// `comment_layout`/`view_mode` から表示行列（[`DisplayRow`]）を組み直す。diff 行の順に、
+    /// その行にアンカーされたスレッドのボックス行を差し込む。split の 1 行は旧側・新側の
+    /// 両 unified 行のコメントを集める（置換の削除側コメントを落とさない）。
+    pub fn rebuild_display_rows(&mut self) {
+        let anchor_lines: Vec<Vec<usize>> = match self.view_mode {
+            DiffViewMode::Unified => (0..self.parsed.lines.len()).map(|i| vec![i]).collect(),
+            DiffViewMode::Split => self
+                .parsed
+                .split_lines
+                .iter()
+                .map(|row| {
+                    let mut lines = Vec::new();
+                    if let Some(left) = row.left {
+                        lines.push(left);
+                    }
+                    if let Some(right) = row.right {
+                        lines.push(right);
+                    }
+                    lines
+                })
+                .collect(),
+        };
+        self.display_rows = build_display_rows(&anchor_lines, &self.comment_layout);
+        self.snap_cursor_focusable();
     }
 
-    /// スクロールの上限（末尾ページの先頭行）。コメント行ぶんの視覚行を勘定して、
-    /// 最終行とその直下のコメントまで見えるところまでスクロールできるようにする。
-    /// `extra_rows` が全 0（split・コメント無し）のときは従来式 `total - viewport` に一致する。
+    /// 指定表示行がカーソル停止対象か（diff 行 or コメントのヘッダ）。空なら全て diff 行。
+    fn is_focusable(&self, index: usize) -> bool {
+        match self.display_rows.get(index) {
+            Some(row) => row.is_focusable(),
+            None => index < self.diff_line_count(),
+        }
+    }
+
+    /// 指定表示行が指す diff 行インデックス（Comment 行は `None`）。空なら 1:1。
+    fn row_diff_index(&self, index: usize) -> Option<usize> {
+        match self.display_rows.get(index) {
+            Some(row) => row.diff_index(),
+            None => (index < self.diff_line_count()).then_some(index),
+        }
+    }
+
+    /// diff 行インデックスに対応する表示行インデックス（`display_rows` 内で最初の `Diff(line)`）。
+    /// 空なら 1:1。見つからなければ末尾へクランプ。
+    fn display_index_for_diff(&self, diff_line: usize) -> usize {
+        if self.display_rows.is_empty() {
+            return diff_line.min(self.total_rows().saturating_sub(1));
+        }
+        self.display_rows
+            .iter()
+            .position(|row| row.diff_index() == Some(diff_line))
+            .unwrap_or_else(|| self.total_rows().saturating_sub(1))
+    }
+
+    /// スクロールの上限（表示行数 − viewport）。
     pub fn max_scroll(&self) -> usize {
-        let viewport = self.viewport.max(1);
-        let total = self.total_lines();
-        if total == 0 {
-            return 0;
-        }
-        let mut top = total - 1;
-        let mut rows = 1 + self.extra_rows(top);
-        while top > 0 {
-            let add = 1 + self.extra_rows(top - 1);
-            if rows + add > viewport {
-                break;
-            }
-            rows += add;
-            top -= 1;
-        }
-        top
+        self.total_rows().saturating_sub(self.viewport.max(1))
     }
 
-    /// `from`..=`cursor` の diff 行を表示するのに要する視覚行数（cursor 自身のコメント行は
-    /// 数えない＝cursor の diff 行が見えれば十分）。不変条件確認用（テスト専用）。
-    #[cfg(test)]
-    fn rows_to_cursor(&self, from: usize) -> usize {
-        let mut rows = 1;
-        let mut i = from;
-        while i < self.cursor {
-            rows += 1 + self.extra_rows(i);
-            i += 1;
-        }
-        rows
-    }
-
-    /// 現在行（`cursor`）を `delta` 行分移動する（負値で上、正値で下）。総行数の範囲内に
-    /// クランプし、移動後は viewport 内に収まるよう `scroll` を自動調整する。
+    /// 現在行（`cursor`）を `delta` ステップ移動する（focusable な表示行だけを辿る）。
     fn move_cursor(&mut self, delta: i64) {
-        if self.total_lines() == 0 {
+        let total = self.total_rows();
+        if total == 0 {
             return;
         }
-        let max_index = self.total_lines() - 1;
-        let next = (self.cursor as i64 + delta).clamp(0, max_index as i64);
-        self.cursor = next as usize;
+        let step: i64 = if delta >= 0 { 1 } else { -1 };
+        let mut remaining = delta.abs();
+        let mut idx = self.cursor.min(total - 1) as i64;
+        while remaining > 0 {
+            let mut next = idx + step;
+            while next >= 0 && (next as usize) < total && !self.is_focusable(next as usize) {
+                next += step;
+            }
+            if next < 0 || next as usize >= total {
+                break;
+            }
+            idx = next;
+            remaining -= 1;
+        }
+        self.cursor = idx.clamp(0, total as i64 - 1) as usize;
+        self.snap_cursor_focusable();
         self.ensure_cursor_visible();
+    }
+
+    /// カーソルが非 focusable 行に居るとき、最寄りの focusable 行へ寄せる。
+    fn snap_cursor_focusable(&mut self) {
+        let total = self.total_rows();
+        if total == 0 {
+            self.cursor = 0;
+            return;
+        }
+        if self.cursor >= total {
+            self.cursor = total - 1;
+        }
+        if self.is_focusable(self.cursor) {
+            return;
+        }
+        for offset in 1..total {
+            if self.cursor >= offset && self.is_focusable(self.cursor - offset) {
+                self.cursor -= offset;
+                return;
+            }
+            if self.cursor + offset < total && self.is_focusable(self.cursor + offset) {
+                self.cursor += offset;
+                return;
+            }
+        }
     }
 
     /// 現在行を先頭へ（`g`/`Home`）。
     fn cursor_to_top(&mut self) {
         self.cursor = 0;
+        self.snap_cursor_focusable();
         self.ensure_cursor_visible();
     }
 
-    /// 現在行を末尾へ（`G`/`End`）。
+    /// 現在行を末尾へ（`G`/`End`）。最後の **diff 行** へ着地する（末尾コメント行ではなく、
+    /// 最後のコード行で `c`（新規コメント）が使えるように）。
     fn cursor_to_bottom(&mut self) {
-        self.cursor = self.total_lines().saturating_sub(1);
+        let last_diff = self.diff_line_count().saturating_sub(1);
+        self.cursor = self.display_index_for_diff(last_diff);
+        self.snap_cursor_focusable();
         self.ensure_cursor_visible();
     }
 
-    /// 現在行が可視範囲 `[scroll, scroll+viewport)` に入るよう `scroll` を最小限だけ動かす
-    /// （現在行より上にはみ出していれば先頭合わせ、下にはみ出していれば末尾合わせ）。
+    /// 現在行を 1 画面ぶん移動する（`PgUp`/`PgDn`）。focusable の数ではなく **表示行数** で
+    /// 動かす（コメント行を挟んでも 1 キーで 1 画面ぶんに収める）。
+    fn page_cursor(&mut self, delta: i64) {
+        let total = self.total_rows();
+        if total == 0 {
+            return;
+        }
+        let next = (self.cursor as i64 + delta).clamp(0, total as i64 - 1);
+        self.cursor = next as usize;
+        self.snap_cursor_focusable();
+        self.ensure_cursor_visible();
+    }
+
+    /// 現在行が可視範囲 `[scroll, scroll+viewport)` に入るよう `scroll` を最小限だけ動かす。
     fn ensure_cursor_visible(&mut self) {
         let viewport = self.viewport.max(1);
         if self.cursor < self.scroll {
             self.scroll = self.cursor;
-        } else {
-            // cursor から上へ視覚行（`1 + extra_rows`）を viewport ぶん積み上げ、cursor の
-            // diff 行を隠さずに戻せる最も手前の scroll（`min_scroll`）を求める。cursor が既に
-            // 可視（`scroll >= min_scroll`）なら動かさない。ウォークは高々 viewport 回で終わる
-            // ため、diff 全長に対して O(viewport)（従来の 1 行ずつ前進は末尾ジャンプで O(n^2)）。
-            let mut rows = 1;
-            let mut min_scroll = self.cursor;
-            while min_scroll > 0 {
-                let add = 1 + self.extra_rows(min_scroll - 1);
-                if rows + add > viewport {
-                    break;
-                }
-                rows += add;
-                min_scroll -= 1;
-            }
-            if self.scroll < min_scroll {
-                self.scroll = min_scroll;
-            }
+        } else if self.cursor >= self.scroll.saturating_add(viewport) {
+            self.scroll = self.cursor + 1 - viewport;
         }
         self.scroll = self.scroll.min(self.max_scroll());
     }
 
-    /// 次のファイル境界へジャンプする（`n`）。サイドバー選択（`file_index`）・現在行
-    /// （`cursor`）ともにそのファイルの先頭へ同期する。
+    /// カーソル位置に対応する diff 行インデックス（現モード）。コメント行にいるときは直前の
+    /// diff 行（そのコメントのアンカー行）を採る。
+    fn cursor_diff_line(&self) -> usize {
+        let mut idx = self.cursor.min(self.total_rows().saturating_sub(1));
+        loop {
+            if let Some(diff_index) = self.row_diff_index(idx) {
+                return diff_index;
+            }
+            if idx == 0 {
+                return 0;
+            }
+            idx -= 1;
+        }
+    }
+
+    /// 次のファイル境界へジャンプする（`n`）。diff 行空間（単調）で比較するので O(files)。
     fn next_file(&mut self) {
-        if let Some((index, &start)) = self
+        let current = self.cursor_diff_line();
+        let found = self
             .active_file_starts()
             .iter()
             .enumerate()
-            .find(|&(_, &start)| start > self.scroll)
-        {
+            .find(|&(_, &start)| start > current)
+            .map(|(index, &start)| (index, start));
+        if let Some((index, start)) = found {
             self.jump_to_file(index, start);
         }
     }
 
-    /// 前のファイル境界へジャンプする（`N`）。サイドバー選択（`file_index`）・現在行
-    /// （`cursor`）ともにそのファイルの先頭へ同期する。
+    /// 前のファイル境界へジャンプする（`N`）。diff 行空間で比較するので O(files)。
     fn prev_file(&mut self) {
-        if let Some((index, &start)) = self
+        let current = self.cursor_diff_line();
+        let found = self
             .active_file_starts()
             .iter()
             .enumerate()
             .rev()
-            .find(|&(_, &start)| start < self.scroll)
-        {
+            .find(|&(_, &start)| start < current)
+            .map(|(index, &start)| (index, start));
+        if let Some((index, start)) = found {
             self.jump_to_file(index, start);
         }
     }
 
-    /// サイドバーで指定インデックスのファイルを選択し、本文の `scroll`/現在行 `cursor` を
-    /// 先頭行に合わせる。範囲外は何もしない（パニックしない）。
+    /// サイドバーで指定インデックスのファイルを選択し、本文をその先頭行へ合わせる。
     fn select_file(&mut self, index: usize) {
         let start = match self.view_mode {
             DiffViewMode::Unified => self.parsed.files.get(index).map(|file| file.start),
@@ -816,11 +1035,13 @@ impl DiffState {
         }
     }
 
-    /// `file_index`/`scroll`/`cursor` を指定ファイルの先頭行へまとめて同期する内部ヘルパ。
+    /// `file_index`/`scroll`/`cursor` を指定ファイルの先頭行（表示行）へまとめて同期する。
     fn jump_to_file(&mut self, index: usize, start: usize) {
         self.file_index = index;
-        self.scroll = start.min(self.max_scroll());
-        self.cursor = start.min(self.total_lines().saturating_sub(1));
+        let display = self.display_index_for_diff(start);
+        self.cursor = display.min(self.total_rows().saturating_sub(1));
+        self.snap_cursor_focusable();
+        self.scroll = self.cursor.min(self.max_scroll());
     }
 
     /// サイドバー選択を 1 つ下へ（末尾で停止）。
@@ -889,65 +1110,124 @@ impl DiffState {
         };
     }
 
-    /// 本文の表示モードを `mode` へ切り替える（`v`）。現在行を新モードの対応する行へ変換し
-    /// （unified⇔split の同じ unified 行を指すよう [`SplitLine`] の左右から逆引きする）、
-    /// viewport 内に収まるよう `scroll` を調整し直す。既に同じモードなら何もしない。
+    /// 本文の表示モードを `mode` へ切り替える（`v`）。カーソルが乗っていたコメント（あれば）と
+    /// unified 行を覚えておき、作り直したあと同じコメント／行へ戻す。既に同じモードなら何もしない。
     fn set_view_mode(&mut self, mode: DiffViewMode) {
         if self.view_mode == mode {
             return;
         }
-        self.cursor = self.convert_cursor_for_mode(self.cursor, mode);
+        let prev_comment = self.cursor_comment().map(|(_, comment_id)| comment_id);
+        let unified = self.cursor_unified_line();
         self.view_mode = mode;
+        self.rebuild_display_rows();
+        self.reanchor_cursor(prev_comment, unified);
         self.ensure_cursor_visible();
     }
 
-    /// `cursor`（現在の `view_mode` 上のインデックス）を `target` モード上の対応インデックスへ
-    /// 変換する。対応が取れない場合（想定外の不整合）は `0` にフォールバックする。
-    fn convert_cursor_for_mode(&self, cursor: usize, target: DiffViewMode) -> usize {
-        match (self.view_mode, target) {
-            (DiffViewMode::Unified, DiffViewMode::Split) => self
+    /// 表示行列を作り直したあと、カーソルを元の位置へ戻す。まず同じコメント（返信/編集後も
+    /// そのコメントに留まる）を探し、無ければアンカーの diff 行へ寄せる。
+    fn reanchor_cursor(&mut self, prev_comment: Option<u64>, unified: Option<usize>) {
+        if let Some(comment_id) = prev_comment
+            && let Some(index) = self.display_rows.iter().position(|row| {
+                matches!(
+                    row,
+                    DisplayRow::Comment(CommentRow {
+                        comment_id: Some(id),
+                        kind: CommentRowKind::Header { .. },
+                        ..
+                    }) if *id == comment_id
+                )
+            })
+        {
+            self.cursor = index;
+            self.snap_cursor_focusable();
+            return;
+        }
+        if let Some(unified) = unified {
+            self.reanchor_cursor_to_unified(unified);
+        }
+    }
+
+    /// 指定 unified 行に対応する表示行へカーソルを移す（現モード基準）。
+    fn reanchor_cursor_to_unified(&mut self, unified: usize) {
+        let diff_line = match self.view_mode {
+            DiffViewMode::Unified => Some(unified),
+            DiffViewMode::Split => self
                 .parsed
                 .split_lines
                 .iter()
-                .position(|row| row.left == Some(cursor) || row.right == Some(cursor))
-                .unwrap_or(0),
-            (DiffViewMode::Split, DiffViewMode::Unified) => self
+                .position(|row| row.left == Some(unified) || row.right == Some(unified)),
+        };
+        if let Some(diff_line) = diff_line {
+            self.cursor = self.display_index_for_diff(diff_line);
+        }
+        self.snap_cursor_focusable();
+    }
+
+    /// カーソル位置（表示行）に対応する unified 行インデックス。コメント行にいるときは直前の
+    /// diff 行（＝そのコメントのアンカー行）を採る。
+    fn cursor_unified_line(&self) -> Option<usize> {
+        let mut idx = self.cursor.min(self.total_rows().saturating_sub(1));
+        loop {
+            if let Some(diff_index) = self.row_diff_index(idx) {
+                return Some(self.diff_index_to_unified(diff_index));
+            }
+            if idx == 0 {
+                return None;
+            }
+            idx -= 1;
+        }
+    }
+
+    /// diff 行インデックス（現モード）を unified 行インデックスへ変換する。
+    fn diff_index_to_unified(&self, diff_index: usize) -> usize {
+        match self.view_mode {
+            DiffViewMode::Unified => diff_index,
+            DiffViewMode::Split => self
                 .parsed
                 .split_lines
-                .get(cursor)
+                .get(diff_index)
                 .and_then(|row| row.right.or(row.left))
-                .unwrap_or(0),
-            _ => cursor,
+                .unwrap_or(diff_index),
         }
     }
 
-    /// 現在行が属するファイルの表示名（`view_mode` に応じて unified/split いずれかの
-    /// 行から解決する）。
+    /// 現在行が属するファイルの表示名。
     pub fn current_file(&self) -> Option<&str> {
-        match self.view_mode {
-            DiffViewMode::Unified => self.parsed.file_for_line(self.cursor),
-            DiffViewMode::Split => self.parsed.split_file_for_line(self.cursor),
-        }
+        let unified = self.cursor_unified_line()?;
+        self.parsed.file_for_line(unified)
     }
 
-    /// 現在行のインラインコメント投稿アンカー（`view_mode` に応じて unified/split いずれかの
-    /// 規則で算出する。split の規則は「新側があれば新側、無ければ旧側」で、これは
-    /// [`ParsedDiff::split_comment_anchor`] が unified と同じ既存規則へ委譲することで
-    /// 実現している）。
+    /// 現在行のインラインコメント投稿アンカー（diff 行にカーソルがあるときのみ）。コメント行や
+    /// メタ/ヘッダ行では `None`。
     pub fn current_comment_anchor(&self) -> Option<CommentAnchor> {
+        let diff_index = self.row_diff_index(self.cursor)?;
         match self.view_mode {
-            DiffViewMode::Unified => self.parsed.comment_anchor(self.cursor),
-            DiffViewMode::Split => self.parsed.split_comment_anchor(self.cursor),
+            DiffViewMode::Unified => self.parsed.comment_anchor(diff_index),
+            DiffViewMode::Split => self.parsed.split_comment_anchor(diff_index),
         }
     }
 
-    /// 現在行に表示中スレッドがあれば、その代表スレッドのルートコメント id を返す（`r` の
-    /// 返信先）。スレッド表示は unified のみなので split では `None`。
-    pub fn reply_target_at_cursor(&self) -> Option<u64> {
-        if self.view_mode != DiffViewMode::Unified {
-            return None;
+    /// カーソルがコメントのヘッダにあるとき `(スレッドのルート id, コメント id)` を返す。
+    /// Reply/Edit/Delete/Resolve の対象。
+    pub fn cursor_comment(&self) -> Option<(u64, u64)> {
+        match self.display_rows.get(self.cursor) {
+            Some(DisplayRow::Comment(row)) => row
+                .comment_id
+                .map(|comment_id| (row.thread_root, comment_id)),
+            _ => None,
         }
-        self.comment_layout.reply_targets.get(&self.cursor).copied()
+    }
+
+    /// カーソル位置のコメントが解決済みか（Resolve トグルの向き判定）。コメント行以外は `None`。
+    pub fn cursor_comment_resolved(&self) -> Option<bool> {
+        match self.display_rows.get(self.cursor) {
+            Some(DisplayRow::Comment(CommentRow {
+                kind: CommentRowKind::Header { resolved, .. },
+                ..
+            })) => Some(*resolved),
+            _ => None,
+        }
     }
 }
 
@@ -1035,6 +1315,8 @@ pub enum Msg {
     ReviewActionDone { id: u64, message: String },
     /// コメント投稿の成功。
     CommentPosted { id: u64 },
+    /// コメントの編集/削除/解決トグルの成功（`message` を Status に出す）。
+    CommentActionDone { id: u64, message: String },
     /// merge の成功（202 の「処理中」を含む）。
     MergeDone { id: u64 },
     /// レビュー系アクション（approve/comment/merge 等）の失敗。
@@ -1200,6 +1482,32 @@ pub enum Command {
         id: u64,
         parent_id: u64,
         raw: String,
+    },
+    /// 既存コメントの本文を編集する（`PUT .../comments/{comment_id}`）。
+    EditComment {
+        client: BitbucketClient,
+        workspace: String,
+        repo: String,
+        id: u64,
+        comment_id: u64,
+        raw: String,
+    },
+    /// 既存コメントを削除する（`DELETE .../comments/{comment_id}`）。
+    DeleteComment {
+        client: BitbucketClient,
+        workspace: String,
+        repo: String,
+        id: u64,
+        comment_id: u64,
+    },
+    /// スレッドの解決/再オープンをトグルする（`comment_id` はスレッドのルート）。
+    ResolveComment {
+        client: BitbucketClient,
+        workspace: String,
+        repo: String,
+        id: u64,
+        comment_id: u64,
+        resolve: bool,
     },
     /// PR をマージする。
     Merge {
@@ -1757,6 +2065,8 @@ pub struct App {
     pub comments_rendered_lines: Option<usize>,
     pub diff: Option<DiffState>,
     pub comment_editor: Option<CommentEditor>,
+    /// コメント削除の確認モーダル（`d` で開く）。
+    pub delete_comment_modal: Option<DeleteCommentModal>,
     pub merge_modal: Option<MergeModal>,
     pub pipelines: SelectList<Pipeline>,
     /// Pipelines 一覧のページ状態。`[`/`]` でページ間移動、`g` でページ番号ジャンプ。
@@ -2030,6 +2340,7 @@ impl App {
             comments_rendered_lines: None,
             diff: None,
             comment_editor: None,
+            delete_comment_modal: None,
             merge_modal: None,
             pipelines: SelectList::default(),
             pipelines_page_info: PageInfo::default(),
@@ -2220,6 +2531,7 @@ impl App {
                         view_mode: self.diff_view_mode,
                         comment_layout: CommentLayout::default(),
                         sidebar_rows: Vec::new(),
+                        display_rows: Vec::new(),
                     });
                     self.rebuild_diff_derived();
                 }
@@ -2240,6 +2552,16 @@ impl App {
                 self.comment_editor = None;
                 if self.current_pr_id() == Some(id) {
                     self.status = Status::Success("コメントを投稿しました".to_string());
+                    self.invalidate_pull_requests_cache_for_current_repo();
+                    return self.refresh_comments();
+                }
+                Command::None
+            }
+            Msg::CommentActionDone { id, message } => {
+                self.comment_editor = None;
+                self.delete_comment_modal = None;
+                if self.current_pr_id() == Some(id) {
+                    self.status = Status::Success(message);
                     self.invalidate_pull_requests_cache_for_current_repo();
                     return self.refresh_comments();
                 }
@@ -2407,6 +2729,7 @@ impl App {
                         view_mode: self.diff_view_mode,
                         comment_layout: CommentLayout::default(),
                         sidebar_rows: Vec::new(),
+                        display_rows: Vec::new(),
                     });
                     self.rebuild_diff_derived();
                 }
@@ -2555,6 +2878,9 @@ impl App {
         // モーダル/エディタは画面キーより優先。
         if self.comment_editor.is_some() {
             return self.on_key_comment_editor(key);
+        }
+        if self.delete_comment_modal.is_some() {
+            return self.on_key_delete_comment_modal(key);
         }
         if self.merge_modal.is_some() {
             return self.on_key_merge_modal(key);
@@ -4452,6 +4778,7 @@ impl App {
         let raw = editor.text.trim_end().to_string();
         let inline = editor.inline.clone();
         let reply_to = editor.reply_to;
+        let editing = editor.editing;
         let Some(id) = self.current_pr_id() else {
             return Command::None;
         };
@@ -4463,8 +4790,18 @@ impl App {
             editor.submitting = true;
         }
         self.status = Status::Loading("コメントを送信中…".to_string());
-        // 返信（`reply_to`）を最優先に判定する。次いでインライン（新規スレッド）、
-        // どちらでもなければ PR 全体への一般コメント。
+        // 編集を最優先。次いで返信（`reply_to`）、インライン（新規スレッド）、
+        // どれでもなければ PR 全体への一般コメント。
+        if let Some(comment_id) = editing {
+            return Command::EditComment {
+                client,
+                workspace,
+                repo,
+                id,
+                comment_id,
+                raw,
+            };
+        }
         if let Some(parent_id) = reply_to {
             return Command::CreateReply {
                 client,
@@ -4518,6 +4855,9 @@ impl App {
             }
             KeyCode::Char('c') => return self.open_inline_comment_editor(),
             KeyCode::Char('r') => return self.open_reply_editor(),
+            KeyCode::Char('e') => return self.open_edit_editor(),
+            KeyCode::Char('d') => return self.request_delete_comment(),
+            KeyCode::Char('R') => return self.toggle_resolve_comment(),
             KeyCode::Char('v') => return self.toggle_diff_view_mode(),
             KeyCode::Char('t') => return self.toggle_diff_sidebar(),
             _ => {}
@@ -4548,8 +4888,8 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => diff.move_cursor(-1),
             KeyCode::Char('J') => diff.move_cursor(10),
             KeyCode::Char('K') => diff.move_cursor(-10),
-            KeyCode::PageDown | KeyCode::Char('f') => diff.move_cursor(page),
-            KeyCode::PageUp | KeyCode::Char('b') => diff.move_cursor(-page),
+            KeyCode::PageDown | KeyCode::Char('f') => diff.page_cursor(page),
+            KeyCode::PageUp | KeyCode::Char('b') => diff.page_cursor(-page),
             KeyCode::Char('g') | KeyCode::Home => diff.cursor_to_top(),
             KeyCode::Char('G') | KeyCode::End => diff.cursor_to_bottom(),
             KeyCode::Char('n') => diff.next_file(),
@@ -4568,14 +4908,19 @@ impl App {
         let Some(diff) = self.diff.as_mut() else {
             return;
         };
+        // コメント配置が変わると表示行列がずれ、カーソルが指す位置も変わってしまう。変更前に
+        // 見ていたコメント（あれば）と unified 行を覚えておき、作り直したあと同じコメント／行へ
+        // 戻す（返信/編集の直後や非同期のコメント取得でカーソルが飛ばないように）。
+        let prev_comment = diff.cursor_comment().map(|(_, comment_id)| comment_id);
+        let anchor = diff.cursor_unified_line();
         diff.sidebar_rows = build_sidebar_rows(&diff.parsed.files);
         diff.comment_layout = if is_pr_diff {
             build_comment_layout(&diff.parsed, &self.comments)
         } else {
             CommentLayout::default()
         };
-        // コメント行が増減したぶん、現在行が viewport から押し出されないよう再クランプする
-        // （非同期のコメント取得後にスクロール位置が飛ばないように）。
+        diff.rebuild_display_rows();
+        diff.reanchor_cursor(prev_comment, anchor);
         diff.ensure_cursor_visible();
     }
 
@@ -4600,31 +4945,167 @@ impl App {
         Command::None
     }
 
-    /// Diff 画面の現在行に表示中のコメントスレッドへ返信エディタを開く（`r`）。
-    ///
-    /// PR 差分でのみ有効。現在行にスレッドが無い場合・unified 以外の場合は `Status` に
-    /// 案内を出して何もしない。
+    /// カーソルで選択中のコメントスレッドへ返信エディタを開く（`r`）。PR 差分でのみ有効。
+    /// コメントを選択していない（diff 行にいる）場合は案内を出す。
     fn open_reply_editor(&mut self) -> Command {
-        if self.diff_return != Screen::PullRequestDetail || self.current_pr.is_none() {
-            self.status = Status::Error("コミット差分にはコメントできません".to_string());
+        if !self.is_pr_diff_writable() {
             return Command::None;
         }
         let Some(diff) = self.diff.as_ref() else {
             return Command::None;
         };
-        // スレッド表示・返信は unified のみ。split 中は「スレッドが無い」と誤解させないよう
-        // unified への切替を案内する。
-        if diff.view_mode != DiffViewMode::Unified {
-            self.status =
-                Status::Error("返信は unified 表示（v で切替）で行ってください".to_string());
-            return Command::None;
-        }
-        let Some(root_id) = diff.reply_target_at_cursor() else {
-            self.status = Status::Error("この行に返信できるスレッドがありません".to_string());
+        let Some((thread_root, _)) = diff.cursor_comment() else {
+            self.status = Status::Error("返信するコメントを ↑↓ で選択してください".to_string());
             return Command::None;
         };
-        self.comment_editor = Some(CommentEditor::reply(root_id));
+        self.comment_editor = Some(CommentEditor::reply(thread_root));
         Command::None
+    }
+
+    /// カーソルで選択中の自分のコメントを編集するエディタを開く（`e`）。現在の本文をプリフィル。
+    fn open_edit_editor(&mut self) -> Command {
+        if !self.is_pr_diff_writable() {
+            return Command::None;
+        }
+        let Some(diff) = self.diff.as_ref() else {
+            return Command::None;
+        };
+        let Some((_, comment_id)) = diff.cursor_comment() else {
+            self.status = Status::Error("編集するコメントを ↑↓ で選択してください".to_string());
+            return Command::None;
+        };
+        if !self.comment_is_mine(comment_id) {
+            self.status = Status::Error("自分のコメントのみ編集できます".to_string());
+            return Command::None;
+        }
+        // 現在の本文を取得してプリフィルする（見つからなければ空で開く）。
+        let text = self
+            .comments
+            .iter()
+            .find(|comment| comment.id == comment_id)
+            .map(|comment| comment.raw().to_string())
+            .unwrap_or_default();
+        self.comment_editor = Some(CommentEditor::edit(comment_id, text));
+        Command::None
+    }
+
+    /// カーソルで選択中のコメントを削除する確認モーダルを開く（`d`）。自分のコメントのみ。
+    fn request_delete_comment(&mut self) -> Command {
+        if !self.is_pr_diff_writable() {
+            return Command::None;
+        }
+        let Some(diff) = self.diff.as_ref() else {
+            return Command::None;
+        };
+        let Some((_, comment_id)) = diff.cursor_comment() else {
+            self.status = Status::Error("削除するコメントを ↑↓ で選択してください".to_string());
+            return Command::None;
+        };
+        if !self.comment_is_mine(comment_id) {
+            self.status = Status::Error("自分のコメントのみ削除できます".to_string());
+            return Command::None;
+        }
+        self.delete_comment_modal = Some(DeleteCommentModal {
+            comment_id,
+            submitting: false,
+        });
+        Command::None
+    }
+
+    /// 指定コメントが自分の投稿か（`e`/`d` を自コメントに限定する）。
+    fn comment_is_mine(&self, comment_id: u64) -> bool {
+        self.comments
+            .iter()
+            .find(|comment| comment.id == comment_id)
+            .map(|comment| user_is_me(comment.user.as_ref(), &self.me))
+            .unwrap_or(false)
+    }
+
+    /// コメント削除確認モーダルのキー処理（Enter=確定 / Esc・n=取消）。
+    fn on_key_delete_comment_modal(&mut self, key: KeyEvent) -> Command {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n') => {
+                self.delete_comment_modal = None;
+                Command::None
+            }
+            KeyCode::Enter | KeyCode::Char('y') => self.confirm_delete_comment(),
+            _ => Command::None,
+        }
+    }
+
+    /// 削除確認モーダルの確定。`Command::DeleteComment` を発行する。
+    fn confirm_delete_comment(&mut self) -> Command {
+        let Some(modal) = self.delete_comment_modal.as_ref() else {
+            return Command::None;
+        };
+        if modal.submitting {
+            return Command::None;
+        }
+        let comment_id = modal.comment_id;
+        let Some(id) = self.current_pr_id() else {
+            return Command::None;
+        };
+        let Some((client, workspace, repo)) = self.review_context() else {
+            self.status = Status::Error("認証クライアントが未初期化です".to_string());
+            return Command::None;
+        };
+        if let Some(modal) = self.delete_comment_modal.as_mut() {
+            modal.submitting = true;
+        }
+        self.status = Status::Loading("コメントを削除中…".to_string());
+        Command::DeleteComment {
+            client,
+            workspace,
+            repo,
+            id,
+            comment_id,
+        }
+    }
+
+    /// カーソルで選択中のスレッドの解決/再オープンをトグルする（`R`）。
+    fn toggle_resolve_comment(&mut self) -> Command {
+        if !self.is_pr_diff_writable() {
+            return Command::None;
+        }
+        let Some(diff) = self.diff.as_ref() else {
+            return Command::None;
+        };
+        let Some((thread_root, _)) = diff.cursor_comment() else {
+            self.status =
+                Status::Error("解決するスレッドのコメントを ↑↓ で選択してください".to_string());
+            return Command::None;
+        };
+        let resolved = diff.cursor_comment_resolved().unwrap_or(false);
+        let Some(id) = self.current_pr_id() else {
+            return Command::None;
+        };
+        let Some((client, workspace, repo)) = self.review_context() else {
+            self.status = Status::Error("認証クライアントが未初期化です".to_string());
+            return Command::None;
+        };
+        self.status = Status::Loading(if resolved {
+            "スレッドを再オープン中…".to_string()
+        } else {
+            "スレッドを解決中…".to_string()
+        });
+        Command::ResolveComment {
+            client,
+            workspace,
+            repo,
+            id,
+            comment_id: thread_root,
+            resolve: !resolved,
+        }
+    }
+
+    /// 書込み系（コメント操作）の前提を満たすか（PR 差分かつ PR あり）。満たさなければ
+    /// `Status` にエラーを出して `false`。
+    fn is_pr_diff_writable(&mut self) -> bool {
+        if self.diff_return != Screen::PullRequestDetail || self.current_pr.is_none() {
+            self.status = Status::Error("コミット差分にはコメントできません".to_string());
+            return false;
+        }
+        true
     }
 
     /// Diff 画面の表示モード（unified/split）を切り替える（`v`）。`config.toml` へ永続化し、
@@ -6244,6 +6725,7 @@ mod tests {
             view_mode: DiffViewMode::Unified,
             comment_layout: CommentLayout::default(),
             sidebar_rows: Vec::new(),
+            display_rows: Vec::new(),
         });
 
         app.update(Msg::Key(ctrl(KeyCode::Char('t'))));
@@ -7496,6 +7978,8 @@ diff --git a/two.txt b/two.txt\n\
             let diff = app.diff.as_mut().expect("diff");
             diff.viewport = 10;
             diff.view_mode = DiffViewMode::Split;
+            // 表示行列はモードに依存するので組み直す（実運用では `v` の set_view_mode 経由）。
+            diff.rebuild_display_rows();
         }
 
         app.update(Msg::Key(key(KeyCode::Char('G'))));
@@ -7629,6 +8113,7 @@ diff --git a/two.txt b/two.txt\n\
             view_mode: DiffViewMode::Unified,
             comment_layout: CommentLayout::default(),
             sidebar_rows: Vec::new(),
+            display_rows: Vec::new(),
         });
 
         let cmd = app.update(Msg::Key(key(KeyCode::Char('c'))));
@@ -7656,6 +8141,7 @@ diff --git a/two.txt b/two.txt\n\
             view_mode: DiffViewMode::Unified,
             comment_layout: CommentLayout::default(),
             sidebar_rows: Vec::new(),
+            display_rows: Vec::new(),
         });
 
         app.update(Msg::Key(key(KeyCode::Char('c'))));
@@ -7685,6 +8171,7 @@ diff --git a/two.txt b/two.txt\n\
             view_mode: DiffViewMode::Unified,
             comment_layout: CommentLayout::default(),
             sidebar_rows: Vec::new(),
+            display_rows: Vec::new(),
         });
 
         let cmd = app.update(Msg::Key(key(KeyCode::Char('c'))));
@@ -7712,6 +8199,7 @@ diff --git a/two.txt b/two.txt\n\
             view_mode: DiffViewMode::Unified,
             comment_layout: CommentLayout::default(),
             sidebar_rows: Vec::new(),
+            display_rows: Vec::new(),
         });
 
         app.update(Msg::Key(key(KeyCode::Char('c'))));
@@ -7746,8 +8234,11 @@ diff --git a/two.txt b/two.txt\n\
         let comment = make_inline_comment(7, "LGTM", "x.rs", 2, "2026-01-01T00:00:00Z", None);
         let layout = build_comment_layout(&parsed, &[comment]);
         // 新側 2 行目（追加行）は unified 行インデックス 3。
-        assert!(layout.by_line.contains_key(&3));
-        assert_eq!(layout.reply_targets.get(&3), Some(&7));
+        let threads = layout.threads_by_line.get(&3).expect("thread at line 3");
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].root_id, 7);
+        assert!(!threads[0].resolved);
+        assert_eq!(threads[0].comments.len(), 1);
         assert_eq!(layout.file_comment_counts, vec![1]);
     }
 
@@ -7759,17 +8250,11 @@ diff --git a/two.txt b/two.txt\n\
         let reply = make_inline_comment(2, "reply", "x.rs", 2, "2026-01-02T00:00:00Z", Some(1));
         // 入力順を逆にしても created_on 昇順（ルート→返信）で並ぶ。
         let layout = build_comment_layout(&parsed, &[reply, root]);
-        let rows = layout.by_line.get(&3).expect("thread present at line 3");
-        let headers: Vec<bool> = rows
-            .iter()
-            .filter_map(|row| match row {
-                CommentLine::Header { reply, .. } => Some(*reply),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(headers, vec![false, true]);
+        let threads = layout.threads_by_line.get(&3).expect("thread at line 3");
+        let replies: Vec<bool> = threads[0].comments.iter().map(|c| c.reply).collect();
+        assert_eq!(replies, vec![false, true]);
+        assert_eq!(threads[0].root_id, 1);
         assert_eq!(layout.file_comment_counts, vec![2]);
-        assert_eq!(layout.reply_targets.get(&3), Some(&1));
     }
 
     #[test]
@@ -7783,8 +8268,8 @@ diff --git a/two.txt b/two.txt\n\
                         "inline": { "path": "x.rs", "from": 1 } }"#;
         let comment: Comment = serde_json::from_str(json).expect("valid inline comment json");
         let layout = build_comment_layout(&parsed, &[comment]);
-        assert!(layout.by_line.contains_key(&2));
-        assert_eq!(layout.reply_targets.get(&2), Some(&7));
+        let threads = layout.threads_by_line.get(&2).expect("thread at line 2");
+        assert_eq!(threads[0].root_id, 7);
     }
 
     #[test]
@@ -7794,7 +8279,7 @@ diff --git a/two.txt b/two.txt\n\
         // 存在しない新側 999 行 → ファイル先頭行（インデックス 0）へフォールバック。
         let comment = make_inline_comment(3, "stale", "x.rs", 999, "2026-01-01T00:00:00Z", None);
         let layout = build_comment_layout(&parsed, &[comment]);
-        assert!(layout.by_line.contains_key(&0));
+        assert!(layout.threads_by_line.contains_key(&0));
         assert_eq!(layout.file_comment_counts, vec![1]);
     }
 
@@ -7810,103 +8295,161 @@ diff --git a/two.txt b/two.txt\n\
         assert_eq!(diff.max_scroll(), 20);
     }
 
-    #[test]
-    fn extra_rows_is_zero_in_split_mode() {
-        let parsed = parse_diff(&"a\n".repeat(30));
-        let mut layout = CommentLayout::default();
-        layout
-            .by_line
-            .insert(5, vec![CommentLine::Blank, CommentLine::Blank]);
-        let diff = DiffState {
-            parsed,
-            viewport: 10,
-            view_mode: DiffViewMode::Split,
-            comment_layout: layout,
-            ..Default::default()
-        };
-        assert_eq!(diff.extra_rows(5), 0);
-    }
-
-    #[test]
-    fn max_scroll_accounts_for_comment_rows_near_bottom() {
-        let parsed = parse_diff(&"a\n".repeat(30));
-        let mut layout = CommentLayout::default();
-        layout.by_line.insert(
-            28,
-            vec![CommentLine::Blank, CommentLine::Blank, CommentLine::Blank],
-        );
-        let diff = DiffState {
-            parsed,
-            viewport: 10,
-            view_mode: DiffViewMode::Unified,
-            comment_layout: layout,
-            ..Default::default()
-        };
-        // コメント無しなら 20。末尾付近の 3 コメント行ぶん、さらにスクロールできる必要があり 23。
-        assert_eq!(diff.max_scroll(), 23);
-    }
-
-    #[test]
-    fn ensure_cursor_visible_keeps_cursor_row_within_viewport_with_comments() {
-        let parsed = parse_diff(&"a\n".repeat(30));
-        let mut layout = CommentLayout::default();
-        layout.by_line.insert(5, vec![CommentLine::Blank; 8]);
+    /// アンカー（新側 2 行目 = unified 行 3）にコメント 1 件のスレッドを持つ diff を組む。
+    /// 表示行列: Diff0..Diff3, [Top, Header, Body, Bottom], Diff4（計 9 行）。
+    fn diff_with_thread(view_mode: DiffViewMode) -> DiffState {
+        let parsed = parse_diff("diff --git a/x.rs b/x.rs\n@@ -1,3 +1,3 @@\n a\n b\n c\n");
+        let comment = make_inline_comment(1, "hi", "x.rs", 2, "2026-01-01T00:00:00Z", None);
+        let comment_layout = build_comment_layout(&parsed, &[comment]);
         let mut diff = DiffState {
             parsed,
-            viewport: 10,
-            view_mode: DiffViewMode::Unified,
-            comment_layout: layout,
+            viewport: 20,
+            view_mode,
+            comment_layout,
             ..Default::default()
         };
-        diff.scroll = 0;
-        diff.cursor = 9;
-        diff.ensure_cursor_visible();
-        // カーソル行が viewport に収まる不変条件を直接確認する（コメント行を勘定しても）。
-        assert!(diff.scroll <= diff.cursor);
-        assert!(diff.rows_to_cursor(diff.scroll) <= diff.viewport.max(1));
+        diff.rebuild_display_rows();
+        diff
+    }
+
+    /// スレッドのヘッダ行（カーソル停止対象）の表示行インデックス。
+    fn thread_header_index(diff: &DiffState) -> usize {
+        diff.display_rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row,
+                    DisplayRow::Comment(CommentRow {
+                        kind: CommentRowKind::Header { .. },
+                        ..
+                    })
+                )
+            })
+            .expect("header row present")
     }
 
     #[test]
-    fn diff_reply_key_opens_editor_and_submits_create_reply() {
+    fn display_rows_interleave_thread_after_anchor_line() {
+        let diff = diff_with_thread(DiffViewMode::Unified);
+        // Diff0..Diff3 の直後（index 4）が枠上端、その後にヘッダ・本文・枠下端が続く。
+        assert!(matches!(
+            diff.display_rows.get(4),
+            Some(DisplayRow::Comment(CommentRow {
+                kind: CommentRowKind::Top,
+                ..
+            }))
+        ));
+        let header = thread_header_index(&diff);
+        assert!(diff.is_focusable(header));
+        // 枠上端はカーソル停止対象でない。
+        assert!(!diff.is_focusable(4));
+    }
+
+    #[test]
+    fn move_cursor_skips_box_border_and_lands_on_comment_header() {
+        let mut diff = diff_with_thread(DiffViewMode::Unified);
+        // アンカー diff 行（表示行 3）から下へ。枠上端(4)を飛ばしてヘッダ(5)へ。
+        diff.cursor = 3;
+        diff.move_cursor(1);
+        assert_eq!(diff.cursor, thread_header_index(&diff));
+        assert_eq!(diff.cursor_comment(), Some((1, 1)));
+    }
+
+    #[test]
+    fn max_scroll_counts_display_rows_including_comments() {
+        let diff = diff_with_thread(DiffViewMode::Unified);
+        // 表示行 = 5 diff + 4 comment(Top/Header/Body/Bottom) = 9。viewport 20 なので上限 0。
+        assert_eq!(diff.display_rows.len(), 9);
+        assert_eq!(diff.max_scroll(), 0);
+    }
+
+    #[test]
+    fn cursor_comment_is_none_on_diff_line() {
+        let diff = diff_with_thread(DiffViewMode::Unified);
+        // 先頭（diff 行）ではコメント選択なし。
+        assert_eq!(diff.cursor_comment(), None);
+    }
+
+    #[test]
+    fn split_display_rows_include_comment_on_replaced_removed_line() {
+        // 置換（-old/+new）。旧側（削除行 old_no=1）にコメント。split でも欠落しない。
+        let parsed = parse_diff("diff --git a/x.rs b/x.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n");
+        let json = r#"{ "id": 7, "content": { "raw": "why" },
+                        "user": { "display_name": "A" }, "deleted": false,
+                        "created_on": "2026-01-01T00:00:00Z",
+                        "inline": { "path": "x.rs", "from": 1 } }"#;
+        let comment: Comment = serde_json::from_str(json).expect("valid inline comment json");
+        let comment_layout = build_comment_layout(&parsed, &[comment]);
+        let mut diff = DiffState {
+            parsed,
+            viewport: 20,
+            view_mode: DiffViewMode::Split,
+            comment_layout,
+            ..Default::default()
+        };
+        diff.rebuild_display_rows();
+        let has_header = diff.display_rows.iter().any(|row| {
+            matches!(
+                row,
+                DisplayRow::Comment(CommentRow {
+                    kind: CommentRowKind::Header { .. },
+                    ..
+                })
+            )
+        });
+        assert!(
+            has_header,
+            "split で削除側コメントが欠落: {:?}",
+            diff.display_rows
+        );
+    }
+
+    /// カーソルをスレッドのヘッダに合わせた PR 差分の App を組む（コメント 1 件 id=1、投稿者
+    /// Alice。`me` も Alice にして自コメント扱いにする）。
+    fn review_app_with_thread() -> App {
         let mut app = review_app();
         app.current_pr = Some(make_pr(9, "OPEN"));
         app.screen = Screen::Diff;
         app.diff_return = Screen::PullRequestDetail;
-        let mut layout = CommentLayout::default();
-        layout.reply_targets.insert(2, 42);
-        app.diff = Some(DiffState {
-            parsed: parse_diff("diff --git a/x b/x\n@@ -1 +1 @@\n-old\n+new\n"),
-            scroll: 0,
-            viewport: 10,
-            title: "#9".to_string(),
-            rendered_lines: None,
-            rendered_split: None,
-            file_index: 0,
-            cursor: 2,
-            focus: DiffFocus::Body,
-            view_mode: DiffViewMode::Unified,
-            comment_layout: layout,
-            sidebar_rows: Vec::new(),
-        });
+        app.me = Me {
+            account_id: None,
+            uuid: None,
+            display_name: Some("Alice".to_string()),
+        };
+        app.comments = vec![make_inline_comment(
+            1,
+            "hi",
+            "x.rs",
+            2,
+            "2026-01-01T00:00:00Z",
+            None,
+        )];
+        let mut diff = diff_with_thread(DiffViewMode::Unified);
+        diff.cursor = thread_header_index(&diff);
+        app.diff = Some(diff);
+        app
+    }
 
+    #[test]
+    fn diff_reply_on_selected_comment_submits_create_reply() {
+        let mut app = review_app_with_thread();
         app.update(Msg::Key(key(KeyCode::Char('r'))));
         assert_eq!(
             app.comment_editor
                 .as_ref()
                 .expect("reply editor open")
                 .reply_to,
-            Some(42)
+            Some(1)
         );
         for ch in "了解".chars() {
             app.update(Msg::Key(key(KeyCode::Char(ch))));
         }
-        let cmd = app.update(Msg::Key(ctrl(KeyCode::Char('s'))));
-        match cmd {
+        match app.update(Msg::Key(ctrl(KeyCode::Char('s')))) {
             Command::CreateReply {
                 id, parent_id, raw, ..
             } => {
                 assert_eq!(id, 9);
-                assert_eq!(parent_id, 42);
+                assert_eq!(parent_id, 1);
                 assert_eq!(raw, "了解");
             }
             other => panic!("expected CreateReply, got {other:?}"),
@@ -7914,63 +8457,164 @@ diff --git a/two.txt b/two.txt\n\
     }
 
     #[test]
-    fn diff_reply_key_without_thread_shows_error() {
-        let mut app = review_app();
-        app.current_pr = Some(make_pr(9, "OPEN"));
-        app.screen = Screen::Diff;
-        app.diff_return = Screen::PullRequestDetail;
-        app.diff = Some(DiffState {
-            parsed: parse_diff("diff --git a/x b/x\n@@ -1 +1 @@\n-old\n+new\n"),
-            scroll: 0,
-            viewport: 10,
-            title: "#9".to_string(),
-            rendered_lines: None,
-            rendered_split: None,
-            file_index: 0,
-            cursor: 2,
-            focus: DiffFocus::Body,
-            view_mode: DiffViewMode::Unified,
-            comment_layout: CommentLayout::default(),
-            sidebar_rows: Vec::new(),
-        });
+    fn diff_edit_on_selected_comment_prefills_and_submits_edit() {
+        let mut app = review_app_with_thread();
+        app.update(Msg::Key(key(KeyCode::Char('e'))));
+        let editor = app.comment_editor.as_ref().expect("edit editor open");
+        assert_eq!(editor.editing, Some(1));
+        assert_eq!(editor.text, "hi");
+        match app.update(Msg::Key(ctrl(KeyCode::Char('s')))) {
+            Command::EditComment {
+                id,
+                comment_id,
+                raw,
+                ..
+            } => {
+                assert_eq!(id, 9);
+                assert_eq!(comment_id, 1);
+                assert_eq!(raw, "hi");
+            }
+            other => panic!("expected EditComment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_delete_on_selected_comment_confirms_then_deletes() {
+        let mut app = review_app_with_thread();
+        app.update(Msg::Key(key(KeyCode::Char('d'))));
+        assert!(app.delete_comment_modal.is_some());
+        match app.update(Msg::Key(key(KeyCode::Enter))) {
+            Command::DeleteComment { id, comment_id, .. } => {
+                assert_eq!(id, 9);
+                assert_eq!(comment_id, 1);
+            }
+            other => panic!("expected DeleteComment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_resolve_on_selected_comment_issues_resolve() {
+        let mut app = review_app_with_thread();
+        match app.update(Msg::Key(key(KeyCode::Char('R')))) {
+            Command::ResolveComment {
+                id,
+                comment_id,
+                resolve,
+                ..
+            } => {
+                assert_eq!(id, 9);
+                assert_eq!(comment_id, 1);
+                assert!(resolve, "未解決スレッドは解決へトグルする");
+            }
+            other => panic!("expected ResolveComment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_reply_on_diff_line_shows_error() {
+        let mut app = review_app_with_thread();
+        // カーソルを diff 行（先頭）へ戻すとコメント未選択。
+        if let Some(diff) = app.diff.as_mut() {
+            diff.cursor = 0;
+        }
         app.update(Msg::Key(key(KeyCode::Char('r'))));
         assert!(app.comment_editor.is_none());
         assert!(matches!(app.status, Status::Error(_)));
     }
 
     #[test]
-    fn diff_reply_in_split_view_guides_to_unified() {
+    fn diff_edit_on_others_comment_is_blocked() {
+        let mut app = review_app_with_thread();
+        // 自分（me）を別人にすると、Alice のコメントは編集不可。
+        app.me = Me {
+            account_id: None,
+            uuid: None,
+            display_name: Some("Bob".to_string()),
+        };
+        app.update(Msg::Key(key(KeyCode::Char('e'))));
+        assert!(app.comment_editor.is_none(), "他人のコメントは編集できない");
+        assert!(matches!(app.status, Status::Error(_)));
+    }
+
+    #[test]
+    fn diff_delete_on_others_comment_is_blocked() {
+        let mut app = review_app_with_thread();
+        app.me = Me {
+            account_id: None,
+            uuid: None,
+            display_name: Some("Bob".to_string()),
+        };
+        app.update(Msg::Key(key(KeyCode::Char('d'))));
+        assert!(
+            app.delete_comment_modal.is_none(),
+            "他人のコメントは削除できない"
+        );
+        assert!(matches!(app.status, Status::Error(_)));
+    }
+
+    #[test]
+    fn cursor_stays_on_diff_line_after_comment_rebuild() {
+        // 回帰: 非同期のコメント取得で表示行が増えても、カーソルは同じ diff 行に留まる。
         let mut app = review_app();
         app.current_pr = Some(make_pr(9, "OPEN"));
         app.screen = Screen::Diff;
         app.diff_return = Screen::PullRequestDetail;
-        let mut layout = CommentLayout::default();
-        layout.reply_targets.insert(2, 42);
-        app.diff = Some(DiffState {
-            parsed: parse_diff("diff --git a/x b/x\n@@ -1 +1 @@\n-old\n+new\n"),
-            scroll: 0,
-            viewport: 10,
-            title: "#9".to_string(),
-            rendered_lines: None,
-            rendered_split: None,
-            file_index: 0,
-            cursor: 2,
-            focus: DiffFocus::Body,
-            view_mode: DiffViewMode::Split,
-            comment_layout: layout,
-            sidebar_rows: Vec::new(),
+        app.update(Msg::DiffLoaded {
+            id: 9,
+            text: "diff --git a/x.rs b/x.rs\n@@ -1,3 +1,3 @@\n a\n b\n c\n".to_string(),
         });
-        app.update(Msg::Key(key(KeyCode::Char('r'))));
-        assert!(app.comment_editor.is_none());
-        match &app.status {
-            Status::Error(msg) => {
-                assert!(
-                    msg.contains("unified"),
-                    "message should guide to unified: {msg}"
-                )
-            }
-            other => panic!("expected error status, got {other:?}"),
+        if let Some(diff) = app.diff.as_mut() {
+            diff.viewport = 20;
+            diff.cursor = 4; // 最後の diff 行（Context c）
         }
+        // アンカー行より上（新側 1 行目 = unified 行 2）にコメントが付く。
+        app.comments = vec![make_inline_comment(
+            1,
+            "hi",
+            "x.rs",
+            1,
+            "2026-01-01T00:00:00Z",
+            None,
+        )];
+        app.update(Msg::CommentsLoaded {
+            id: 9,
+            comments: app.comments.clone(),
+        });
+        let diff = app.diff.as_ref().expect("diff");
+        // カーソルは依然として最後の diff 行（Context c、unified 行 4）を指す。
+        assert_eq!(diff.cursor_diff_line(), 4);
+    }
+
+    #[test]
+    fn cursor_stays_on_same_comment_after_comment_rebuild() {
+        // 返信/編集後の CommentsLoaded 相当。コメントが残っていればカーソルはそのコメントに留まる。
+        let mut app = review_app_with_thread(); // カーソルはコメント id=1 のヘッダ
+        app.update(Msg::CommentsLoaded {
+            id: 9,
+            comments: app.comments.clone(),
+        });
+        let diff = app.diff.as_ref().expect("diff");
+        assert_eq!(diff.cursor_comment(), Some((1, 1)));
+    }
+
+    #[test]
+    fn cursor_to_bottom_lands_on_last_diff_line_even_with_trailing_comment() {
+        // 最終 diff 行にコメントがあっても G は最後の diff 行に着地する（c が使えるように）。
+        let parsed = parse_diff("diff --git a/x.rs b/x.rs\n@@ -1,3 +1,3 @@\n a\n b\n c\n");
+        // 新側 3 行目（unified 行 4 = 最終 diff 行）にコメント。
+        let comment = make_inline_comment(1, "hi", "x.rs", 3, "2026-01-01T00:00:00Z", None);
+        let comment_layout = build_comment_layout(&parsed, &[comment]);
+        let mut diff = DiffState {
+            parsed,
+            viewport: 20,
+            view_mode: DiffViewMode::Unified,
+            comment_layout,
+            ..Default::default()
+        };
+        diff.rebuild_display_rows();
+        diff.cursor_to_bottom();
+        // カーソルは diff 行（コメント不可の枠行ではない）。
+        assert_eq!(diff.row_diff_index(diff.cursor), Some(4));
     }
 
     #[test]
@@ -7980,13 +8624,11 @@ diff --git a/two.txt b/two.txt\n\
         // parent が取得済みコメント集合に無い（削除/未取得）ため、このコメントがルートに昇格する。
         let orphan = make_inline_comment(5, "body", "x.rs", 2, "2026-01-01T00:00:00Z", Some(99));
         let layout = build_comment_layout(&parsed, &[orphan]);
-        let rows = layout.by_line.get(&3).expect("thread present");
-        match &rows[0] {
-            CommentLine::Header { reply, .. } => {
-                assert!(!reply, "昇格したルートに返信マーカーを付けない")
-            }
-            other => panic!("expected header, got {other:?}"),
-        }
+        let threads = layout.threads_by_line.get(&3).expect("thread present");
+        assert!(
+            !threads[0].comments[0].reply,
+            "昇格したルートに返信マーカーを付けない"
+        );
     }
 
     #[test]
@@ -8006,23 +8648,20 @@ diff --git a/two.txt b/two.txt\n\
     }
 
     #[test]
-    fn ensure_cursor_visible_keeps_cursor_when_comments_added_above() {
+    fn ensure_cursor_visible_keeps_cursor_within_viewport() {
         let parsed = parse_diff(&"a\n".repeat(30));
-        let mut layout = CommentLayout::default();
-        layout.by_line.insert(6, vec![CommentLine::Blank; 6]);
         let mut diff = DiffState {
             parsed,
             viewport: 10,
             view_mode: DiffViewMode::Unified,
-            comment_layout: layout,
             ..Default::default()
         };
-        // cursor(12) より上の行にコメント行が増えても、cursor の diff 行は viewport 内に留まる。
-        diff.cursor = 12;
+        // 表示行 = diff 行と 1:1。cursor が下にはみ出したら scroll を合わせる。
+        diff.cursor = 25;
         diff.scroll = 5;
         diff.ensure_cursor_visible();
         assert!(diff.scroll <= diff.cursor);
-        assert!(diff.rows_to_cursor(diff.scroll) <= diff.viewport.max(1));
+        assert!(diff.cursor < diff.scroll + diff.viewport.max(1));
     }
 
     #[test]
@@ -9731,6 +10370,7 @@ diff --git a/two.txt b/two.txt\n\
             view_mode: DiffViewMode::Unified,
             comment_layout: CommentLayout::default(),
             sidebar_rows: Vec::new(),
+            display_rows: Vec::new(),
         });
 
         // 現在行が 10 行分下がり、viewport(5) に収まるよう最小限だけ自動スクロールする

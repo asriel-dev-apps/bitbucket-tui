@@ -271,6 +271,58 @@ impl BitbucketClient {
         self.send_json(Method::POST, url, &body).await
     }
 
+    /// 既存コメントの本文を編集する（`PUT .../comments/{comment_id}`、body `{"content":{"raw":".."}}`）。
+    pub async fn edit_comment(
+        &self,
+        workspace: &str,
+        repo: &str,
+        id: u64,
+        comment_id: u64,
+        raw: &str,
+    ) -> Result<(), ApiError> {
+        let url = format!(
+            "{BASE_URL}/repositories/{workspace}/{repo}/pullrequests/{id}/comments/{comment_id}"
+        );
+        self.send_json_discard(Method::PUT, url, &comment_body(raw))
+            .await
+    }
+
+    /// 既存コメントを削除する（`DELETE .../comments/{comment_id}`）。
+    pub async fn delete_comment(
+        &self,
+        workspace: &str,
+        repo: &str,
+        id: u64,
+        comment_id: u64,
+    ) -> Result<(), ApiError> {
+        let url = format!(
+            "{BASE_URL}/repositories/{workspace}/{repo}/pullrequests/{id}/comments/{comment_id}"
+        );
+        self.send_empty(Method::DELETE, url).await
+    }
+
+    /// スレッドの解決/再オープンをトグルする（`POST`/`DELETE .../comments/{comment_id}/resolve`。
+    /// `comment_id` はスレッドのルート。この endpoint の挙動は未検証の仮定として
+    /// `docs/LEDGER.md` に残す）。
+    pub async fn resolve_comment(
+        &self,
+        workspace: &str,
+        repo: &str,
+        id: u64,
+        comment_id: u64,
+        resolve: bool,
+    ) -> Result<(), ApiError> {
+        let url = format!(
+            "{BASE_URL}/repositories/{workspace}/{repo}/pullrequests/{id}/comments/{comment_id}/resolve"
+        );
+        let method = if resolve {
+            Method::POST
+        } else {
+            Method::DELETE
+        };
+        self.send_empty(method, url).await
+    }
+
     /// PR をマージする（`POST .../merge`）。
     ///
     /// 大きなマージは 202（処理中）で返り得るが、いずれも成功ステータスなので `Ok(())` を返す。

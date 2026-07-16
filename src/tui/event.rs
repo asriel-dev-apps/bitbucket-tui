@@ -364,6 +364,81 @@ fn dispatch(command: Command, api_tx: &mpsc::Sender<Msg>) -> bool {
             });
             true
         }
+        Command::EditComment {
+            client,
+            workspace,
+            repo,
+            id,
+            comment_id,
+            raw,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let msg = match client
+                    .edit_comment(&workspace, &repo, id, comment_id, &raw)
+                    .await
+                {
+                    Ok(_comment) => Msg::CommentActionDone {
+                        id,
+                        message: "コメントを編集しました".to_string(),
+                    },
+                    Err(error) => Msg::ActionFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
+        Command::DeleteComment {
+            client,
+            workspace,
+            repo,
+            id,
+            comment_id,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let msg = match client
+                    .delete_comment(&workspace, &repo, id, comment_id)
+                    .await
+                {
+                    Ok(()) => Msg::CommentActionDone {
+                        id,
+                        message: "コメントを削除しました".to_string(),
+                    },
+                    Err(error) => Msg::ActionFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
+        Command::ResolveComment {
+            client,
+            workspace,
+            repo,
+            id,
+            comment_id,
+            resolve,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let msg = match client
+                    .resolve_comment(&workspace, &repo, id, comment_id, resolve)
+                    .await
+                {
+                    Ok(()) => Msg::CommentActionDone {
+                        id,
+                        message: if resolve {
+                            "スレッドを解決しました".to_string()
+                        } else {
+                            "スレッドを再オープンしました".to_string()
+                        },
+                    },
+                    Err(error) => Msg::ActionFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
         Command::Merge {
             client,
             workspace,

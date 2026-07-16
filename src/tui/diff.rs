@@ -94,6 +94,31 @@ pub struct CommentAnchor {
 ///
 /// `file_starts` と同じ境界から導出するため要素数・並びが一致する
 /// （`files[i].start == file_starts[i]`）。
+/// ファイルの変更種別（サイドバーの先頭マーカー用。git diff のメタ行から判定する）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileStatus {
+    /// 変更（`M`）。
+    Modified,
+    /// 追加（`A`、`new file mode`）。
+    Added,
+    /// 削除（`D`、`deleted file mode`）。
+    Deleted,
+    /// リネーム（`R`、`rename from`/`rename to`）。
+    Renamed,
+}
+
+impl FileStatus {
+    /// サイドバー表示用の 1 文字マーカー。
+    pub fn marker(self) -> char {
+        match self {
+            FileStatus::Modified => 'M',
+            FileStatus::Added => 'A',
+            FileStatus::Deleted => 'D',
+            FileStatus::Renamed => 'R',
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffFile {
     /// 表示用のファイル名（新側のパスを優先。抽出できない場合は `"(unknown)"`）。
@@ -106,6 +131,8 @@ pub struct DiffFile {
     pub added: u32,
     /// このファイル区間の削除行数（`-`）。サイドバーの `-N` 表示に使う。
     pub removed: u32,
+    /// 変更種別（サイドバーの先頭マーカー）。
+    pub status: FileStatus,
 }
 
 /// ファイル名を抽出できなかった場合のプレースホルダ（renamed/binary 等の想定外形式でも
@@ -197,13 +224,6 @@ impl ParsedDiff {
             }),
             DiffLineKind::FileHeader | DiffLineKind::Hunk | DiffLineKind::Meta => None,
         }
-    }
-
-    /// split 表示の行インデックスからファイルの表示名を解決する（[`Self::file_for_line`] の
-    /// split 版。[`SplitLine::anchor_index`] で unified 行インデックスへ変換してから委譲する）。
-    pub fn split_file_for_line(&self, split_index: usize) -> Option<&str> {
-        let anchor = self.split_lines.get(split_index)?.anchor_index()?;
-        self.file_for_line(anchor)
     }
 
     /// split 表示の行インデックスからインラインコメント投稿アンカーを算出する
@@ -434,12 +454,14 @@ fn build_files(lines: &[DiffLine], file_starts: &[usize], used_fallback: bool) -
                 git_header_file_name(&lines[start].text)
             };
             let (added, removed) = count_file_stats(&lines[start..end]);
+            let status = detect_file_status(&lines[start..end]);
             DiffFile {
                 name,
                 start,
                 end,
                 added,
                 removed,
+                status,
             }
         })
         .collect()
@@ -457,6 +479,28 @@ fn count_file_stats(lines: &[DiffLine]) -> (u32, u32) {
         }
     }
     (added, removed)
+}
+
+/// ファイル区間のメタ行から変更種別を判定する（`new file mode`=追加 / `deleted file mode`=削除 /
+/// `rename from`/`rename to`=リネーム / それ以外=変更）。
+fn detect_file_status(lines: &[DiffLine]) -> FileStatus {
+    for line in lines {
+        // 状態メタ行は最初のハンク（`@@`）より前にしか現れないので、ハンク到達で打ち切る。
+        if line.kind == DiffLineKind::Hunk {
+            break;
+        }
+        let text = line.text.as_str();
+        if text.starts_with("new file mode") {
+            return FileStatus::Added;
+        }
+        if text.starts_with("deleted file mode") {
+            return FileStatus::Deleted;
+        }
+        if text.starts_with("rename from") || text.starts_with("rename to") {
+            return FileStatus::Renamed;
+        }
+    }
+    FileStatus::Modified
 }
 
 /// ツリー構築の中間ノード（ディレクトリ）。`children` は名前順（`BTreeMap`）で、
@@ -1080,8 +1124,14 @@ diff --git a/two.txt b/two.txt\n\
 
         let first_file_row = parsed.split_file_starts[0];
         let second_file_row = parsed.split_file_starts[1];
-        assert_eq!(parsed.split_file_for_line(first_file_row), Some("one.txt"));
-        assert_eq!(parsed.split_file_for_line(second_file_row), Some("two.txt"));
+        // split 行境界を unified 行へ逆引きして、正しいファイルを指すことを確認する。
+        let file_at = |split_row: usize| {
+            parsed.split_lines[split_row]
+                .anchor_index()
+                .and_then(|unified| parsed.file_for_line(unified))
+        };
+        assert_eq!(file_at(first_file_row), Some("one.txt"));
+        assert_eq!(file_at(second_file_row), Some("two.txt"));
     }
 
     /// 逆引き（split 行 → unified 行インデックス）: 各 unified 行はちょうど 1 つの split 行
@@ -1159,12 +1209,6 @@ diff --git a/two.txt b/two.txt\n\
         assert_eq!(parsed.split_comment_anchor(9999), None);
     }
 
-    #[test]
-    fn split_file_for_line_out_of_range_index_is_none() {
-        let parsed = sample_diff_for_split_anchor();
-        assert_eq!(parsed.split_file_for_line(9999), None);
-    }
-
     fn df(name: &str) -> DiffFile {
         DiffFile {
             name: name.to_string(),
@@ -1172,6 +1216,7 @@ diff --git a/two.txt b/two.txt\n\
             end: 0,
             added: 0,
             removed: 0,
+            status: FileStatus::Modified,
         }
     }
 
@@ -1254,6 +1299,21 @@ diff --git a/two.txt b/two.txt\n\
         let rows = build_sidebar_rows(&files);
         let file_indices: Vec<usize> = rows.iter().filter_map(SidebarRow::file_index).collect();
         assert_eq!(file_indices, vec![1, 0]);
+    }
+
+    #[test]
+    fn parse_detects_file_status_from_meta_lines() {
+        let added = parse("diff --git a/n.rs b/n.rs\nnew file mode 100644\n@@ -0,0 +1 @@\n+x\n");
+        assert_eq!(added.files[0].status, FileStatus::Added);
+        let deleted =
+            parse("diff --git a/o.rs b/o.rs\ndeleted file mode 100644\n@@ -1 +0,0 @@\n-x\n");
+        assert_eq!(deleted.files[0].status, FileStatus::Deleted);
+        let renamed = parse(
+            "diff --git a/a.rs b/b.rs\nsimilarity index 100%\nrename from a.rs\nrename to b.rs\n",
+        );
+        assert_eq!(renamed.files[0].status, FileStatus::Renamed);
+        let modified = parse("diff --git a/m.rs b/m.rs\n@@ -1 +1 @@\n-x\n+y\n");
+        assert_eq!(modified.files[0].status, FileStatus::Modified);
     }
 
     #[test]

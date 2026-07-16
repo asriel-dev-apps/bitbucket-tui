@@ -594,9 +594,12 @@ pub struct InlineTarget {
 /// 親コメント参照（スレッド判定に使用）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct CommentParent {
-    #[allow(dead_code, reason = "スレッド表示は未対応")]
     pub id: u64,
 }
+
+/// inline コメントスレッドの解決情報（フィールドは使わず、存在のみで解決済みと判定する）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommentResolution {}
 
 /// `GET .../pullrequests/{id}/comments` の要素。
 #[derive(Debug, Clone, Deserialize)]
@@ -619,6 +622,9 @@ pub struct Comment {
     /// 親コメント（返信元）。`Some` ならスレッドの返信としてインデント表示する。
     #[serde(default)]
     pub parent: Option<CommentParent>,
+    /// スレッドの解決情報（`Some` なら解決済み）。inline スレッドのルートに付く。
+    #[serde(default)]
+    pub resolution: Option<CommentResolution>,
 }
 
 impl Comment {
@@ -636,6 +642,11 @@ impl Comment {
             .as_ref()
             .and_then(|user| user.display_name.as_deref())
             .unwrap_or("?")
+    }
+
+    /// スレッドが解決済みか（`resolution` の有無で判定）。
+    pub fn is_resolved(&self) -> bool {
+        self.resolution.is_some()
     }
 }
 
