@@ -254,6 +254,23 @@ impl BitbucketClient {
         self.send_json(Method::POST, url, &body).await
     }
 
+    /// 既存スレッドへ返信する（`POST .../comments`、body `{"content":{"raw":".."},"parent":{"id":<id>}}`）。
+    ///
+    /// `parent_id` は返信先スレッドのルートコメント id。アンカー（inline）は Bitbucket 側が
+    /// 親から継承するため送らない（この解釈は未検証の仮定として `docs/LEDGER.md` に残す）。
+    pub async fn create_reply(
+        &self,
+        workspace: &str,
+        repo: &str,
+        id: u64,
+        parent_id: u64,
+        raw: &str,
+    ) -> Result<Comment, ApiError> {
+        let url = format!("{BASE_URL}/repositories/{workspace}/{repo}/pullrequests/{id}/comments");
+        let body = reply_comment_body(raw, parent_id);
+        self.send_json(Method::POST, url, &body).await
+    }
+
     /// PR をマージする（`POST .../merge`）。
     ///
     /// 大きなマージは 202（処理中）で返り得るが、いずれも成功ステータスなので `Ok(())` を返す。
@@ -772,6 +789,13 @@ fn inline_comment_body(raw: &str, path: &str, side: CommentSide, line: u32) -> s
     serde_json::json!({ "content": { "raw": raw }, "inline": inline })
 }
 
+/// 返信投稿のリクエストボディ（`{"content":{"raw":".."},"parent":{"id":<id>}}`）を組み立てる。
+///
+/// 返信のアンカーは Bitbucket 側が親コメントから継承する（`inline` は送らない）。
+fn reply_comment_body(raw: &str, parent_id: u64) -> serde_json::Value {
+    serde_json::json!({ "content": { "raw": raw }, "parent": { "id": parent_id } })
+}
+
 /// URL パスセグメント用の percent-encode。
 ///
 /// unreserved 文字（`A-Z a-z 0-9 - . _ ~`）以外をすべて `%XX` へエンコードする。
@@ -1109,6 +1133,15 @@ mod tests {
     #[test]
     fn page_size_constant_is_forty() {
         assert_eq!(PAGE_SIZE, 40);
+    }
+
+    #[test]
+    fn reply_comment_body_wraps_parent_and_content() {
+        let body = reply_comment_body("thanks", 42);
+        assert_eq!(body["content"]["raw"], "thanks");
+        assert_eq!(body["parent"]["id"], 42);
+        // 返信ではアンカー（inline）は送らない（親から継承）。
+        assert!(body["inline"].is_null());
     }
 
     #[test]

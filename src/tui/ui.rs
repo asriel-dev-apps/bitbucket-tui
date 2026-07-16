@@ -23,11 +23,11 @@ use crate::api::{
     PipelineStatus, PipelineStep, PullRequest, SrcEntry,
 };
 use crate::tui::app::{
-    App, CommentEditor, ConfirmModal, DetailFocus, DiffFocus, DiffState, DiffViewMode, HintLayout,
-    ImageHit, JumpPaletteState, LinkPalette, ListKind, ListLayout, MergeModal, ModalKind,
-    ModalLayout, PageJumpModal, PaneKind, Screen, SelectList, Status,
+    App, CommentEditor, CommentLine, ConfirmModal, DetailFocus, DiffFocus, DiffState, DiffViewMode,
+    HintLayout, ImageHit, JumpPaletteState, LinkPalette, ListKind, ListLayout, MergeModal,
+    ModalKind, ModalLayout, PageJumpModal, PaneKind, Screen, SelectList, Status,
 };
-use crate::tui::diff::{DiffLineKind, ParsedDiff};
+use crate::tui::diff::{DiffLineKind, ParsedDiff, SidebarRow};
 use crate::tui::onboarding::Field;
 use crate::tui::richdoc::{self, DocBlock, RichDocument};
 use crate::tui::theme::Theme;
@@ -1131,15 +1131,9 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
     // 枠線ぶんを差し引いたビューポート高さを保持（スクロール上限計算に使う）。
     let viewport = body_area.height.saturating_sub(2) as usize;
     diff.viewport = viewport;
-    // `scroll`/`cursor` の総行数は表示モードによって異なる（unified=`lines`、split=
-    // `split_lines`）。`DiffState::total_lines`（app 側の私有ヘルパ）と同じ計算をここでも
-    // 行う（`pub` フィールド経由で複製している。App 内部の状態遷移ロジックとは独立に、
-    // 描画側もモードに応じた総行数を知る必要があるため）。
-    let total_lines = match diff.view_mode {
-        DiffViewMode::Unified => diff.parsed.lines.len(),
-        DiffViewMode::Split => diff.parsed.split_lines.len(),
-    };
-    let max_scroll = total_lines.saturating_sub(viewport.max(1));
+    // スクロール上限はコメント行ぶんの視覚行も勘定した [`DiffState::max_scroll`] に集約する
+    // （unified/split・コメントの有無を含めて状態層と同じ計算を使い、二重定義を避ける）。
+    let max_scroll = diff.max_scroll();
     if diff.scroll > max_scroll {
         diff.scroll = max_scroll;
     }
@@ -1162,7 +1156,7 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
     ]);
     let visible_height = usize::from(sidebar_area.height.saturating_sub(2)).max(1);
     let first_visible = diff
-        .file_index
+        .selected_sidebar_row()
         .saturating_add(1)
         .saturating_sub(visible_height);
     app.layout.lists.push(ListLayout {
@@ -1172,8 +1166,9 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
     });
 }
 
-/// ファイル一覧サイドバー。選択中ファイル（`file_index`）をハイライトし、フォーカス中は
-/// 枠線を `theme.border_focus` にする。
+/// ファイル一覧サイドバー。フォルダ階層のツリー（各ファイルに `+追加 -削除` とコメント数
+/// バッジ）を描画し、選択中ファイルの表示行をハイライトする。フォーカス中は枠線を
+/// `theme.border_focus` にする。`sidebar_rows` が未構築ならフルパスのフラット一覧へ退避する。
 fn render_diff_sidebar(frame: &mut Frame, area: Rect, diff: &DiffState, theme: &Theme) {
     let focused = diff.focus == DiffFocus::Files;
     let title = format!(" ファイル ({}) ", diff.parsed.files.len());
@@ -1191,19 +1186,29 @@ fn render_diff_sidebar(frame: &mut Frame, area: Rect, diff: &DiffState, theme: &
         return;
     }
 
-    // 枠線 + 左右パディングぶん（`rounded_block` が `Padding::horizontal(1)` を持つ）を
-    // 差し引いた表示可能文字数。
-    let name_width = area.width.saturating_sub(4);
-    let items: Vec<ListItem> = diff
-        .parsed
-        .files
-        .iter()
-        .map(|file| {
-            ListItem::new(Line::from(Span::raw(truncate_file_name(
-                &file.name, name_width,
-            ))))
-        })
-        .collect();
+    let items: Vec<ListItem> = if diff.sidebar_rows.is_empty() {
+        // ツリー未構築時はフルパスのフラット一覧へフォールバック（末尾優先で省略）。
+        // 枠線 + 左右パディングぶんを差し引いた表示可能文字数。
+        let name_width = area.width.saturating_sub(4);
+        diff.parsed
+            .files
+            .iter()
+            .map(|file| {
+                ListItem::new(Line::from(Span::raw(truncate_file_name(
+                    &file.name, name_width,
+                ))))
+            })
+            .collect()
+    } else {
+        // 枠線 2 + 左右パディング 2 + 選択記号ぶん 2（`highlight_spacing=Always`）を差し引いた
+        // 実表示幅。名前を中略して統計・コメントバッジが右端で切れないようにする。
+        let content_width = area.width.saturating_sub(6) as usize;
+        diff.sidebar_rows
+            .iter()
+            .map(|row| sidebar_row_item(row, diff, theme, content_width))
+            .collect()
+    };
+    let item_count = items.len();
 
     let list = List::new(items)
         .block(block)
@@ -1216,9 +1221,106 @@ fn render_diff_sidebar(frame: &mut Frame, area: Rect, diff: &DiffState, theme: &
         .highlight_symbol("▌ ")
         .highlight_spacing(HighlightSpacing::Always);
 
-    let selected = diff.file_index.min(diff.parsed.files.len() - 1);
+    let selected = diff
+        .selected_sidebar_row()
+        .min(item_count.saturating_sub(1));
     let mut state = ListState::default().with_selected(Some(selected));
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// サイドバーのツリー 1 行を [`ListItem`] に整形する。フォルダは淡色 + `name/`、ファイルは
+/// `basename  +A -R  💬N`（値が 0 の要素は省略）。深さぶんインデントし、`content_width` に
+/// 収まるよう名前を中略して統計・バッジが右端で切れないようにする。
+fn sidebar_row_item(
+    row: &SidebarRow,
+    diff: &DiffState,
+    theme: &Theme,
+    content_width: usize,
+) -> ListItem<'static> {
+    match row {
+        SidebarRow::Folder { depth, name } => {
+            let indent = "  ".repeat(*depth);
+            // 末尾 `/` の 1 桁ぶんを残して名前を中略する。
+            let budget = content_width.saturating_sub(indent.len() + 1).max(1);
+            let shown = truncate_middle(name, budget);
+            ListItem::new(Line::from(Span::styled(
+                format!("{indent}{shown}/"),
+                Style::new().fg(theme.muted).bold(),
+            )))
+        }
+        SidebarRow::File {
+            depth,
+            file_index,
+            name,
+        } => {
+            let indent = "  ".repeat(*depth);
+            // 統計 + バッジ（右側）を先に組み、その表示幅ぶんを名前から確保する。
+            let mut suffix: Vec<Span<'static>> = Vec::new();
+            if let Some(file) = diff.parsed.files.get(*file_index) {
+                if file.added > 0 {
+                    suffix.push(Span::styled(
+                        format!("  +{}", file.added),
+                        Style::new().fg(theme.success),
+                    ));
+                }
+                if file.removed > 0 {
+                    suffix.push(Span::styled(
+                        format!(" -{}", file.removed),
+                        Style::new().fg(theme.danger),
+                    ));
+                }
+            }
+            let count = diff
+                .comment_layout
+                .file_comment_counts
+                .get(*file_index)
+                .copied()
+                .unwrap_or(0);
+            if count > 0 {
+                suffix.push(Span::styled(
+                    format!("  💬{count}"),
+                    Style::new().fg(theme.info),
+                ));
+            }
+            let suffix_width: usize = suffix
+                .iter()
+                .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                .sum();
+            let budget = content_width
+                .saturating_sub(indent.len() + suffix_width)
+                .max(1);
+            let shown = truncate_middle(name, budget);
+            let mut spans = vec![Span::styled(
+                format!("{indent}{shown}"),
+                Style::new().fg(theme.fg),
+            )];
+            spans.extend(suffix);
+            ListItem::new(Line::from(spans))
+        }
+    }
+}
+
+/// 表示幅 `budget`（列数）に収まるよう文字列を中略する。頭と尾を残し、中央に `…` を置く
+/// （ファイル名の拡張子側と識別子側の両方を残すため）。既に収まるならそのまま返す。
+fn truncate_middle(text: &str, budget: usize) -> String {
+    if UnicodeWidthStr::width(text) <= budget {
+        return text.to_string();
+    }
+    if budget <= 1 {
+        return "…".to_string();
+    }
+    // `…` の 1 桁を除いた残りを頭と尾に割り振る（列幅は近似として文字数で数える）。
+    let keep = budget - 1;
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= keep {
+        // 文字数では収まる（全角で列幅超過のケース）。頭尾が重ならないよう clip に委ねる。
+        return text.to_string();
+    }
+    let head_len = keep.div_ceil(2);
+    let tail_len = keep - head_len;
+    let head: String = chars.iter().take(head_len).collect();
+    let tail: String = chars[chars.len() - tail_len..].iter().collect();
+    format!("{head}…{tail}")
 }
 
 /// ファイル名を表示幅に収める。長い場合は先頭を省略し末尾（ファイル名側）を優先して残す。
@@ -1248,40 +1350,87 @@ fn render_diff_body(frame: &mut Frame, area: Rect, diff: &mut DiffState, theme: 
     // 着色済み行は diff ロード時（新しい `DiffState`）ごと・テーマ切替ごとに一度だけ構築し、
     // 以降は使い回す。毎フレーム全行を `Span::styled` で作り直すと diff が大きいほど描画
     // コストが線形に増える（テーマ切替時のキャッシュ無効化は `App::cycle_theme` が行う）。
+    // コメント行は挟まないので `rendered_lines` は `parsed.lines` と同じ並び・同じ長さのまま。
     let total = diff.parsed.len();
     let position = diff_cursor_position_label(diff);
     let title = format!(" diff {} ({total} 行){position} ", diff.title);
-    let lines = diff.rendered_lines.get_or_insert_with(|| {
-        diff.parsed
-            .lines
-            .iter()
-            .map(|line| {
-                Line::from(Span::styled(
-                    line.text.clone(),
-                    diff_line_style(theme, line.kind),
-                ))
-            })
-            .collect()
-    });
+    if diff.rendered_lines.is_none() {
+        diff.rendered_lines = Some(
+            diff.parsed
+                .lines
+                .iter()
+                .map(|line| {
+                    Line::from(Span::styled(
+                        line.text.clone(),
+                        diff_line_style(theme, line.kind),
+                    ))
+                })
+                .collect(),
+        );
+    }
+    let focused = diff.focus == DiffFocus::Body;
 
-    // per-frame のコストを O(viewport) に抑えるため、可視範囲だけを切り出して渡す
-    // （`.scroll()` はここでは使わない。全行を Paragraph に渡すのを避けるのが目的）。
-    let (start, end) = diff_visible_range(diff.scroll, diff.viewport, lines.len());
-    let mut visible: Vec<Line> = lines[start..end].to_vec();
-
-    // 現在行ハイライトはキャッシュ（`lines`）には焼き込まず、viewport にスライスした複製
-    // （`visible`）の該当行だけをここで上書きする。これにより `rendered_lines` は書き換わらず
-    // Phase1 のキャッシュ再利用（1 度だけ構築・以後使い回し）が保たれる。
-    if diff.cursor >= start
-        && diff.cursor < end
-        && let Some(line) = visible.get_mut(diff.cursor - start)
-    {
-        *line = highlighted_diff_line(line, theme);
+    // `scroll`（diff 行インデックス）から viewport ぶんの「視覚行」を、diff 行 → その行の直下の
+    // コメントスレッド行、の順に積む。per-frame コストは O(viewport)。`cursor` は diff 行の
+    // ままで（コメント行はカーソル対象にしない）、キャッシュ（`rendered_lines`）には現在行
+    // ハイライトを焼き込まず、積んだ複製側だけ上書きする。
+    let viewport = diff.viewport.max(1);
+    let mut visible: Vec<Line> = Vec::with_capacity(viewport);
+    if let Some(lines) = diff.rendered_lines.as_ref() {
+        let mut i = diff.scroll;
+        while i < lines.len() && visible.len() < viewport {
+            let row = if i == diff.cursor {
+                highlighted_diff_line(&lines[i], theme)
+            } else {
+                lines[i].clone()
+            };
+            visible.push(row);
+            if let Some(comment_rows) = diff.comment_layout.by_line.get(&i) {
+                for comment_line in comment_rows {
+                    if visible.len() >= viewport {
+                        break;
+                    }
+                    visible.push(render_comment_inline_line(comment_line, theme));
+                }
+            }
+            i += 1;
+        }
     }
 
-    let focused = diff.focus == DiffFocus::Body;
     let paragraph = Paragraph::new(visible).block(themed_block(theme, focused).title(title));
     frame.render_widget(paragraph, area);
+}
+
+/// [`CommentLine`] を Diff 本文へインライン表示する 1 行に整形する。左端に淡色のガター
+/// （`│`）を付けてコメント行を diff 行と視覚的に区別し、返信は 1 段インデントする。
+fn render_comment_inline_line(line: &CommentLine, theme: &Theme) -> Line<'static> {
+    let gutter = Span::styled("  │ ".to_string(), Style::new().fg(theme.muted));
+    match line {
+        CommentLine::Header {
+            reply,
+            author,
+            when,
+        } => {
+            let marker = if *reply { "  ↳ " } else { "💬 " };
+            let mut spans = vec![
+                gutter,
+                Span::styled(marker.to_string(), Style::new().fg(theme.info)),
+                Span::styled(author.clone(), Style::new().fg(theme.accent).bold()),
+            ];
+            if !when.is_empty() {
+                spans.push(Span::styled(format!("  {when}"), Style::new().dim()));
+            }
+            Line::from(spans)
+        }
+        CommentLine::Body { reply, text } => {
+            let indent = if *reply { "     " } else { "   " };
+            Line::from(vec![
+                gutter,
+                Span::styled(format!("{indent}{text}"), Style::new().fg(theme.fg)),
+            ])
+        }
+        CommentLine::Blank => Line::from(vec![gutter]),
+    }
 }
 
 /// split 表示（左=旧ファイル/右=新ファイル）の本文を描画する。
@@ -2247,6 +2396,7 @@ fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("v", "表示切替(unified/split)"),
             ("t", "ファイル一覧 表示/非表示"),
             ("c", "コメント"),
+            ("r", "返信"),
             ("Esc", "戻る"),
         ],
         Screen::Pipelines => vec![
@@ -2407,11 +2557,15 @@ fn render_comment_editor(frame: &mut Frame, area: Rect, editor: &CommentEditor, 
         Style::new().dim(),
     )));
 
-    // インラインコメントは対象アンカー（`path:line`）をタイトルに出す（一般コメントと
-    // 見分けが付くように）。非破壊的な入力オーバーレイなのでフォーカス色の枠線。
-    let title = match &editor.inline {
-        Some(anchor) => format!(" {}:{} にコメント ", anchor.path, anchor.line),
-        None => " コメントを書く ".to_string(),
+    // 返信はスレッド返信、インラインは対象アンカー（`path:line`）、それ以外は一般コメントと
+    // 見分けが付くようにタイトルを出し分ける。非破壊的な入力オーバーレイなのでフォーカス色の枠線。
+    let title = if editor.reply_to.is_some() {
+        " スレッドに返信 ".to_string()
+    } else {
+        match &editor.inline {
+            Some(anchor) => format!(" {}:{} にコメント ", anchor.path, anchor.line),
+            None => " コメントを書く ".to_string(),
+        }
     };
     let block = rounded_block(theme, theme.border_focus)
         .title(title)
@@ -2568,6 +2722,7 @@ fn render_help(frame: &mut Frame, area: Rect, screen: Screen, theme: &Theme) {
             "v              表示モード切替（unified ⇔ split。設定に永続化）",
             "t              ファイル一覧 表示/非表示（境界のドラッグでも幅調整可。設定に永続化）",
             "c              現在行にインラインコメント投稿（PR 差分のみ。Ctrl+S 送信 / Esc 取消）",
+            "r              現在行のコメントスレッドへ返信（PR 差分・unified のみ）",
             "               コミット差分では投稿できません",
         ],
         Screen::Repositories => &[
@@ -2763,6 +2918,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
 
+    use crate::tui::app::CommentLayout;
     use crate::tui::diff::parse as parse_diff;
     use crate::tui::theme::ThemeName;
 
@@ -2783,6 +2939,8 @@ mod tests {
             cursor: 0,
             focus: DiffFocus::Body,
             view_mode: DiffViewMode::Unified,
+            comment_layout: CommentLayout::default(),
+            sidebar_rows: Vec::new(),
         }
     }
 
@@ -2812,6 +2970,8 @@ mod tests {
             cursor: 0,
             focus: DiffFocus::Body,
             view_mode: DiffViewMode::Unified,
+            comment_layout: CommentLayout::default(),
+            sidebar_rows: Vec::new(),
         }
     }
 
@@ -3063,6 +3223,8 @@ mod tests {
             cursor: 5, // "+new"（追加行 → 新ファイル側の行番号）
             focus: DiffFocus::Body,
             view_mode: DiffViewMode::Unified,
+            comment_layout: CommentLayout::default(),
+            sidebar_rows: Vec::new(),
         };
         let theme = Theme::default();
 
@@ -3078,6 +3240,96 @@ mod tests {
         let content = buffer_text(terminal.backend().buffer());
         assert!(content.contains("x:1"), "position label missing: {content}");
         assert!(content.contains('新'), "side marker missing: {content}");
+    }
+
+    #[test]
+    fn render_diff_body_interleaves_comment_thread_below_anchored_line() {
+        // 行: 0=FileHeader 1=Hunk 2=Removed(-old) 3=Added(+new)。3 行目にスレッドを置く。
+        let text = "diff --git a/x b/x\n@@ -1 +1 @@\n-old\n+new\n".to_string();
+        let mut layout = CommentLayout::default();
+        layout.by_line.insert(
+            3,
+            vec![
+                CommentLine::Header {
+                    reply: false,
+                    author: "Bob".to_string(),
+                    when: "2026-05-27".to_string(),
+                },
+                CommentLine::Body {
+                    reply: false,
+                    text: "looks good to me".to_string(),
+                },
+                CommentLine::Blank,
+            ],
+        );
+        let mut diff = DiffState {
+            parsed: parse_diff(&text),
+            scroll: 0,
+            viewport: 10,
+            title: "#1".to_string(),
+            rendered_lines: None,
+            rendered_split: None,
+            file_index: 0,
+            cursor: 0,
+            focus: DiffFocus::Body,
+            view_mode: DiffViewMode::Unified,
+            comment_layout: layout,
+            sidebar_rows: Vec::new(),
+        };
+        let theme = Theme::default();
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| render_diff_body(frame, frame.area(), &mut diff, &theme))
+            .expect("draw succeeds");
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("Bob"), "comment author missing: {content}");
+        assert!(
+            content.contains("2026-05-27"),
+            "comment timestamp missing: {content}"
+        );
+        assert!(
+            content.contains("looks good to me"),
+            "comment body missing: {content}"
+        );
+    }
+
+    #[test]
+    fn render_diff_sidebar_shows_tree_stats_and_comment_badge() {
+        let text = "diff --git a/lib/a.rs b/lib/a.rs\n@@ -1 +1,2 @@\n ctx\n+added\n\
+                    diff --git a/lib/b.rs b/lib/b.rs\n@@ -1 +0,0 @@\n-removed\n"
+            .to_string();
+        let parsed = parse_diff(&text);
+        let sidebar_rows = crate::tui::diff::build_sidebar_rows(&parsed.files);
+        let layout = CommentLayout {
+            file_comment_counts: vec![2, 0],
+            ..Default::default()
+        };
+        let diff = DiffState {
+            parsed,
+            scroll: 0,
+            viewport: 10,
+            title: "#1".to_string(),
+            rendered_lines: None,
+            rendered_split: None,
+            file_index: 0,
+            cursor: 0,
+            focus: DiffFocus::Files,
+            view_mode: DiffViewMode::Unified,
+            comment_layout: layout,
+            sidebar_rows,
+        };
+        let theme = Theme::default();
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| render_diff_sidebar(frame, frame.area(), &diff, &theme))
+            .expect("draw succeeds");
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("lib"), "folder row missing: {content}");
+        assert!(content.contains("a.rs"), "file row missing: {content}");
+        assert!(content.contains("+1"), "added stat missing: {content}");
+        assert!(content.contains('💬'), "comment badge missing: {content}");
     }
 
     // ---- split 表示（render_diff_body_split） ----
@@ -3119,6 +3371,8 @@ mod tests {
             cursor: 0,
             focus: DiffFocus::Body,
             view_mode: DiffViewMode::Split,
+            comment_layout: CommentLayout::default(),
+            sidebar_rows: Vec::new(),
         };
         let theme = Theme::default();
 
@@ -3462,6 +3716,27 @@ mod tests {
     #[test]
     fn truncate_file_name_keeps_short_names_untouched() {
         assert_eq!(truncate_file_name("src/main.rs", 20), "src/main.rs");
+    }
+
+    #[test]
+    fn truncate_middle_keeps_short_text() {
+        assert_eq!(truncate_middle("main.rs", 20), "main.rs");
+    }
+
+    #[test]
+    fn truncate_middle_ellipsizes_center_within_budget_and_keeps_extension() {
+        let out = truncate_middle("very_long_file_name.dart", 12);
+        assert!(
+            UnicodeWidthStr::width(out.as_str()) <= 12,
+            "over budget: {out}"
+        );
+        assert!(out.contains('…'), "should ellipsize: {out}");
+        assert!(out.ends_with("dart"), "should keep extension tail: {out}");
+    }
+
+    #[test]
+    fn truncate_middle_tiny_budget_is_single_ellipsis() {
+        assert_eq!(truncate_middle("anything", 1), "…");
     }
 
     #[test]

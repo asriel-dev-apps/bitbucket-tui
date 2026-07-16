@@ -8,6 +8,8 @@
 //! （[`DiffLine::old_no`]/[`DiffLine::new_no`]）を付与する。インラインコメント投稿の
 //! アンカー算出（[`ParsedDiff::comment_anchor`]）の土台になる。
 
+use std::collections::BTreeMap;
+
 use crate::api::models::CommentSide;
 
 /// diff の 1 行の種別。
@@ -100,11 +102,41 @@ pub struct DiffFile {
     pub start: usize,
     /// このファイルの終端（次ファイルの `start`、末尾なら `lines.len()`）。
     pub end: usize,
+    /// このファイル区間の追加行数（`+`）。サイドバーの `+N` 表示に使う。
+    pub added: u32,
+    /// このファイル区間の削除行数（`-`）。サイドバーの `-N` 表示に使う。
+    pub removed: u32,
 }
 
 /// ファイル名を抽出できなかった場合のプレースホルダ（renamed/binary 等の想定外形式でも
 /// パニックせずに退避するため）。
 const UNKNOWN_FILE_NAME: &str = "(unknown)";
+
+/// サイドバー（ファイル一覧）のツリー表示 1 行。[`build_sidebar_rows`] がフルパス群から
+/// フォルダ階層に落として生成する。`depth` はインデントの深さ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarRow {
+    /// フォルダ見出し行（クリック不可の視覚的グループ）。単一子フォルダの連鎖は
+    /// `name` に `foo/bar` のように圧縮して 1 行にまとめる。
+    Folder { depth: usize, name: String },
+    /// ファイル行。`file_index` は [`ParsedDiff::files`] の添字（本文ジャンプ・選択に使う）。
+    /// `name` は表示用のベース名。
+    File {
+        depth: usize,
+        file_index: usize,
+        name: String,
+    },
+}
+
+impl SidebarRow {
+    /// ファイル行なら [`ParsedDiff::files`] の添字を返す（フォルダ行は `None`）。
+    pub fn file_index(&self) -> Option<usize> {
+        match self {
+            SidebarRow::File { file_index, .. } => Some(*file_index),
+            SidebarRow::Folder { .. } => None,
+        }
+    }
+}
 
 /// パース済みの diff 全体。
 #[derive(Debug, Clone, Default)]
@@ -401,9 +433,92 @@ fn build_files(lines: &[DiffLine], file_starts: &[usize], used_fallback: bool) -
             } else {
                 git_header_file_name(&lines[start].text)
             };
-            DiffFile { name, start, end }
+            let (added, removed) = count_file_stats(&lines[start..end]);
+            DiffFile {
+                name,
+                start,
+                end,
+                added,
+                removed,
+            }
         })
         .collect()
+}
+
+/// ファイル区間の追加/削除行数を数える（`+++`/`---` のパスヘッダは `Meta` として除外済み）。
+fn count_file_stats(lines: &[DiffLine]) -> (u32, u32) {
+    let mut added = 0;
+    let mut removed = 0;
+    for line in lines {
+        match line.kind {
+            DiffLineKind::Added => added += 1,
+            DiffLineKind::Removed => removed += 1,
+            _ => {}
+        }
+    }
+    (added, removed)
+}
+
+/// ツリー構築の中間ノード（ディレクトリ）。`children` は名前順（`BTreeMap`）で、
+/// フラット化時にフォルダ→ファイルの順で並べる。
+#[derive(Default)]
+struct TreeNode {
+    children: BTreeMap<String, TreeNode>,
+    /// このディレクトリ直下のファイル（ベース名, `files` の添字）。
+    files: Vec<(String, usize)>,
+}
+
+/// ファイル群（フルパス）をフォルダ階層のフラットな表示行列へ落とす。
+///
+/// - 名前順にソートし、フォルダ→ファイルの順で並べる。
+/// - 単一子フォルダの連鎖（`lib` の下に `src` だけ、のような）は `lib/src` に圧縮して 1 行にする。
+/// - `/` を含まない・空・`(unknown)` のパスは深さ 0 のファイル行として扱う。
+pub fn build_sidebar_rows(files: &[DiffFile]) -> Vec<SidebarRow> {
+    let mut root = TreeNode::default();
+    for (file_index, file) in files.iter().enumerate() {
+        let segments: Vec<&str> = file.name.split('/').filter(|s| !s.is_empty()).collect();
+        let Some((base, dirs)) = segments.split_last() else {
+            // パスが空（想定外）ならルート直下のファイルとして退避する。
+            root.files.push((file.name.clone(), file_index));
+            continue;
+        };
+        let mut node = &mut root;
+        for dir in dirs {
+            node = node.children.entry((*dir).to_string()).or_default();
+        }
+        node.files.push(((*base).to_string(), file_index));
+    }
+    let mut out = Vec::new();
+    flatten_tree(&root, 0, &mut out);
+    out
+}
+
+/// [`build_sidebar_rows`] の再帰フラット化。フォルダ（名前順）→ファイル（名前順）で出力する。
+fn flatten_tree(node: &TreeNode, depth: usize, out: &mut Vec<SidebarRow>) {
+    for (name, child) in &node.children {
+        // 単一子フォルダの連鎖を 1 行に圧縮する（直下にファイルが無く子が 1 つだけの間）。
+        let mut label = name.clone();
+        let mut cur = child;
+        while cur.files.is_empty() && cur.children.len() == 1 {
+            let Some((only_name, only_child)) = cur.children.iter().next() else {
+                break;
+            };
+            label.push('/');
+            label.push_str(only_name);
+            cur = only_child;
+        }
+        out.push(SidebarRow::Folder { depth, name: label });
+        flatten_tree(cur, depth + 1, out);
+    }
+    let mut files: Vec<&(String, usize)> = node.files.iter().collect();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    for (base, file_index) in files {
+        out.push(SidebarRow::File {
+            depth,
+            file_index: *file_index,
+            name: base.clone(),
+        });
+    }
 }
 
 /// `diff --git a/OLD b/NEW` からファイル名（新側 `NEW`）を取り出す。
@@ -1048,5 +1163,110 @@ diff --git a/two.txt b/two.txt\n\
     fn split_file_for_line_out_of_range_index_is_none() {
         let parsed = sample_diff_for_split_anchor();
         assert_eq!(parsed.split_file_for_line(9999), None);
+    }
+
+    fn df(name: &str) -> DiffFile {
+        DiffFile {
+            name: name.to_string(),
+            start: 0,
+            end: 0,
+            added: 0,
+            removed: 0,
+        }
+    }
+
+    #[test]
+    fn build_sidebar_rows_groups_folders_and_compresses_single_child_chain() {
+        let files = [
+            df("lib/src/common_widgets/infinite_scroll_mixin.dart"),
+            df("lib/src/features/coordinate/coordinate_list_page.dart"),
+            df("lib/src/features/favorite/favorite_stores_page.dart"),
+        ];
+        let rows = build_sidebar_rows(&files);
+        assert_eq!(
+            rows,
+            vec![
+                SidebarRow::Folder {
+                    depth: 0,
+                    name: "lib/src".to_string()
+                },
+                SidebarRow::Folder {
+                    depth: 1,
+                    name: "common_widgets".to_string()
+                },
+                SidebarRow::File {
+                    depth: 2,
+                    file_index: 0,
+                    name: "infinite_scroll_mixin.dart".to_string()
+                },
+                SidebarRow::Folder {
+                    depth: 1,
+                    name: "features".to_string()
+                },
+                SidebarRow::Folder {
+                    depth: 2,
+                    name: "coordinate".to_string()
+                },
+                SidebarRow::File {
+                    depth: 3,
+                    file_index: 1,
+                    name: "coordinate_list_page.dart".to_string()
+                },
+                SidebarRow::Folder {
+                    depth: 2,
+                    name: "favorite".to_string()
+                },
+                SidebarRow::File {
+                    depth: 3,
+                    file_index: 2,
+                    name: "favorite_stores_page.dart".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn build_sidebar_rows_top_level_file_has_depth_zero_and_no_folder() {
+        let files = [df("README.md"), df("(unknown)")];
+        let rows = build_sidebar_rows(&files);
+        // ソートで "(unknown)" が先。いずれも深さ 0 のファイル行、フォルダ行は出ない。
+        assert_eq!(
+            rows,
+            vec![
+                SidebarRow::File {
+                    depth: 0,
+                    file_index: 1,
+                    name: "(unknown)".to_string()
+                },
+                SidebarRow::File {
+                    depth: 0,
+                    file_index: 0,
+                    name: "README.md".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn build_sidebar_rows_sorts_display_but_preserves_file_index() {
+        // 入力（parsed）順は b→a だが、表示は名前順（a→b）。file_index は元の添字を保つ。
+        let files = [df("b/second.txt"), df("a/first.txt")];
+        let rows = build_sidebar_rows(&files);
+        let file_indices: Vec<usize> = rows.iter().filter_map(SidebarRow::file_index).collect();
+        assert_eq!(file_indices, vec![1, 0]);
+    }
+
+    #[test]
+    fn parse_counts_added_and_removed_per_file() {
+        let text = "diff --git a/x.rs b/x.rs\n\
+                    @@ -1,2 +1,3 @@\n\
+                    -old line\n\
+                    +new line one\n\
+                    +new line two\n\
+                     context\n";
+        let parsed = parse(text);
+        assert_eq!(parsed.files.len(), 1);
+        assert_eq!(parsed.files[0].added, 2);
+        assert_eq!(parsed.files[0].removed, 1);
     }
 }

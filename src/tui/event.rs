@@ -343,6 +343,27 @@ fn dispatch(command: Command, api_tx: &mpsc::Sender<Msg>) -> bool {
             });
             true
         }
+        Command::CreateReply {
+            client,
+            workspace,
+            repo,
+            id,
+            parent_id,
+            raw,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let msg = match client
+                    .create_reply(&workspace, &repo, id, parent_id, &raw)
+                    .await
+                {
+                    Ok(_comment) => Msg::CommentPosted { id },
+                    Err(error) => Msg::ActionFailed(error),
+                };
+                let _ = tx.send(msg).await;
+            });
+            true
+        }
         Command::Merge {
             client,
             workspace,
