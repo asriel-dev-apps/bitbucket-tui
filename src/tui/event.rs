@@ -160,8 +160,16 @@ fn dispatch(command: Command, api_tx: &mpsc::Sender<Msg>) -> bool {
         } => {
             let tx = api_tx.clone();
             tokio::spawn(async move {
+                let states = filter.state_values();
                 let msg = match client
-                    .get_pull_requests_page(&workspace, &repo, filter.states(), sort, page)
+                    .get_pull_requests_page(
+                        &workspace,
+                        &repo,
+                        &states,
+                        filter.author_uuid(),
+                        sort,
+                        page,
+                    )
                     .await
                 {
                     Ok(result) => Msg::PullRequestsLoaded {
@@ -174,6 +182,16 @@ fn dispatch(command: Command, api_tx: &mpsc::Sender<Msg>) -> bool {
                     Err(error) => Msg::LoadFailed(error),
                 };
                 let _ = tx.send(msg).await;
+            });
+            true
+        }
+        Command::LoadWorkspaceMembers { client, workspace } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let result = client.get_workspace_members(&workspace).await;
+                let _ = tx
+                    .send(Msg::WorkspaceMembersLoaded { workspace, result })
+                    .await;
             });
             true
         }

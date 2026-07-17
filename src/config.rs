@@ -38,6 +38,11 @@ pub struct Config {
     /// にフォールバックする。
     #[serde(default)]
     pub diff_sidebar_width: Option<u16>,
+    /// PR 一覧の state フィルタの選択（`"OPEN"`/`"MERGED"`/`"DECLINED"`/`"SUPERSEDED"` の配列）。
+    /// 任意。読み込み時に不正値は無視し、未設定/全滅なら既定（OPEN のみ）にフォールバック
+    /// する（[`crate::tui::app::PrStateFilter::from_config`]）。author フィルタは保存しない。
+    #[serde(default)]
+    pub pr_states: Option<Vec<String>>,
 }
 
 /// このアプリの `ProjectDirs` を返す。
@@ -85,5 +90,40 @@ impl Config {
                 .with_context(|| format!("設定ファイルを削除できません: {}", path.display()))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pr_states_round_trip_through_toml() {
+        let config = Config {
+            pr_states: Some(vec!["OPEN".to_string(), "MERGED".to_string()]),
+            ..Config::default()
+        };
+        let text = toml::to_string_pretty(&config).expect("serialize");
+        let parsed: Config = toml::from_str(&text).expect("parse");
+        assert_eq!(parsed.pr_states, config.pr_states);
+    }
+
+    #[test]
+    fn config_without_pr_states_parses_as_none() {
+        // 旧バージョンの config.toml（pr_states 無し）も読めること。
+        let parsed: Config = toml::from_str("email = \"me@example.com\"\n").expect("parse");
+        assert!(parsed.pr_states.is_none());
+        assert_eq!(parsed.email.as_deref(), Some("me@example.com"));
+    }
+
+    #[test]
+    fn pr_states_with_unknown_values_still_parse_as_strings() {
+        // 不正値の無視は読み込み側（PrStateFilter::from_config）の責務。TOML としては
+        // 文字列配列のまま保持する。
+        let parsed: Config = toml::from_str("pr_states = [\"OPEN\", \"bogus\"]\n").expect("parse");
+        assert_eq!(
+            parsed.pr_states,
+            Some(vec!["OPEN".to_string(), "bogus".to_string()])
+        );
     }
 }

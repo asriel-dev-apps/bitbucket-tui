@@ -26,8 +26,8 @@ use crate::tui::app::{
     App, CommentAction, CommentActionHit, CommentEditor, CommentRow, CommentRowKind, ConfirmModal,
     DeleteCommentModal, DetailFocus, DiffFocus, DiffState, DiffViewMode, DisplayRow, HintLayout,
     ImageHit, JumpPaletteState, LinkPalette, ListKind, ListLayout, MergeModal, ModalKind,
-    ModalLayout, PageJumpModal, PaneKind, Screen, SelectList, Status, comment_action_labels,
-    format_when, now_unix,
+    ModalLayout, PageJumpModal, PaneKind, PrFilterModal, PrFilterSection, PrState, Screen,
+    SelectList, Status, comment_action_labels, format_when, now_unix,
 };
 use crate::tui::diff::{DiffLineKind, FileStatus, ParsedDiff, SidebarRow};
 use crate::tui::onboarding::Field;
@@ -110,6 +110,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_confirm_modal(frame, area, modal, &app.theme);
         app.layout.modal = Some(ModalLayout {
             kind: ModalKind::PipelineConfirm,
+            area,
+        });
+    }
+    if let Some(modal) = &app.pr_filter_modal {
+        let area = centered_rect(52, 62, frame.area());
+        render_pr_filter_modal(frame, area, modal, &app.theme);
+        // モーダルとして登録し、モーダル外クリックを Esc（取消）として扱う既存機構に乗せる。
+        app.layout.modal = Some(ModalLayout {
+            kind: ModalKind::PrFilter,
             area,
         });
     }
@@ -1573,7 +1582,9 @@ fn comment_box_line(
             };
             let line = Line::from(Span::styled(shown, style));
             if hot {
-                line.style(Style::new().bg(theme.selection_bg))
+                // span 個別 fg が Line style より優先されるため、fg/bg とも span 単位で
+                // 上書きする（diff 行ハイライトと同じ見た目に揃える）。
+                highlighted_diff_line(&line, theme)
             } else {
                 line
             }
@@ -1585,6 +1596,8 @@ fn comment_box_line(
             let content = vec![Span::styled(shown, Style::new().fg(theme.fg))];
             comment_box_content_line(content, budget, border, hot, theme)
         }
+        // スレッド間の間隔用の空行（unified/split どちらも空行のまま）。
+        CommentRowKind::Spacer => Line::raw(""),
     }
 }
 
@@ -1684,7 +1697,10 @@ fn comment_box_content_line(
     spans.push(Span::styled(" │".to_string(), border));
     let line = Line::from(spans);
     if hot {
-        line.style(Style::new().bg(theme.selection_bg))
+        // 全テーマで selection_bg == accent == info のため、bg だけを Line style で上書きすると
+        // marker/author/リンク（accent/info の fg。span 個別 style が優先される）が背景に溶ける。
+        // `highlighted_diff_line` と同じく全 span の fg/bg を選択色へ上書きする。
+        highlighted_diff_line(&line, theme)
     } else {
         line
     }
@@ -2726,6 +2742,7 @@ fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("m", "Merged"),
             ("d", "Declined"),
             ("a", "All"),
+            ("f", "フィルタ"),
             ("r", "再読込"),
             ("P", "パイプライン"),
             ("b", "ブランチ"),
@@ -2854,20 +2871,24 @@ fn render_hints(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = app.theme;
     let mut spans = Vec::new();
     let mut x = area.x;
+    let right = area.x.saturating_add(area.width);
     for (index, (key, description)) in hint_entries(screen).iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::raw("  "));
-            x = x.saturating_add(2);
-        }
+        let sep_width: u16 = if index > 0 { 2 } else { 0 };
         let item_width = UnicodeWidthStr::width(format!("{key} {description}").as_str())
             .min(usize::from(u16::MAX)) as u16;
-        let visible_width = item_width.min(area.x.saturating_add(area.width).saturating_sub(x));
-        if visible_width > 0 {
-            app.layout.hints.push(HintLayout {
-                area: Rect::new(x, area.y, visible_width, area.height),
-                key: hint_key(key),
-            });
+        // 次のエントリが（区切りを含めて）丸ごと収まらなければ、そこで打ち切る
+        // （部分描画も省略記号も出さない。描画されないエントリはクリック不可のまま）。
+        if x.saturating_add(sep_width).saturating_add(item_width) > right {
+            break;
         }
+        if index > 0 {
+            spans.push(Span::raw("  "));
+            x = x.saturating_add(sep_width);
+        }
+        app.layout.hints.push(HintLayout {
+            area: Rect::new(x, area.y, item_width, area.height),
+            key: hint_key(key),
+        });
         x = x.saturating_add(item_width);
         spans.push(Span::styled(*key, Style::new().fg(theme.accent)));
         spans.push(Span::raw(" "));
@@ -2903,16 +2924,26 @@ fn hint_key(label: &str) -> KeyEvent {
 fn render_comment_editor(frame: &mut Frame, area: Rect, editor: &CommentEditor, theme: &Theme) {
     frame.render_widget(Clear, area);
 
+    let (cursor_line, cursor_col) = editor.cursor_line_col();
     let mut lines: Vec<Line> = if editor.text.is_empty() {
-        vec![Line::from(Span::styled(
-            "（コメントを入力）",
-            Style::new().dim(),
-        ))]
+        // 空のときは反転空白カーソルを先頭に置き、プレースホルダを続ける
+        // （Onboarding の `input_spans` と同じ視覚方式）。
+        vec![Line::from(vec![
+            Span::styled(" ", Style::new().reversed()),
+            Span::styled("（コメントを入力）", Style::new().dim()),
+        ])]
     } else {
         editor
             .text
             .split('\n')
-            .map(|raw| Line::raw(raw.to_string()))
+            .enumerate()
+            .map(|(index, raw)| {
+                if index == cursor_line {
+                    editor_line_with_cursor(raw, cursor_col)
+                } else {
+                    Line::raw(raw.to_string())
+                }
+            })
             .collect()
     };
     lines.push(Line::raw(""));
@@ -2948,6 +2979,29 @@ fn render_comment_editor(frame: &mut Frame, area: Rect, editor: &CommentEditor, 
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+/// コメントエディタのカーソル行を組む。カーソル位置（char 単位の列）の 1 文字を反転し、
+/// 行末（その行の文字数と同位置）なら反転空白を 1 個足す。折返し（`Wrap`）は span 単位で
+/// 維持されるため、反転 span を付けるだけで折返し後も正しい位置に出る。
+fn editor_line_with_cursor(raw: &str, cursor_col: usize) -> Line<'static> {
+    let chars: Vec<char> = raw.chars().collect();
+    let col = cursor_col.min(chars.len());
+    let before: String = chars[..col].iter().collect();
+    if col < chars.len() {
+        let at = chars[col].to_string();
+        let after: String = chars[col + 1..].iter().collect();
+        Line::from(vec![
+            Span::raw(before),
+            Span::styled(at, Style::new().reversed()),
+            Span::raw(after),
+        ])
+    } else {
+        Line::from(vec![
+            Span::raw(before),
+            Span::styled(" ".to_string(), Style::new().reversed()),
+        ])
+    }
 }
 
 fn render_merge_modal(
@@ -3012,6 +3066,104 @@ fn render_merge_modal(
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// PR フィルタモーダル（`f`）。上段は state のチェックボックス（Space でトグル）、下段は
+/// author の単一選択（カーソル位置＝選択）。フォーカス中セクションの見出しを強調し、
+/// カーソル行に `▶` を出す。author 候補が多い場合はカーソルに追従する窓で切り出す。
+fn render_pr_filter_modal(frame: &mut Frame, area: Rect, modal: &PrFilterModal, theme: &Theme) {
+    frame.render_widget(Clear, area);
+
+    let states_focused = modal.section == PrFilterSection::States;
+    let section_style = |focused: bool| {
+        if focused {
+            Style::new().fg(theme.accent).bold()
+        } else {
+            Style::new().fg(theme.muted).bold()
+        }
+    };
+
+    let mut lines = vec![Line::from(Span::styled(
+        "State",
+        section_style(states_focused),
+    ))];
+    for (index, state) in PrState::ALL.iter().enumerate() {
+        let checkbox = if modal.states.contains(state) {
+            "[x]"
+        } else {
+            "[ ]"
+        };
+        let hot = states_focused && index == modal.state_cursor;
+        lines.push(pr_filter_row(
+            hot,
+            &format!("{checkbox} {}", state.api_value()),
+            theme,
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Author",
+        section_style(!states_focused),
+    )));
+
+    match &modal.authors {
+        None => lines.push(Line::from(Span::styled(
+            "    読み込み中…",
+            Style::new().fg(theme.muted),
+        ))),
+        Some(authors) => {
+            // 固定行: 枠 2 + ここまでに積んだ行（State 見出し + state + 空行 + Author 見出し）
+            // + この後に積む行（空行 + キー案内）2。残りを author 行の窓にする。
+            let fixed_rows = 2 + lines.len() + 2;
+            let capacity = usize::from(area.height).saturating_sub(fixed_rows).max(1);
+            let total_rows = authors.len() + 1;
+            let start = modal
+                .author_cursor
+                .saturating_sub(capacity.saturating_sub(1));
+            for row in start..total_rows.min(start + capacity) {
+                let radio = if row == modal.author_cursor {
+                    "(x)"
+                } else {
+                    "( )"
+                };
+                let label = if row == 0 {
+                    "All authors"
+                } else {
+                    authors
+                        .get(row - 1)
+                        .map(|author| author.display_name.as_str())
+                        .unwrap_or("?")
+                };
+                let hot = !states_focused && row == modal.author_cursor;
+                lines.push(pr_filter_row(hot, &format!("{radio} {label}"), theme));
+            }
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "↑↓/jk: 移動   Space: 切替   Tab: セクション   Enter: 適用   Esc: 取消",
+        Style::new().dim(),
+    )));
+
+    // 非破壊的な入力オーバーレイなのでフォーカス色の枠線（コメントエディタと同じ方針）。
+    let block = rounded_block(theme, theme.border_focus)
+        .title(" PR フィルタ ")
+        .style(Style::new().bg(theme.bg));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// フィルタモーダルの 1 行（カーソル行は `▶` マーカー + 強調色）。
+fn pr_filter_row(hot: bool, label: &str, theme: &Theme) -> Line<'static> {
+    let marker = if hot { "▶ " } else { "  " };
+    let style = if hot {
+        Style::new().fg(theme.accent).bold()
+    } else {
+        Style::new()
+    };
+    Line::from(vec![
+        Span::styled(marker, Style::new().fg(theme.accent)),
+        Span::styled(label.to_string(), style),
+    ])
+}
+
 fn render_help(frame: &mut Frame, area: Rect, screen: Screen, theme: &Theme) {
     frame.render_widget(Clear, area);
 
@@ -3057,6 +3209,8 @@ fn render_help(frame: &mut Frame, area: Rect, screen: Screen, theme: &Theme) {
             "m              状態フィルタ: Merged",
             "d              状態フィルタ: Declined",
             "a              状態フィルタ: All",
+            "f              フィルタモーダル（state 複数選択 + author。↑↓/jk 移動,",
+            "               Space 切替, Tab セクション, Enter 適用, Esc 取消）",
             "r              再読込（現在ページ）",
             "Enter          PR 詳細を開く",
             "P              パイプライン一覧を開く",
@@ -3744,6 +3898,106 @@ mod tests {
             !content.contains("done"),
             "body should be hidden: {content}"
         );
+    }
+
+    #[test]
+    fn comment_box_line_spacer_is_blank() {
+        let theme = Theme::default();
+        let row = CommentRow {
+            thread_root: 1,
+            comment_id: None,
+            kind: CommentRowKind::Spacer,
+        };
+        let line = comment_box_line(&row, 30, &theme, None, None, 0);
+        assert_eq!(line.width(), 0, "Spacer は空行として描画する");
+    }
+
+    #[test]
+    fn hot_comment_header_overrides_all_spans_with_selection_colors() {
+        // 全テーマで selection_bg == accent == info のため、bg 上書きだけだと
+        // marker/author（accent/info の span fg）が背景に溶ける。全 span の fg/bg が
+        // 選択色に上書きされることを確認する。
+        let parsed = parse_diff("diff --git a/x.rs b/x.rs\n@@ -0,0 +1 @@\n+new line\n");
+        let json = r#"{ "id": 1, "content": { "raw": "hi" },
+                        "user": { "display_name": "Bob" }, "deleted": false,
+                        "created_on": "2026-05-27T00:00:00Z",
+                        "inline": { "path": "x.rs", "to": 1 } }"#;
+        let comment: Comment = serde_json::from_str(json).expect("valid inline comment json");
+        let comment_layout = build_comment_layout(&parsed, &[comment], &Default::default());
+        let mut diff = DiffState {
+            parsed,
+            viewport: 12,
+            view_mode: DiffViewMode::Unified,
+            comment_layout,
+            ..Default::default()
+        };
+        diff.rebuild_display_rows();
+        // Header は Diff0..Diff2, Top(3) の次 = 表示行 4。
+        diff.cursor = 4;
+        let theme = Theme::default();
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                render_diff_body(frame, frame.area(), &mut diff, &theme);
+            })
+            .expect("draw succeeds");
+        let buffer = terminal.backend().buffer();
+        let (bx, by) = find_text_position(buffer, "Bob").expect("author drawn");
+        for offset in 0..3 {
+            let cell = buffer.cell((bx + offset, by)).expect("author cell");
+            assert_eq!(
+                cell.fg, theme.selection_fg,
+                "著者 span の fg も上書きされる"
+            );
+            assert_eq!(cell.bg, theme.selection_bg);
+        }
+        // ボックス左枠 span も同様（diff 行ハイライトと同じ見た目）。位置はペイン枠 1 +
+        // パディング 1 の直後 = x 2（`collect_action_hits` の座標規約と同じ）。
+        let border_cell = buffer.cell((2, by)).expect("border cell");
+        assert_eq!(border_cell.symbol(), "│");
+        assert_eq!(border_cell.fg, theme.selection_fg);
+        assert_eq!(border_cell.bg, theme.selection_bg);
+    }
+
+    #[test]
+    fn hot_collapsed_row_overrides_all_spans_with_selection_colors() {
+        let parsed = parse_diff("diff --git a/x.rs b/x.rs\n@@ -0,0 +1 @@\n+new line\n");
+        let json = r#"{ "id": 1, "content": { "raw": "done" },
+                        "user": { "display_name": "Bob" }, "deleted": false,
+                        "created_on": "2026-05-27T00:00:00Z",
+                        "inline": { "path": "x.rs", "to": 1 },
+                        "resolution": {} }"#;
+        let comment: Comment = serde_json::from_str(json).expect("valid resolved comment json");
+        let comment_layout = build_comment_layout(&parsed, &[comment], &Default::default());
+        let mut diff = DiffState {
+            parsed,
+            viewport: 12,
+            view_mode: DiffViewMode::Unified,
+            comment_layout,
+            ..Default::default()
+        };
+        diff.rebuild_display_rows();
+        // Collapsed 行は Diff0..Diff2 の次 = 表示行 3。
+        diff.cursor = 3;
+        let theme = Theme::default();
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                render_diff_body(frame, frame.area(), &mut diff, &theme);
+            })
+            .expect("draw succeeds");
+        let buffer = terminal.backend().buffer();
+        let (rx, ry) = find_text_position(buffer, "resolved").expect("collapsed row drawn");
+        for offset in 0..8 {
+            let cell = buffer.cell((rx + offset, ry)).expect("collapsed cell");
+            assert_eq!(
+                cell.fg, theme.selection_fg,
+                "Collapsed の fg も上書きされる"
+            );
+            assert_eq!(cell.bg, theme.selection_bg);
+        }
     }
 
     #[test]
@@ -5088,5 +5342,214 @@ mod tests {
                 "{screen:?} の S が誤って並び替えと表示されています"
             );
         }
+    }
+
+    #[test]
+    fn render_hints_stops_at_entry_boundary_when_width_is_narrow() {
+        let entries = hint_entries(Screen::ImageView);
+        let first = entries.first().expect("entries non-empty");
+        let first_width =
+            UnicodeWidthStr::width(format!("{} {}", first.0, first.1).as_str()) as u16;
+        // 1 個目は丸ごと収まり、2 個目は（区切り 2 桁を含めて）1 文字も収まらない幅。
+        let width = first_width + 3;
+        let mut app = App::new(crate::config::Config::default(), None);
+        app.theme = Theme::default();
+        app.screen = Screen::ImageView;
+
+        let backend = TestBackend::new(width, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| render_hints(frame, frame.area(), &mut app))
+            .expect("draw succeeds");
+
+        // `buffer_text` は全角文字をセル単位で空白区切りに展開するため、空白を除いて照合する。
+        let compact = buffer_text(terminal.backend().buffer()).replace(' ', "");
+        assert!(
+            compact.contains("前/次の画像"),
+            "先頭エントリは丸ごと描画される: {compact}"
+        );
+        // 2 個目（"Esc 戻る"）は部分描画もされない（旧実装では "E" だけ残っていた）。
+        assert!(
+            !compact.contains('E'),
+            "収まらないエントリは 1 文字も描画しない: {compact}"
+        );
+        // ヒットボックスも描画されたエントリぶんだけ登録される。
+        assert_eq!(app.layout.hints.len(), 1);
+    }
+
+    #[test]
+    fn render_comment_editor_reverses_char_under_cursor() {
+        let theme = Theme::default();
+        let editor = CommentEditor {
+            text: "ab".to_string(),
+            cursor: 1, // 'b' の上
+            ..Default::default()
+        };
+        let backend = TestBackend::new(30, 6);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| render_comment_editor(frame, frame.area(), &editor, &theme))
+            .expect("draw succeeds");
+        let buffer = terminal.backend().buffer();
+        let (x, y) = find_text_position(buffer, "ab").expect("text drawn");
+        let at = buffer.cell((x + 1, y)).expect("cursor cell");
+        assert!(
+            at.modifier.contains(Modifier::REVERSED),
+            "カーソル位置の 1 文字が反転表示される"
+        );
+        let before = buffer.cell((x, y)).expect("before cell");
+        assert!(!before.modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn render_comment_editor_shows_reversed_space_cursor_at_text_end() {
+        let theme = Theme::default();
+        let editor = CommentEditor {
+            text: "ab".to_string(),
+            cursor: 2, // 行末（文字数と同位置）
+            ..Default::default()
+        };
+        let backend = TestBackend::new(30, 6);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| render_comment_editor(frame, frame.area(), &editor, &theme))
+            .expect("draw succeeds");
+        let buffer = terminal.backend().buffer();
+        let (x, y) = find_text_position(buffer, "ab").expect("text drawn");
+        // 'b' の直後に反転空白カーソル。
+        let cursor_cell = buffer.cell((x + 2, y)).expect("cursor cell");
+        assert!(cursor_cell.modifier.contains(Modifier::REVERSED));
+        assert_eq!(cursor_cell.symbol(), " ");
+    }
+
+    #[test]
+    fn render_registers_pr_filter_modal_and_title_shows_filter_label() {
+        use std::collections::BTreeSet;
+
+        use crate::config::Config;
+        use crate::tui::app::{PrAuthor, PrFilterModal, PrStateFilter};
+
+        let mut app = App::new(Config::default(), None);
+        app.theme = Theme::default();
+        app.screen = Screen::PullRequests;
+        app.pull_requests.set_items(vec![make_pr_with_participants(
+            r#"{ "id": 1, "title": "PR 1", "state": "OPEN", "participants": [] }"#,
+        )]);
+        app.pr_state_filter = PrStateFilter {
+            states: BTreeSet::from([PrState::Open, PrState::Merged]),
+            author: Some(PrAuthor {
+                uuid: "{u-1}".to_string(),
+                display_name: "Alice".to_string(),
+            }),
+        };
+        app.pr_filter_modal = Some(PrFilterModal {
+            section: PrFilterSection::States,
+            states: app.pr_state_filter.states.clone(),
+            state_cursor: 0,
+            author_cursor: 1,
+            authors: Some(vec![PrAuthor {
+                uuid: "{u-1}".to_string(),
+                display_name: "Alice".to_string(),
+            }]),
+        });
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("draw succeeds");
+
+        // モーダルは `app.layout.modal` に登録される（モーダル外クリック = Esc の既存機構）。
+        assert_eq!(
+            app.layout.modal.as_ref().map(|modal| modal.kind),
+            Some(ModalKind::PrFilter)
+        );
+        let compact = buffer_text(terminal.backend().buffer()).replace(' ', "");
+        // 一覧タイトルにフィルタ内容が出る。
+        assert!(
+            compact.contains("OPEN+MERGED,author:Alice"),
+            "タイトルにフィルタ内容が出ていない: {compact}"
+        );
+        // モーダルの構成要素（見出し・チェックボックス・All authors 行）。
+        assert!(compact.contains("PRフィルタ"));
+        assert!(compact.contains("Allauthors"));
+        assert!(compact.contains("[x]OPEN"));
+        // 空白除去後の未チェック表現（`[ ]` → `[]`）。
+        assert!(compact.contains("[]DECLINED"));
+    }
+
+    #[test]
+    fn render_pr_filter_modal_shows_loading_while_authors_are_none() {
+        use std::collections::BTreeSet;
+
+        use crate::tui::app::PrFilterModal;
+
+        let theme = Theme::default();
+        let modal = PrFilterModal {
+            section: PrFilterSection::Author,
+            states: BTreeSet::from([PrState::Open]),
+            state_cursor: 0,
+            author_cursor: 0,
+            authors: None,
+        };
+        let backend = TestBackend::new(50, 16);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| render_pr_filter_modal(frame, frame.area(), &modal, &theme))
+            .expect("draw succeeds");
+        let compact = buffer_text(terminal.backend().buffer()).replace(' ', "");
+        assert!(
+            compact.contains("読み込み中"),
+            "author 取得中は読み込み中表示: {compact}"
+        );
+    }
+
+    #[test]
+    fn render_pr_filter_modal_author_window_follows_cursor_with_fixed_rows_derived() {
+        use std::collections::BTreeSet;
+
+        use crate::tui::app::{PrAuthor, PrFilterModal};
+
+        let theme = Theme::default();
+        let authors: Vec<PrAuthor> = (0..20)
+            .map(|index| PrAuthor {
+                uuid: format!("{{u-{index}}}"),
+                display_name: format!("user{index:02}"),
+            })
+            .collect();
+        let modal = PrFilterModal {
+            section: PrFilterSection::Author,
+            states: BTreeSet::from([PrState::Open]),
+            state_cursor: 0,
+            author_cursor: 20, // 末尾の author（user19）。
+            authors: Some(authors),
+        };
+        // 高さ 16 = 固定行 11（枠 2 + State 見出し 1 + state 4 + 空行 1 + Author 見出し 1 +
+        // 空行 1 + キー案内 1）+ author 窓 5 行、の従来レイアウトを固定する回帰テスト。
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| render_pr_filter_modal(frame, frame.area(), &modal, &theme))
+            .expect("draw succeeds");
+        let compact = buffer_text(terminal.backend().buffer()).replace(' ', "");
+        // 窓はカーソルに追従し、末尾 5 件（user15..user19）だけが見える。
+        assert!(
+            compact.contains("(x)user19"),
+            "カーソル行が見えない: {compact}"
+        );
+        assert!(compact.contains("user15"), "窓の先頭が見えない: {compact}");
+        assert!(
+            !compact.contains("user14"),
+            "窓の外の候補が見えている: {compact}"
+        );
+        assert!(
+            !compact.contains("Allauthors"),
+            "窓の外の先頭行が見えている: {compact}"
+        );
+        // 窓の後ろに積むキー案内行も欠けずに描画される。
+        assert!(
+            compact.contains("Enter:適用"),
+            "キー案内が欠けた: {compact}"
+        );
     }
 }

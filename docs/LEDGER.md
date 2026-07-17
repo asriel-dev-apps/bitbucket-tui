@@ -113,6 +113,28 @@
 - **多角レビュー反映**: (1) 削除確認モーダルを `layout.modal` に登録し、表示中はモーダル外のアクションリンクを遮断（未登録だと確認待ちの裏で別コメントの Delete リンクが押せて誤削除し得た）。破壊的モーダルのクリック決定不可の対象にも追加。(2) スレッドの解決状態が変わったら折りたたみの手動上書きを破棄（展開したまま再解決しても自動コラプスへ戻る）。(3) 相対時刻を焼き込みから描画時整形へ変更（`CommentView.when` は生の created_on を保持し、`comment_box_line` が毎フレーム `format_when`。PR 詳細ペインと常に一致）。(4) `format_when` は 5 分を超える未来（時計ずれ超過）を「just now」にせず日付へフォールバック。(5) 返信ヘッダにカーソルがある状態で解決→自動コラプスされた場合、カーソルは同スレッドのコラプス行へ再アンカー（diff 行へ落ちて R の再トグルが効かなくなるのを防止）。🗨 の端末依存幅（絵文字表示端末で 2 セル描画され枠が 1 列ずれ得る）はアイコン選定時に合意済みのトレードオフとして許容。
 - テスト 527→543（時刻パース/ラベル構成/自動コラプス/トグル/クリックディスパッチ/描画/モーダルゲート/上書き破棄/再アンカー）。fmt/clippy(-D warnings)/test(--offline) green。**resolve/edit/delete の実 API 挙動は未検証の仮定のまま**。
 
+## M7 実装メモ (2026-07-17): コメント UI 磨き込み + PR フィルタ
+
+仕様書 `docs/specs/M7.md`。実装は 2 フェーズに分けて委譲し、フェーズ毎にゲート（fmt/clippy -D warnings/test --offline）を再実行して検収した。
+
+**Phase 1（コメント UI 磨き + キーヒント）**:
+- **スレッド間の空行**: `CommentRowKind::Spacer` を各スレッドブロック（Bottom / Collapsed）の直後に挿入。non-focusable（カーソルは素通り）・クリック no-op。Actions ヒットボックスの y は描画ループの viewport オフセット基準なので Spacer 挿入でもズレない。
+- **コメントエディタのカーソル**: `CommentEditor.cursor`（char 単位。byte スライス演算なし）。途中挿入/削除、Left/Right/Home/End/Up/Down（論理行。列 char 数維持・行長クランプ）。描画はカーソル位置の 1 文字を反転（行末は反転空白。Onboarding の `input_spans` と同方式）。
+- **選択ハイライトの可読化**: 真因は**全テーマで `selection_bg == accent == info`（同色）**で、hot 時に bg だけ上書きしていたため marker/著者名/リンクが背景に溶けていた。`highlighted_diff_line`（bg+fg を span 単位で上書き）へ寄せて解消。theme 定義は不変。
+- **キーヒントのはみ出し**: `render_hints` が累積幅を追い、丸ごと収まらないエントリで break（部分描画なし）。ヒットボックスも同じ break に従い、描画とクリック判定が一致。
+- テスト 543→556。
+
+**Phase 2（PR フィルタ）**:
+- **フィルタ構造体**: `PrStateFilter` を enum から `states: BTreeSet<PrState>` + `author: Option<PrAuthor{uuid, display_name}>` の構造体へ（Ord 導出で表示/クエリ/キャッシュキーの順序が安定）。`o`/`m`/`d`/`a` は集合への写像で維持（author は維持し、解除はモーダルの All authors で）。
+- **クエリ構築（事前に公開リポジトリで実測して決定）**: author 無し → 従来の `state` 繰り返し。author 有り → `q=state IN ("OPEN",..) AND author.uuid="{uuid}"` に一本化し **`state` パラメータは付けない**（**実測: `q` と `state` を併用すると `state` が黙って無視される**。未文書化挙動）。`sort` は常時併用。エンコードは reqwest の `.query()` に委譲（手組み URL なし）。
+- **`f` フィルタモーダル**: State チェックボックス + Author リスト（All authors + 候補）。`↑↓/jk`・`Space` トグル・`Tab` セクション移動・`Enter` 適用（空 states は拒否）・`Esc` 取消。`layout.modal` 登録でモーダル外クリック=Esc。
+- **author 候補**: `GET /2.0/workspaces/{workspace}/members`（`values[].user`、ページング追従）をモーダル初回表示時に遅延取得し、**成功時のみ**ワークスペース単位でキャッシュ（失敗を恒久化しない）。失敗時は読み込み済み PR の author（uuid 有りのみ・重複排除・表示名昇順）へフォールバック。
+- **キャッシュ/永続化**: `PullRequestsCache` のキーへフィルタ全体を追加（フィルタ切替での誤表示防止）。states は config.toml `pr_states` に永続化（不正値は読み込み時に無視、空なら既定 OPEN）。author はセッション内のみ。
+- テスト 556→577。
+- **未検証の仮定（実 token 未検証。読み取り系のため実機確認はユーザーに委ねる）**: (a) members API の応答形が `values[].user` で uuid/display_name を含むこと。(b) `q=state IN (...) AND author.uuid="{uuid}"` の実挙動（公開リポジトリでは実測済みだが、認証付き・別リポジトリでの挙動は未確認）。(c) reqwest のフォームエンコード（空白→`+`）を Bitbucket が受理すること。
+- **既知の上限（設計どおり）**: author 候補のメンバー取得はページング上限（20 ページ × 100 件 = 2000 人）で打ち切る（既存 `paginate` の安全上限。超過分は候補に出ないが、フォールバック（読み込み済み PR の著者）と併せて実用上は足りる想定）。
+- **多角レビュー反映**: (1) Ctrl+K ジャンプパレットのガードに削除確認モーダル/ページジャンプを追加（漏れていると削除確認の裏でパレットが開き、画面遷移後の Enter が誤削除になり得た）。(2) フィルタモーダルで author 候補の読み込み中に Enter しても現用 author を維持（states のみ適用）。候補に現用 author が無い場合は挿入してカーソルを合わせる（作業コピー限定でキャッシュは汚さない）。(3) author のリセットは「repo コンテキストが実際に変わるとき」に統一（ジャンプパレット経由の別 repo 移動でもリセット。同一 repo 再入場では維持）。(4) members 失敗時のフォールバック候補は現在 repo のキャッシュ全エントリ（全フィルタ・全ページ）から集約（フィルタ適用中に候補が痩せない）。(5) 単一ページ GET 経路を `fetch_single_page`（所有クエリ）へ一本化・フィルタモーダルの高さ定数を導出化。
+
 ## 画像表示 実装メモ (2026-07-11)
 
 - **ratatui-image のバージョン非互換（着手前の精読で発覚）**: `vendor/ratatui-image/Cargo.toml` は `ratatui = "^0.30.1"`(`default-features=false, features=[]`)に依存し、`cargo tree -e features -p ratatui-image`/`cargo tree --invert ratatui@0.30.2` で確認すると `ratatui@0.30.2` が本クレートの `ratatui@0.29.0`（直接依存）とは別インスタンスとして解決される（`vendor/` にも `ratatui-0.29.0`/`ratatui`(=0.30.2 相当。新しい ratatui は `ratatui-core`/`ratatui-widgets`/`ratatui-crossterm` 等に分割された facade クレート) の 2 系統が実在）。`ratatui_image::Image`/`StatefulImage` はいずれも 0.30 系の `ratatui::widgets::{Widget,StatefulWidget}` を実装しており、`f.render_widget`/`f.render_stateful_widget`（本クレートの 0.29 系 `Frame`）へ渡すには 0.30 系の `Buffer`/`Rect` を経由する必要があるが、`ratatui-image` は `pub use ratatui;` のような再エクスポートをしていない。したがって呼び出し側が 0.30 系の型を名指しするには、Cargo.toml に `ratatui`（0.30 系）を別名で追加依存する以外に方法が無い。これは本依頼のゲート「Cargo.toml は `image` 追加以外変更しない」に反するため、**`StatefulImage`/`Image` ウィジェットは不採用**とした。同様の理由（クレート境界を跨いだ型の名指しが必要）で `Resize::resize`/`Picker::new_protocol`/`new_resize_protocol` 等、`ratatui::layout::{Rect,Size}` を引数に取る API も使っていない。

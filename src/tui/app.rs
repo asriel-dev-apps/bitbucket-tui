@@ -3,7 +3,7 @@
 //! bubbletea の `Model`/`Msg`/`Cmd` に相当する構造。`update()` は状態を更新し、副作用を
 //! [`Command`] として返す。実際の非同期実行（API 呼び出しの spawn）は `event` モジュールが行う。
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use image::DynamicImage;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
@@ -103,6 +103,7 @@ pub enum ModalKind {
     PageJump,
     LinkPalette,
     JumpPalette,
+    PrFilter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,37 +174,212 @@ pub struct LinkPalette {
     pub links: SelectList<DetailLink>,
 }
 
-/// PR 一覧の state フィルタ。
+/// PR の状態（一覧フィルタの選択肢）。
 ///
-/// `Hash` は PR 一覧キャッシュ（[`RevisitCache`]）のキーの一部として使うために導出する。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PrStateFilter {
+/// `Ord` は `BTreeSet` 内の順序（＝クエリ順・表示順）を宣言順（OPEN → MERGED → DECLINED →
+/// SUPERSEDED）に固定するために導出する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PrState {
     Open,
     Merged,
     Declined,
-    All,
+    Superseded,
+}
+
+impl PrState {
+    /// フィルタモーダルの表示順（`Ord`＝`BTreeSet` の走査順と一致させる）。
+    pub const ALL: [PrState; 4] = [
+        PrState::Open,
+        PrState::Merged,
+        PrState::Declined,
+        PrState::Superseded,
+    ];
+
+    /// API へ渡す `state` 値（config.toml への保存値も同じ文字列）。
+    pub fn api_value(self) -> &'static str {
+        match self {
+            PrState::Open => "OPEN",
+            PrState::Merged => "MERGED",
+            PrState::Declined => "DECLINED",
+            PrState::Superseded => "SUPERSEDED",
+        }
+    }
+
+    /// 設定ファイルの文字列から解釈する（未知の値は `None`）。
+    pub fn from_config_str(value: &str) -> Option<PrState> {
+        PrState::ALL
+            .iter()
+            .copied()
+            .find(|state| state.api_value() == value)
+    }
+}
+
+/// PR 一覧の author フィルタ候補（`uuid` を `q` フィルタに渡し、`display_name` を UI に出す）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PrAuthor {
+    pub uuid: String,
+    pub display_name: String,
+}
+
+/// PR 一覧のフィルタ（state の複数選択 + author）。
+///
+/// `Hash` は PR 一覧キャッシュ（[`RevisitCache`]）のキーの一部として使うために導出する。
+/// `states` は空にしない（フィルタモーダルが空集合の適用を拒否する。空のまま送ると
+/// Bitbucket 既定＝OPEN のみになり表示と食い違うため）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PrStateFilter {
+    pub states: BTreeSet<PrState>,
+    /// author フィルタ。リポジトリ/ワークスペース依存のためセッション内のみ（保存しない）。
+    pub author: Option<PrAuthor>,
+}
+
+impl Default for PrStateFilter {
+    /// 既定は OPEN のみ・author なし。
+    fn default() -> Self {
+        Self::only(PrState::Open)
+    }
 }
 
 impl PrStateFilter {
-    /// API へ渡す `state` 値の並び（`All` は全状態を明示）。
-    pub fn states(self) -> &'static [&'static str] {
-        match self {
-            PrStateFilter::Open => &["OPEN"],
-            PrStateFilter::Merged => &["MERGED"],
-            PrStateFilter::Declined => &["DECLINED"],
-            PrStateFilter::All => &["OPEN", "MERGED", "DECLINED", "SUPERSEDED"],
+    /// 単一 state のみのフィルタ（`o`/`m`/`d` 単発キーの写像）。
+    pub fn only(state: PrState) -> Self {
+        Self {
+            states: BTreeSet::from([state]),
+            author: None,
         }
     }
 
-    /// UI 表示ラベル。
-    pub fn label(self) -> &'static str {
-        match self {
-            PrStateFilter::Open => "OPEN",
-            PrStateFilter::Merged => "MERGED",
-            PrStateFilter::Declined => "DECLINED",
-            PrStateFilter::All => "ALL",
+    /// 全 state のフィルタ（`a`（All）キーの写像）。
+    pub fn all() -> Self {
+        Self {
+            states: BTreeSet::from(PrState::ALL),
+            author: None,
         }
     }
+
+    /// config.toml の保存値（state 文字列の配列）から復元する。不正値は無視し、1 つも
+    /// 残らなければ既定（OPEN のみ）に落とす。author は保存しないため常に `None`。
+    pub fn from_config(states: Option<&[String]>) -> Self {
+        let parsed: BTreeSet<PrState> = states
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|value| PrState::from_config_str(value))
+            .collect();
+        if parsed.is_empty() {
+            Self::default()
+        } else {
+            Self {
+                states: parsed,
+                author: None,
+            }
+        }
+    }
+
+    /// config.toml への保存値（state 文字列の配列、`BTreeSet` の順）。
+    pub fn config_states(&self) -> Vec<String> {
+        self.states
+            .iter()
+            .map(|state| state.api_value().to_string())
+            .collect()
+    }
+
+    /// API へ渡す `state` 値の並び（`BTreeSet` の `Ord` 順で安定）。
+    pub fn state_values(&self) -> Vec<&'static str> {
+        self.states.iter().map(|state| state.api_value()).collect()
+    }
+
+    /// author の uuid（`q` フィルタ用）。
+    pub fn author_uuid(&self) -> Option<&str> {
+        self.author.as_ref().map(|author| author.uuid.as_str())
+    }
+
+    /// UI 表示ラベル（例: `OPEN+MERGED, author: Alice`。全 state 選択時は `ALL`）。
+    pub fn label(&self) -> String {
+        let states = if self.states.len() == PrState::ALL.len() {
+            "ALL".to_string()
+        } else {
+            self.state_values().join("+")
+        };
+        match &self.author {
+            Some(author) => format!("{states}, author: {}", author.display_name),
+            None => states,
+        }
+    }
+}
+
+/// PR フィルタモーダルのフォーカス中セクション（`Tab` で移動）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrFilterSection {
+    States,
+    Author,
+}
+
+/// PR フィルタモーダル（`f`）の状態。`Enter` で適用するまで [`App::pr_state_filter`] には
+/// 反映しない（作業コピー）。
+#[derive(Debug)]
+pub struct PrFilterModal {
+    pub section: PrFilterSection,
+    /// state チェックボックスの作業コピー。
+    pub states: BTreeSet<PrState>,
+    /// State セクションのカーソル（[`PrState::ALL`] のインデックス）。
+    pub state_cursor: usize,
+    /// Author セクションのカーソル（0 = All authors、`1..` = `authors[i-1]`）。
+    /// Author セクションは単一選択のため、カーソル位置がそのまま選択を表す。
+    pub author_cursor: usize,
+    /// author 候補（`None` は読み込み中）。
+    pub authors: Option<Vec<PrAuthor>>,
+}
+
+/// 現在適用中の author が候補（uuid 照合）に無ければ挿入する（表示名の大文字小文字を
+/// 無視した昇順 = [`members_to_authors`] の並びを維持）。メンバー API の結果や
+/// フォールバック候補に現用 author が含まれない場合（脱退済みメンバー等）でも、
+/// モーダル上で現在の選択が見え、そのまま維持・解除できるようにするため。
+fn insert_current_author(authors: &mut Vec<PrAuthor>, current: Option<&PrAuthor>) {
+    let Some(current) = current else {
+        return;
+    };
+    if authors.iter().any(|author| author.uuid == current.uuid) {
+        return;
+    }
+    let key = current.display_name.to_lowercase();
+    let index = authors.partition_point(|author| author.display_name.to_lowercase() <= key);
+    authors.insert(index, current.clone());
+}
+
+/// モーダルの author カーソル初期位置（現在のフィルタの author が候補にあればその行、
+/// 無ければ 0 = All authors）。
+fn author_cursor_for(authors: Option<&[PrAuthor]>, current: Option<&PrAuthor>) -> usize {
+    let (Some(authors), Some(current)) = (authors, current) else {
+        return 0;
+    };
+    authors
+        .iter()
+        .position(|author| author.uuid == current.uuid)
+        .map_or(0, |index| index + 1)
+}
+
+/// ユーザー一覧を author 候補へ変換する（uuid 無しは除外、uuid で重複排除、表示名の
+/// 大文字小文字を無視した昇順）。メンバー API の結果と、取得失敗時の「読み込み済み PR の
+/// author」フォールバックの双方で使う共通経路。
+fn members_to_authors(users: Vec<User>) -> Vec<PrAuthor> {
+    let mut seen = HashSet::new();
+    let mut authors: Vec<PrAuthor> = users
+        .into_iter()
+        .filter_map(|user| {
+            let uuid = user.uuid?;
+            if !seen.insert(uuid.clone()) {
+                return None;
+            }
+            let display_name = user.display_name.unwrap_or_else(|| uuid.clone());
+            Some(PrAuthor { uuid, display_name })
+        })
+        .collect();
+    authors.sort_by(|a, b| {
+        a.display_name
+            .to_lowercase()
+            .cmp(&b.display_name.to_lowercase())
+    });
+    authors
 }
 
 /// 現在ログイン中のユーザー識別子（自分の承認状態を判定するために使う）。
@@ -316,6 +492,9 @@ pub struct DeleteCommentModal {
 #[derive(Debug, Clone, Default)]
 pub struct CommentEditor {
     pub text: String,
+    /// `text` への挿入位置（**char 単位**、`0..=chars().count()`）。描画側はこの位置の
+    /// 1 文字を反転表示する。byte index ではないのでマルチバイト文字でも安全。
+    pub cursor: usize,
     pub submitting: bool,
     pub inline: Option<CommentAnchor>,
     /// `Some(root_id)` なら既存スレッドへの返信（`parent` を送る）。`inline` とは排他で使う。
@@ -327,6 +506,109 @@ pub struct CommentEditor {
 impl CommentEditor {
     fn is_submittable(&self) -> bool {
         !self.text.trim().is_empty()
+    }
+
+    /// カーソル（char 単位）に対応する byte 位置。挿入/削除はこの位置で行う。
+    fn cursor_byte(&self) -> usize {
+        self.text
+            .char_indices()
+            .nth(self.cursor)
+            .map(|(index, _)| index)
+            .unwrap_or(self.text.len())
+    }
+
+    /// カーソル位置に 1 文字挿入し、カーソルを右へ進める（改行も同じ経路）。
+    fn insert_char(&mut self, ch: char) {
+        let at = self.cursor_byte();
+        self.text.insert(at, ch);
+        self.cursor += 1;
+    }
+
+    /// カーソル直前の 1 文字を削除する（Backspace。先頭では何もしない）。
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        self.cursor -= 1;
+        let at = self.cursor_byte();
+        self.text.remove(at);
+    }
+
+    /// カーソルを 1 文字左へ。
+    fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    /// カーソルを 1 文字右へ（末尾でクランプ）。
+    fn move_right(&mut self) {
+        if self.cursor < self.text.chars().count() {
+            self.cursor += 1;
+        }
+    }
+
+    /// カーソルの (論理行, 行内 char 列)。描画側の反転位置決定にも使う。
+    pub fn cursor_line_col(&self) -> (usize, usize) {
+        let mut line = 0;
+        let mut col = 0;
+        for ch in self.text.chars().take(self.cursor) {
+            if ch == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        (line, col)
+    }
+
+    /// 各論理行の char 数（改行は含まない）。空文字でも 1 行（長さ 0）になる。
+    fn line_char_lens(&self) -> Vec<usize> {
+        self.text
+            .split('\n')
+            .map(|line| line.chars().count())
+            .collect()
+    }
+
+    /// 指定の (論理行, 列) に対応するカーソル位置（列は行長にクランプ）。
+    fn cursor_at(&self, target_line: usize, target_col: usize) -> usize {
+        let mut cursor = 0;
+        for (line, len) in self.line_char_lens().into_iter().enumerate() {
+            if line == target_line {
+                return cursor + target_col.min(len);
+            }
+            cursor += len + 1; // 改行 1 文字ぶん
+        }
+        self.text.chars().count()
+    }
+
+    /// カーソルを論理行の行頭へ（Home）。
+    fn move_line_home(&mut self) {
+        let (line, _) = self.cursor_line_col();
+        self.cursor = self.cursor_at(line, 0);
+    }
+
+    /// カーソルを論理行の行末へ（End）。
+    fn move_line_end(&mut self) {
+        let (line, _) = self.cursor_line_col();
+        self.cursor = self.cursor_at(line, usize::MAX);
+    }
+
+    /// カーソルを前の論理行へ（Up。列は char 数で維持し行長にクランプ。先頭行では何もしない）。
+    fn move_line_up(&mut self) {
+        let (line, col) = self.cursor_line_col();
+        if line == 0 {
+            return;
+        }
+        self.cursor = self.cursor_at(line - 1, col);
+    }
+
+    /// カーソルを次の論理行へ（Down。列は char 数で維持し行長にクランプ。最終行では何もしない）。
+    fn move_line_down(&mut self) {
+        let (line, col) = self.cursor_line_col();
+        if line + 1 >= self.line_char_lens().len() {
+            return;
+        }
+        self.cursor = self.cursor_at(line + 1, col);
     }
 
     /// インラインコメント用のエディタを作る（対象アンカー付き＝新規スレッド）。
@@ -345,9 +627,10 @@ impl CommentEditor {
         }
     }
 
-    /// 既存コメントの編集用エディタを作る（現在の本文をプリフィルする）。
+    /// 既存コメントの編集用エディタを作る（現在の本文をプリフィルし、カーソルは末尾）。
     fn edit(comment_id: u64, text: String) -> Self {
         Self {
+            cursor: text.chars().count(),
             text,
             editing: Some(comment_id),
             ..Self::default()
@@ -464,6 +747,8 @@ pub enum CommentRowKind {
         count: usize,
         resolved: bool,
     },
+    /// スレッドブロック直後の間隔用の空行（non-focusable。クリックは no-op）。
+    Spacer,
 }
 
 impl DisplayRow {
@@ -613,7 +898,7 @@ fn build_display_rows(
     rows
 }
 
-/// コラプス中のスレッドを 1 行で表す（Enter/クリックで展開）。
+/// コラプス中のスレッドを 1 行で表す（Enter/クリックで展開）。直後に間隔用の空行を挟む。
 fn push_collapsed_row(rows: &mut Vec<DisplayRow>, thread: &CommentThreadView) {
     let author = thread
         .comments
@@ -629,9 +914,20 @@ fn push_collapsed_row(rows: &mut Vec<DisplayRow>, thread: &CommentThreadView) {
             resolved: thread.resolved,
         },
     }));
+    push_spacer_row(rows, thread.root_id);
 }
 
-/// 1 スレッドを表示行列へ展開する（枠上 → 各コメントの[ヘッダ + 本文 + アクション行] → 枠下）。
+/// スレッドブロック直後の間隔用の空行を 1 行足す（次のスレッド/diff 行との密着を防ぐ）。
+fn push_spacer_row(rows: &mut Vec<DisplayRow>, thread_root: u64) {
+    rows.push(DisplayRow::Comment(CommentRow {
+        thread_root,
+        comment_id: None,
+        kind: CommentRowKind::Spacer,
+    }));
+}
+
+/// 1 スレッドを表示行列へ展開する（枠上 → 各コメントの[ヘッダ + 本文 + アクション行] → 枠下 →
+/// 間隔用の空行）。
 fn push_thread_rows(rows: &mut Vec<DisplayRow>, thread: &CommentThreadView) {
     rows.push(DisplayRow::Comment(CommentRow {
         thread_root: thread.root_id,
@@ -675,6 +971,7 @@ fn push_thread_rows(rows: &mut Vec<DisplayRow>, thread: &CommentThreadView) {
         comment_id: None,
         kind: CommentRowKind::Bottom,
     }));
+    push_spacer_row(rows, thread.root_id);
 }
 
 /// アクション行に表示するリンクの並び（描画とクリック判定で共有する）。
@@ -1475,7 +1772,9 @@ impl DiffState {
                 self.ensure_cursor_visible();
             }
             Some(DisplayRow::Comment(row)) => {
-                if matches!(row.kind, CommentRowKind::Collapsed { .. }) {
+                if matches!(row.kind, CommentRowKind::Spacer) {
+                    // スレッド間の空行は無操作（枠上下端の「スレッド先頭選択」に落とさない）。
+                } else if matches!(row.kind, CommentRowKind::Collapsed { .. }) {
                     // コラプス行のクリックは展開。
                     self.toggle_thread_collapse(row.thread_root);
                 } else if let Some(comment_id) = row.comment_id {
@@ -1581,6 +1880,14 @@ pub enum Msg {
         sort: ListSort,
         prs: Vec<PullRequest>,
         page_info: PageInfo,
+    },
+    /// ワークスペースメンバー（PR フィルタの author 候補）の取得完了/失敗。
+    ///
+    /// 失敗はフィルタモーダル内のフォールバック（読み込み済み PR の author）に切り替える
+    /// 材料になるため、`Msg::LoadFailed`（Status エラー表示）とは分けて運ぶ。
+    WorkspaceMembersLoaded {
+        workspace: String,
+        result: Result<Vec<User>, ApiError>,
     },
     /// PR 詳細の取得完了（承認状態の再反映にも使う）。
     PrDetailLoaded { id: u64, pr: Box<PullRequest> },
@@ -1692,6 +1999,11 @@ pub enum Command {
         filter: PrStateFilter,
         sort: ListSort,
         page: u32,
+    },
+    /// ワークスペースメンバー（PR フィルタの author 候補）を取得する。
+    LoadWorkspaceMembers {
+        client: BitbucketClient,
+        workspace: String,
     },
     /// PR 詳細を取得する。
     LoadPrDetail {
@@ -2222,6 +2534,12 @@ where
         self.map.insert(key, value);
     }
 
+    /// 全エントリを走査する（順序は不定）。キーの部分一致（例: repo slug）でページや
+    /// フィルタを跨いでエントリを集約したい場合に使う（[`App::loaded_pr_authors`] 参照）。
+    fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.map.iter()
+    }
+
     /// 述語 `keep` が `false` を返すキーをすべて取り除く。
     ///
     /// キーの一部（例: repo slug）だけが一致すればページ番号を問わず一括無効化したい場合に使う
@@ -2323,6 +2641,12 @@ pub struct App {
     /// （workspace をまたいだ同名 repo slug の衝突は既存ガードと同じ既知の制約）。
     pub pull_requests_cache: PullRequestsCache,
     pub pr_state_filter: PrStateFilter,
+    /// PR フィルタモーダル（`f`）。開いている間は最優先でキー入力を奪う。
+    pub pr_filter_modal: Option<PrFilterModal>,
+    /// ワークスペースメンバー（author 候補）のキャッシュ（キー = workspace slug）。
+    /// フィルタモーダルの初回表示時に遅延取得し、**成功時のみ**保存する（失敗時は読み込み済み
+    /// PR の author へのフォールバックを表示し、キャッシュしない＝次回開いたときに再試行する）。
+    pub workspace_members_cache: RevisitCache<String, Vec<PrAuthor>>,
     pub current_pr: Option<PullRequest>,
     /// PR 詳細の再訪キャッシュ（キー = (repo full_name, PR id)）。
     /// [`App::open_pr_detail_with`] が即時表示に使い、`Msg::PrDetailLoaded`/`DiffStatLoaded`/
@@ -2580,6 +2904,7 @@ impl App {
             .unwrap_or_default();
         let diff_sidebar_visible = config.diff_sidebar_visible.unwrap_or(true);
         let diff_sidebar_width = config.diff_sidebar_width;
+        let pr_state_filter = PrStateFilter::from_config(config.pr_states.as_deref());
         Self {
             screen: Screen::Onboarding,
             config,
@@ -2607,7 +2932,9 @@ impl App {
             pull_requests_sort: ListSort::default(),
             pull_requests_page_info: PageInfo::default(),
             pull_requests_cache: RevisitCache::default(),
-            pr_state_filter: PrStateFilter::Open,
+            pr_state_filter,
+            pr_filter_modal: None,
+            workspace_members_cache: RevisitCache::default(),
             current_pr: None,
             pr_detail_cache: RevisitCache::default(),
             diffstat: SelectList::default(),
@@ -2746,22 +3073,44 @@ impl App {
                 prs,
                 page_info,
             } => {
+                // 取得中に別 repo/フィルタ/ソート/ページへ切り替えていた場合は画面反映のみ
+                // 破棄する文脈ガード（キャッシュ挿入で filter を move する前に判定する）。
+                let fresh = self.repo_slug().as_deref() == Some(repo.as_str())
+                    && self.pr_state_filter == filter
+                    && self.pull_requests_sort == sort
+                    && self.pull_requests_page_info.page == page_info.page;
                 // 表示中かどうかに関わらずキャッシュは最新化する（他 repo/フィルタ/ページへ
                 // 切り替えていても、その結果は次回再訪時に活かす）。
                 self.pull_requests_cache.insert(
-                    (repo.clone(), filter, sort, page_info.page),
+                    (repo, filter, sort, page_info.page),
                     (prs.clone(), page_info),
                 );
-                if self.repo_slug().as_deref() == Some(repo.as_str())
-                    && self.pr_state_filter == filter
-                    && self.pull_requests_sort == sort
-                    && self.pull_requests_page_info.page == page_info.page
-                {
+                if fresh {
                     self.status = Status::Idle;
                     // 同一文脈への再検証: 選択位置は識別子（PR id）で追従する。
                     self.pull_requests
                         .set_items_keep_selection_by(prs, |pr| pr.id);
                     self.pull_requests_page_info = page_info;
+                }
+                Command::None
+            }
+            Msg::WorkspaceMembersLoaded { workspace, result } => {
+                match result {
+                    Ok(users) => {
+                        let authors = members_to_authors(users);
+                        // 表示中かどうかに関わらずキャッシュは最新化する（次回モーダルを
+                        // 開いたときの即時表示に活かす）。
+                        self.workspace_members_cache
+                            .insert(workspace.clone(), authors.clone());
+                        self.fill_pr_filter_modal_authors(&workspace, authors);
+                    }
+                    Err(error) => {
+                        // 権限等で取得できない場合は読み込み済み PR の author へフォール
+                        // バックする（キャッシュには入れない＝次回開いたときに再試行する）。
+                        tracing::warn!(%error, "ワークスペースメンバーの取得に失敗しました");
+                        let fallback = self.loaded_pr_authors();
+                        self.fill_pr_filter_modal_authors(&workspace, fallback);
+                    }
                 }
                 Command::None
             }
@@ -3149,6 +3498,9 @@ impl App {
             && self.comment_editor.is_none()
             && self.merge_modal.is_none()
             && self.confirm_modal.is_none()
+            && self.pr_filter_modal.is_none()
+            && self.delete_comment_modal.is_none()
+            && self.page_jump.is_none()
         {
             return self.open_jump_palette();
         }
@@ -3171,6 +3523,9 @@ impl App {
         }
         if self.confirm_modal.is_some() {
             return self.on_key_confirm_modal(key);
+        }
+        if self.pr_filter_modal.is_some() {
+            return self.on_key_pr_filter_modal(key);
         }
         if self.page_jump.is_some() {
             return self.on_key_page_jump(key);
@@ -4036,8 +4391,14 @@ impl App {
         }
     }
 
-    /// 選択リポジトリを確定する（`ws/repo` と既定ブランチを保持する）。
+    /// 選択リポジトリを確定する（`ws/repo` と既定ブランチを保持する）。repo コンテキストが
+    /// 実際に変わる場合は author フィルタをリセットする（author はリポジトリ/ワークスペース
+    /// 依存のため。`full_name` は workspace を含むので、この比較だけで別ワークスペースの
+    /// 同名 repo も区別できる。同一 repo の選び直しでは維持する）。
     fn select_repo(&mut self, repo: &Repository) {
+        if self.selected_repo.as_deref() != Some(repo.full_name.as_str()) {
+            self.pr_state_filter.author = None;
+        }
         self.selected_repo = Some(repo.full_name.clone());
         self.repo_main_branch = repo.main_branch_name().map(str::to_string);
     }
@@ -4063,10 +4424,13 @@ impl App {
         self.load_repositories_page(1)
     }
 
-    /// PR 一覧画面へ遷移し、OPEN の一覧の 1 ページ目取得を開始する。
+    /// PR 一覧画面へ遷移し、現在の state フィルタで 1 ページ目の取得を開始する。
+    ///
+    /// states は永続化された選択（config.toml）をそのまま使う。author はリポジトリ/
+    /// ワークスペース依存のため、repo コンテキストが実際に変わる場所でリセットする
+    /// （[`App::select_repo`]/[`App::jump_to_pr`]。同一 repo への再入場では維持する）。
     fn open_pull_requests(&mut self) -> Command {
         self.screen = Screen::PullRequests;
-        self.pr_state_filter = PrStateFilter::Open;
         self.current_pr = None;
         self.load_pull_requests_page(1)
     }
@@ -4085,8 +4449,9 @@ impl App {
             return Command::None;
         };
         let sort = self.pull_requests_sort;
+        let filter = self.pr_state_filter.clone();
 
-        let cache_key = (repo.clone(), self.pr_state_filter, sort, page);
+        let cache_key = (repo.clone(), filter.clone(), sort, page);
         match self.pull_requests_cache.get(&cache_key).cloned() {
             Some((cached, info)) => {
                 self.apply_pull_requests(cached, info);
@@ -4101,7 +4466,7 @@ impl App {
                 };
                 self.status = Status::Loading(format!(
                     "PR 一覧を取得中…（{}・{}・{page} ページ目）",
-                    self.pr_state_filter.label(),
+                    filter.label(),
                     sort.label()
                 ));
             }
@@ -4111,7 +4476,7 @@ impl App {
             client,
             workspace,
             repo,
-            filter: self.pr_state_filter,
+            filter,
             sort,
             page,
         }
@@ -4171,10 +4536,11 @@ impl App {
             KeyCode::Char('[') => self.prev_page(),
             KeyCode::Char(']') => self.next_page(),
             KeyCode::Char('g') => self.open_page_jump(),
-            KeyCode::Char('o') => self.set_pr_filter(PrStateFilter::Open),
-            KeyCode::Char('m') => self.set_pr_filter(PrStateFilter::Merged),
-            KeyCode::Char('d') => self.set_pr_filter(PrStateFilter::Declined),
-            KeyCode::Char('a') => self.set_pr_filter(PrStateFilter::All),
+            KeyCode::Char('o') => self.set_pr_states(BTreeSet::from([PrState::Open])),
+            KeyCode::Char('m') => self.set_pr_states(BTreeSet::from([PrState::Merged])),
+            KeyCode::Char('d') => self.set_pr_states(BTreeSet::from([PrState::Declined])),
+            KeyCode::Char('a') => self.set_pr_states(PrStateFilter::all().states),
+            KeyCode::Char('f') => self.open_pr_filter_modal(),
             KeyCode::Char('r') => self.reload_pull_requests(),
             KeyCode::Char('P') => {
                 self.browse_return = Screen::PullRequests;
@@ -4194,10 +4560,180 @@ impl App {
         }
     }
 
-    /// 状態フィルタを切り替え、1 ページ目から読み込み直す（新しいフィルタ文脈のため）。
+    /// state 集合だけを差し替え、1 ページ目から読み込み直す（`o`/`m`/`d`/`a` 単発キーの
+    /// 共通経路）。author フィルタは state とは独立の軸なので維持する（解除はフィルタ
+    /// モーダル（`f`）で All authors を選ぶ）。
+    fn set_pr_states(&mut self, states: BTreeSet<PrState>) -> Command {
+        self.set_pr_filter(PrStateFilter {
+            states,
+            author: self.pr_state_filter.author.clone(),
+        })
+    }
+
+    /// フィルタを切り替え、states を config.toml へ永続化し、1 ページ目から読み込み直す
+    /// （新しいフィルタ文脈のため）。単発キーとフィルタモーダル適用の共通経路。
     fn set_pr_filter(&mut self, filter: PrStateFilter) -> Command {
         self.pr_state_filter = filter;
+        self.persist_pr_states();
         self.load_pull_requests_page(1)
+    }
+
+    /// 現在の state フィルタ選択を config.toml へ保存する（author は保存しない）。
+    fn persist_pr_states(&mut self) {
+        self.config.pr_states = Some(self.pr_state_filter.config_states());
+        if let Err(error) = self.config.save() {
+            // 設定保存の失敗は致命ではない（他の config 保存箇所と同じ方針）。
+            tracing::warn!(%error, "PR state フィルタ設定の保存に失敗しました");
+        }
+    }
+
+    /// PR フィルタモーダル（`f`）を開く。author 候補はワークスペース単位のキャッシュが
+    /// あれば即表示し、無ければメンバー API の遅延取得を発行する（取得完了までは
+    /// 「読み込み中」表示）。
+    fn open_pr_filter_modal(&mut self) -> Command {
+        let mut authors = self
+            .selected_workspace
+            .as_ref()
+            .and_then(|workspace| self.workspace_members_cache.get(workspace).cloned());
+        if let Some(authors) = authors.as_mut() {
+            insert_current_author(authors, self.pr_state_filter.author.as_ref());
+        }
+        let author_cursor =
+            author_cursor_for(authors.as_deref(), self.pr_state_filter.author.as_ref());
+        let need_fetch = authors.is_none();
+        self.pr_filter_modal = Some(PrFilterModal {
+            section: PrFilterSection::States,
+            states: self.pr_state_filter.states.clone(),
+            state_cursor: 0,
+            author_cursor,
+            authors,
+        });
+        if need_fetch && let Some((client, workspace, _)) = self.review_context() {
+            return Command::LoadWorkspaceMembers { client, workspace };
+        }
+        Command::None
+    }
+
+    fn on_key_pr_filter_modal(&mut self, key: KeyEvent) -> Command {
+        let Some(modal) = self.pr_filter_modal.as_mut() else {
+            return Command::None;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                // 取消: 作業コピーを破棄し、現在のフィルタは変更しない。
+                self.pr_filter_modal = None;
+                Command::None
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                modal.section = match modal.section {
+                    PrFilterSection::States => PrFilterSection::Author,
+                    PrFilterSection::Author => PrFilterSection::States,
+                };
+                Command::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                match modal.section {
+                    PrFilterSection::States => {
+                        modal.state_cursor = (modal.state_cursor + 1).min(PrState::ALL.len() - 1);
+                    }
+                    PrFilterSection::Author => {
+                        // 行数は「All authors」+ 候補数（読み込み中は All authors のみ）。
+                        let last = modal.authors.as_ref().map_or(0, Vec::len);
+                        modal.author_cursor = (modal.author_cursor + 1).min(last);
+                    }
+                }
+                Command::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                match modal.section {
+                    PrFilterSection::States => {
+                        modal.state_cursor = modal.state_cursor.saturating_sub(1);
+                    }
+                    PrFilterSection::Author => {
+                        modal.author_cursor = modal.author_cursor.saturating_sub(1);
+                    }
+                }
+                Command::None
+            }
+            KeyCode::Char(' ') => {
+                // state のチェックボックスをトグルする（Author セクションでは何もしない。
+                // author はカーソル位置がそのまま単一選択のため）。
+                if modal.section == PrFilterSection::States
+                    && let Some(state) = PrState::ALL.get(modal.state_cursor).copied()
+                    && !modal.states.remove(&state)
+                {
+                    modal.states.insert(state);
+                }
+                Command::None
+            }
+            KeyCode::Enter => self.apply_pr_filter_modal(),
+            _ => Command::None,
+        }
+    }
+
+    /// フィルタモーダルの内容を適用する（`Enter`）。states が空なら Status エラーを出して
+    /// 適用しない（モーダルは開いたまま）。
+    fn apply_pr_filter_modal(&mut self) -> Command {
+        let Some(modal) = self.pr_filter_modal.as_ref() else {
+            return Command::None;
+        };
+        if modal.states.is_empty() {
+            self.status = Status::Error("state を 1 つ以上選択してください".to_string());
+            return Command::None;
+        }
+        let author = match modal.authors.as_deref() {
+            // 候補が未着（読み込み中）の間は author を選び直せないため、現在の author を
+            // 維持して states だけを適用する（黙って All authors へ落とさない）。
+            None => self.pr_state_filter.author.clone(),
+            Some(_) if modal.author_cursor == 0 => None,
+            Some(authors) => authors.get(modal.author_cursor - 1).cloned(),
+        };
+        let filter = PrStateFilter {
+            states: modal.states.clone(),
+            author,
+        };
+        self.pr_filter_modal = None;
+        self.set_pr_filter(filter)
+    }
+
+    /// メンバー取得結果（またはフォールバック）をフィルタモーダルの author 候補へ反映する。
+    /// 現在適用中の author が候補に無ければ挿入する（[`insert_current_author`]。モーダルの
+    /// 作業コピーのみで、[`App::workspace_members_cache`] には影響しない）。
+    ///
+    /// 取得中に別ワークスペースへ移動していた場合と、既に候補が入っている場合（キャッシュ
+    /// 命中で開き直した後に古い取得結果が届いた場合）は反映しない。
+    fn fill_pr_filter_modal_authors(&mut self, workspace: &str, mut authors: Vec<PrAuthor>) {
+        if self.selected_workspace.as_deref() != Some(workspace) {
+            return;
+        }
+        let current = self.pr_state_filter.author.clone();
+        if let Some(modal) = self.pr_filter_modal.as_mut()
+            && modal.authors.is_none()
+        {
+            insert_current_author(&mut authors, current.as_ref());
+            modal.author_cursor = author_cursor_for(Some(&authors), current.as_ref());
+            modal.authors = Some(authors);
+        }
+    }
+
+    /// 読み込み済み PR の author から候補を作る（メンバー API が使えないときの
+    /// フォールバック。uuid 無しの author は除外し、uuid で重複排除する）。
+    ///
+    /// 現在表示中の一覧だけでは author フィルタ適用済みの著者しか拾えず、フィルタ適用中に
+    /// モーダルを開き直すと候補が現用 author だけへ痩せてしまう。そのため現在 repo の
+    /// PR 一覧キャッシュ（[`App::pull_requests_cache`]、全フィルタ・全ソート・全ページ）を
+    /// 集約し、表示中の一覧（キャッシュ無効化直後の取りこぼし防止）も合わせて候補にする。
+    fn loaded_pr_authors(&self) -> Vec<PrAuthor> {
+        let repo = self.repo_slug();
+        let users: Vec<User> = self
+            .pull_requests_cache
+            .iter()
+            .filter(|((cached_repo, _, _, _), _)| Some(cached_repo.as_str()) == repo.as_deref())
+            .flat_map(|(_, (prs, _))| prs.iter())
+            .chain(self.pull_requests.items.iter())
+            .filter_map(|pr| pr.author.clone())
+            .collect();
+        members_to_authors(users)
     }
 
     /// PullRequests 一覧のサーバソートを次へ巡回し、1 ページ目から再取得する。
@@ -4435,6 +4971,15 @@ impl App {
         repo_full_name: String,
         pr: PullRequest,
     ) -> Command {
+        // repo コンテキストが実際に変わる場合は author フィルタをリセットする（author は
+        // リポジトリ/ワークスペース依存で、別ワークスペースの uuid が残留すると PR 一覧が
+        // 誤った author で絞られたままになる）。同一 repo へのジャンプでは維持する
+        // （[`App::select_repo`] と同じ方針）。
+        if self.selected_workspace.as_deref() != Some(workspace.as_str())
+            || self.selected_repo.as_deref() != Some(repo_full_name.as_str())
+        {
+            self.pr_state_filter.author = None;
+        }
         self.selected_workspace = Some(workspace);
         self.selected_repo = Some(repo_full_name);
         let Some((client, workspace, repo)) = self.review_context() else {
@@ -5052,7 +5597,7 @@ impl App {
                 if let Some(editor) = self.comment_editor.as_mut()
                     && !editor.submitting
                 {
-                    editor.text.push('\n');
+                    editor.insert_char('\n');
                 }
                 Command::None
             }
@@ -5060,7 +5605,43 @@ impl App {
                 if let Some(editor) = self.comment_editor.as_mut()
                     && !editor.submitting
                 {
-                    editor.text.pop();
+                    editor.backspace();
+                }
+                Command::None
+            }
+            KeyCode::Left => {
+                if let Some(editor) = self.comment_editor.as_mut() {
+                    editor.move_left();
+                }
+                Command::None
+            }
+            KeyCode::Right => {
+                if let Some(editor) = self.comment_editor.as_mut() {
+                    editor.move_right();
+                }
+                Command::None
+            }
+            KeyCode::Home => {
+                if let Some(editor) = self.comment_editor.as_mut() {
+                    editor.move_line_home();
+                }
+                Command::None
+            }
+            KeyCode::End => {
+                if let Some(editor) = self.comment_editor.as_mut() {
+                    editor.move_line_end();
+                }
+                Command::None
+            }
+            KeyCode::Up => {
+                if let Some(editor) = self.comment_editor.as_mut() {
+                    editor.move_line_up();
+                }
+                Command::None
+            }
+            KeyCode::Down => {
+                if let Some(editor) = self.comment_editor.as_mut() {
+                    editor.move_line_down();
                 }
                 Command::None
             }
@@ -5068,7 +5649,7 @@ impl App {
                 if let Some(editor) = self.comment_editor.as_mut()
                     && !editor.submitting
                 {
-                    editor.text.push(ch);
+                    editor.insert_char(ch);
                 }
                 Command::None
             }
@@ -7207,7 +7788,7 @@ mod tests {
             } => {
                 assert_eq!(workspace, "acme");
                 assert_eq!(repo, "widget");
-                assert_eq!(filter, PrStateFilter::Open);
+                assert_eq!(filter, PrStateFilter::only(PrState::Open));
             }
             other => panic!("expected LoadPullRequests, got {other:?}"),
         }
@@ -7217,11 +7798,11 @@ mod tests {
     fn pull_requests_loaded_sets_items_when_fresh() {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
-        app.pr_state_filter = PrStateFilter::Open;
+        app.pr_state_filter = PrStateFilter::only(PrState::Open);
         app.update(Msg::PullRequestsLoaded {
             sort: ListSort::RecentlyUpdated,
             repo: "widget".to_string(),
-            filter: PrStateFilter::Open,
+            filter: PrStateFilter::only(PrState::Open),
             prs: vec![make_pr(1, "OPEN"), make_pr(2, "OPEN")],
             page_info: single_page(),
         });
@@ -7232,11 +7813,11 @@ mod tests {
     #[test]
     fn pull_requests_loaded_ignored_for_stale_filter() {
         let mut app = review_app();
-        app.pr_state_filter = PrStateFilter::Open;
+        app.pr_state_filter = PrStateFilter::only(PrState::Open);
         app.update(Msg::PullRequestsLoaded {
             sort: ListSort::RecentlyUpdated,
             repo: "widget".to_string(),
-            filter: PrStateFilter::Merged,
+            filter: PrStateFilter::only(PrState::Merged),
             prs: vec![make_pr(1, "MERGED")],
             page_info: single_page(),
         });
@@ -7248,11 +7829,503 @@ mod tests {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
         let cmd = app.update(Msg::Key(key(KeyCode::Char('m'))));
-        assert_eq!(app.pr_state_filter, PrStateFilter::Merged);
+        assert_eq!(app.pr_state_filter, PrStateFilter::only(PrState::Merged));
         match cmd {
-            Command::LoadPullRequests { filter, .. } => assert_eq!(filter, PrStateFilter::Merged),
+            Command::LoadPullRequests { filter, .. } => {
+                assert_eq!(filter, PrStateFilter::only(PrState::Merged))
+            }
             other => panic!("expected LoadPullRequests, got {other:?}"),
         }
+    }
+
+    // ---- PR フィルタ（M7 Phase 2） ----
+
+    fn author(name: &str, uuid: &str) -> PrAuthor {
+        PrAuthor {
+            uuid: uuid.to_string(),
+            display_name: name.to_string(),
+        }
+    }
+
+    fn make_user(name: Option<&str>, uuid: Option<&str>) -> User {
+        let mut fields = Vec::new();
+        if let Some(name) = name {
+            fields.push(format!(r#""display_name": "{name}""#));
+        }
+        if let Some(uuid) = uuid {
+            fields.push(format!(r#""uuid": "{uuid}""#));
+        }
+        let json = format!("{{ {} }}", fields.join(", "));
+        serde_json::from_str(&json).expect("valid user json")
+    }
+
+    /// author（表示名 + 任意の uuid）付きの PR。
+    fn make_pr_with_author(id: u64, state: &str, name: &str, uuid: Option<&str>) -> PullRequest {
+        let uuid_json = match uuid {
+            Some(uuid) => format!(r#", "uuid": "{uuid}""#),
+            None => String::new(),
+        };
+        let json = format!(
+            r#"{{ "id": {id}, "title": "PR {id}", "state": "{state}",
+                  "author": {{ "display_name": "{name}"{uuid_json} }},
+                  "participants": [] }}"#
+        );
+        serde_json::from_str(&json).expect("valid pr json")
+    }
+
+    #[test]
+    fn single_state_keys_map_to_state_sets_and_preserve_author() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.pr_state_filter.author = Some(author("Alice", "{u-1}"));
+
+        app.update(Msg::Key(key(KeyCode::Char('o'))));
+        assert_eq!(app.pr_state_filter.states, BTreeSet::from([PrState::Open]));
+        app.update(Msg::Key(key(KeyCode::Char('m'))));
+        assert_eq!(
+            app.pr_state_filter.states,
+            BTreeSet::from([PrState::Merged])
+        );
+        app.update(Msg::Key(key(KeyCode::Char('d'))));
+        assert_eq!(
+            app.pr_state_filter.states,
+            BTreeSet::from([PrState::Declined])
+        );
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('a'))));
+        assert_eq!(app.pr_state_filter.states, BTreeSet::from(PrState::ALL));
+        // author は state キーとは独立の軸なので維持される（解除はフィルタモーダルで行う）。
+        assert_eq!(app.pr_state_filter.author, Some(author("Alice", "{u-1}")));
+        // 既存の体感どおり 1 ページ目から再取得する。
+        match cmd {
+            Command::LoadPullRequests { page, filter, .. } => {
+                assert_eq!(page, 1);
+                assert_eq!(filter.states, BTreeSet::from(PrState::ALL));
+            }
+            other => panic!("expected LoadPullRequests, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn state_filter_change_persists_states_to_config_but_not_author() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.pr_state_filter.author = Some(author("Alice", "{u-1}"));
+        app.update(Msg::Key(key(KeyCode::Char('m'))));
+        assert_eq!(app.config.pr_states, Some(vec!["MERGED".to_string()]));
+    }
+
+    #[test]
+    fn pr_state_filter_from_config_ignores_invalid_values_and_defaults_to_open() {
+        assert_eq!(PrStateFilter::from_config(None), PrStateFilter::default());
+
+        let mixed = vec![
+            "MERGED".to_string(),
+            "bogus".to_string(),
+            "DECLINED".to_string(),
+        ];
+        let filter = PrStateFilter::from_config(Some(&mixed));
+        assert_eq!(
+            filter.states,
+            BTreeSet::from([PrState::Merged, PrState::Declined])
+        );
+        assert!(filter.author.is_none());
+
+        let invalid = vec!["bogus".to_string()];
+        assert_eq!(
+            PrStateFilter::from_config(Some(&invalid)),
+            PrStateFilter::default()
+        );
+    }
+
+    #[test]
+    fn app_new_restores_pr_states_from_config() {
+        let config = Config {
+            pr_states: Some(vec!["MERGED".to_string(), "bogus".to_string()]),
+            ..Config::default()
+        };
+        let app = App::new(config, None);
+        assert_eq!(
+            app.pr_state_filter.states,
+            BTreeSet::from([PrState::Merged])
+        );
+        assert!(app.pr_state_filter.author.is_none());
+    }
+
+    #[test]
+    fn pr_state_filter_label_formats_states_and_author() {
+        assert_eq!(PrStateFilter::only(PrState::Open).label(), "OPEN");
+        assert_eq!(PrStateFilter::all().label(), "ALL");
+        let filter = PrStateFilter {
+            states: BTreeSet::from([PrState::Open, PrState::Merged]),
+            author: Some(author("Alice", "{u-1}")),
+        };
+        assert_eq!(filter.label(), "OPEN+MERGED, author: Alice");
+    }
+
+    #[test]
+    fn f_opens_pr_filter_modal_and_caches_members_per_workspace() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('f'))));
+        let modal = app.pr_filter_modal.as_ref().expect("modal opens");
+        assert!(modal.authors.is_none(), "取得完了までは読み込み中");
+        match cmd {
+            Command::LoadWorkspaceMembers { workspace, .. } => assert_eq!(workspace, "acme"),
+            other => panic!("expected LoadWorkspaceMembers, got {other:?}"),
+        }
+
+        // 取得成功 → 候補が表示名順（大文字小文字は無視）で入り、workspace 単位でキャッシュ。
+        app.update(Msg::WorkspaceMembersLoaded {
+            workspace: "acme".to_string(),
+            result: Ok(vec![
+                make_user(Some("bob"), Some("{u-2}")),
+                make_user(Some("Alice"), Some("{u-1}")),
+            ]),
+        });
+        let modal = app.pr_filter_modal.as_ref().expect("modal stays open");
+        assert_eq!(
+            modal.authors,
+            Some(vec![author("Alice", "{u-1}"), author("bob", "{u-2}")])
+        );
+
+        // 閉じて開き直すとキャッシュ命中で即表示（再取得コマンドを発行しない）。
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('f'))));
+        assert!(matches!(cmd, Command::None));
+        assert!(
+            app.pr_filter_modal
+                .as_ref()
+                .is_some_and(|modal| modal.authors.is_some())
+        );
+    }
+
+    #[test]
+    fn pr_filter_modal_space_toggles_and_rejects_empty_states_on_enter() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.update(Msg::Key(key(KeyCode::Char('f'))));
+
+        // カーソル先頭（OPEN）をトグルして空集合にする → Enter は拒否（Status エラー）。
+        app.update(Msg::Key(key(KeyCode::Char(' '))));
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+        assert!(matches!(cmd, Command::None));
+        assert!(matches!(app.status, Status::Error(_)));
+        assert!(
+            app.pr_filter_modal.is_some(),
+            "空集合では適用されずモーダルは開いたまま"
+        );
+        assert_eq!(app.pr_state_filter, PrStateFilter::only(PrState::Open));
+
+        // OPEN を戻し、MERGED も足して適用 → 1 ページ目から再取得。
+        app.update(Msg::Key(key(KeyCode::Char(' '))));
+        app.update(Msg::Key(key(KeyCode::Char('j'))));
+        app.update(Msg::Key(key(KeyCode::Char(' '))));
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+        assert!(app.pr_filter_modal.is_none());
+        assert_eq!(
+            app.pr_state_filter.states,
+            BTreeSet::from([PrState::Open, PrState::Merged])
+        );
+        assert_eq!(
+            app.config.pr_states,
+            Some(vec!["OPEN".to_string(), "MERGED".to_string()])
+        );
+        match cmd {
+            Command::LoadPullRequests { filter, page, .. } => {
+                assert_eq!(page, 1);
+                assert_eq!(
+                    filter.states,
+                    BTreeSet::from([PrState::Open, PrState::Merged])
+                );
+            }
+            other => panic!("expected LoadPullRequests, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_filter_modal_tab_moves_to_author_section_and_enter_applies_author() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.workspace_members_cache.insert(
+            "acme".to_string(),
+            vec![author("Alice", "{u-1}"), author("Bob", "{u-2}")],
+        );
+
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('f'))));
+        assert!(
+            matches!(cmd, Command::None),
+            "キャッシュ命中時は再取得しない"
+        );
+
+        app.update(Msg::Key(key(KeyCode::Tab)));
+        assert_eq!(
+            app.pr_filter_modal.as_ref().map(|modal| modal.section),
+            Some(PrFilterSection::Author)
+        );
+        app.update(Msg::Key(key(KeyCode::Char('j')))); // All authors → Alice
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+        assert_eq!(app.pr_state_filter.author, Some(author("Alice", "{u-1}")));
+        assert_eq!(app.pr_state_filter.states, BTreeSet::from([PrState::Open]));
+        match cmd {
+            Command::LoadPullRequests { filter, page, .. } => {
+                assert_eq!(page, 1);
+                assert_eq!(filter.author_uuid(), Some("{u-1}"));
+            }
+            other => panic!("expected LoadPullRequests, got {other:?}"),
+        }
+        // author は config へ保存しない（states のみ）。
+        assert_eq!(app.config.pr_states, Some(vec!["OPEN".to_string()]));
+    }
+
+    #[test]
+    fn pr_filter_modal_esc_cancels_without_applying() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.update(Msg::Key(key(KeyCode::Char('f'))));
+        app.update(Msg::Key(key(KeyCode::Char(' ')))); // OPEN を外す。
+        app.update(Msg::Key(key(KeyCode::Char('j'))));
+        app.update(Msg::Key(key(KeyCode::Char(' ')))); // MERGED を付ける。
+        let cmd = app.update(Msg::Key(key(KeyCode::Esc)));
+        assert!(matches!(cmd, Command::None));
+        assert!(app.pr_filter_modal.is_none());
+        // 作業コピーは破棄され、現在のフィルタは変わらない。
+        assert_eq!(app.pr_state_filter, PrStateFilter::only(PrState::Open));
+    }
+
+    #[test]
+    fn members_fetch_failure_falls_back_to_loaded_pr_authors_and_does_not_cache() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.pull_requests.set_items(vec![
+            make_pr_with_author(1, "OPEN", "Alice", Some("{u-1}")),
+            make_pr_with_author(2, "OPEN", "Alice", Some("{u-1}")), // 重複 uuid → 1 件に。
+            make_pr_with_author(3, "OPEN", "Ghost", None),          // uuid 無し → 除外。
+        ]);
+        app.update(Msg::Key(key(KeyCode::Char('f'))));
+        app.update(Msg::WorkspaceMembersLoaded {
+            workspace: "acme".to_string(),
+            result: Err(ApiError::Auth),
+        });
+
+        let modal = app.pr_filter_modal.as_ref().expect("modal stays open");
+        assert_eq!(modal.authors, Some(vec![author("Alice", "{u-1}")]));
+
+        // 失敗はキャッシュしない → 開き直すと再取得を試みる。
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('f'))));
+        assert!(matches!(cmd, Command::LoadWorkspaceMembers { .. }));
+    }
+
+    #[test]
+    fn pr_filter_modal_enter_while_authors_loading_keeps_current_author() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.pr_state_filter.author = Some(author("Alice", "{u-1}"));
+
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('f'))));
+        assert!(matches!(cmd, Command::LoadWorkspaceMembers { .. }));
+        // 候補未着（読み込み中）のまま MERGED を足して Enter。
+        app.update(Msg::Key(key(KeyCode::Char('j'))));
+        app.update(Msg::Key(key(KeyCode::Char(' '))));
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+        assert!(app.pr_filter_modal.is_none());
+        // author は黙って All authors へ落とさず維持し、states だけを適用する。
+        assert_eq!(app.pr_state_filter.author, Some(author("Alice", "{u-1}")));
+        assert_eq!(
+            app.pr_state_filter.states,
+            BTreeSet::from([PrState::Open, PrState::Merged])
+        );
+        match cmd {
+            Command::LoadPullRequests { filter, page, .. } => {
+                assert_eq!(page, 1);
+                assert_eq!(filter.author_uuid(), Some("{u-1}"));
+            }
+            other => panic!("expected LoadPullRequests, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn current_author_missing_from_members_is_inserted_with_cursor_on_it() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.pr_state_filter.author = Some(author("Alice", "{u-1}"));
+        app.update(Msg::Key(key(KeyCode::Char('f'))));
+        app.update(Msg::WorkspaceMembersLoaded {
+            workspace: "acme".to_string(),
+            result: Ok(vec![
+                make_user(Some("bob"), Some("{u-2}")),
+                make_user(Some("Zoe"), Some("{u-3}")),
+            ]),
+        });
+
+        let modal = app.pr_filter_modal.as_ref().expect("modal stays open");
+        // 脱退済み等で候補に無い現用 author は表示名順（大文字小文字無視）の位置へ挿入される。
+        assert_eq!(
+            modal.authors,
+            Some(vec![
+                author("Alice", "{u-1}"),
+                author("bob", "{u-2}"),
+                author("Zoe", "{u-3}"),
+            ])
+        );
+        // カーソルは現用 author を指す（0 = All authors、1 = Alice）。
+        assert_eq!(modal.author_cursor, 1);
+        // 挿入はモーダルの作業コピーのみで、ワークスペースキャッシュへは波及しない。
+        assert_eq!(
+            app.workspace_members_cache.get(&"acme".to_string()),
+            Some(&vec![author("bob", "{u-2}"), author("Zoe", "{u-3}")])
+        );
+    }
+
+    #[test]
+    fn current_author_missing_from_cached_members_is_inserted_on_open() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.workspace_members_cache
+            .insert("acme".to_string(), vec![author("Bob", "{u-2}")]);
+        app.pr_state_filter.author = Some(author("Alice", "{u-1}"));
+
+        app.update(Msg::Key(key(KeyCode::Char('f'))));
+        let modal = app.pr_filter_modal.as_ref().expect("modal opens");
+        assert_eq!(
+            modal.authors,
+            Some(vec![author("Alice", "{u-1}"), author("Bob", "{u-2}")])
+        );
+        assert_eq!(modal.author_cursor, 1);
+    }
+
+    #[test]
+    fn members_fallback_aggregates_authors_across_cached_filters_and_pages() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        // author フィルタ適用中: 表示中の一覧は Alice の PR だけに痩せている。
+        let with_author = PrStateFilter {
+            states: BTreeSet::from([PrState::Open]),
+            author: Some(author("Alice", "{u-1}")),
+        };
+        app.pr_state_filter = with_author.clone();
+        app.update(Msg::PullRequestsLoaded {
+            sort: ListSort::RecentlyUpdated,
+            repo: "widget".to_string(),
+            filter: with_author,
+            prs: vec![make_pr_with_author(1, "OPEN", "Alice", Some("{u-1}"))],
+            page_info: single_page(),
+        });
+        // 現在 repo の別フィルタ・別ページのキャッシュには別著者の PR が残っている。
+        app.pull_requests_cache.insert(
+            (
+                "widget".to_string(),
+                PrStateFilter::only(PrState::Merged),
+                ListSort::RecentlyUpdated,
+                2,
+            ),
+            (
+                vec![make_pr_with_author(2, "MERGED", "bob", Some("{u-2}"))],
+                page_info(2, Some(2), false),
+            ),
+        );
+        // 他 repo のキャッシュは候補に混ぜない。
+        app.pull_requests_cache.insert(
+            (
+                "gadget".to_string(),
+                PrStateFilter::only(PrState::Open),
+                ListSort::RecentlyUpdated,
+                1,
+            ),
+            (
+                vec![make_pr_with_author(3, "OPEN", "Carol", Some("{u-3}"))],
+                single_page(),
+            ),
+        );
+
+        // members 取得失敗 → フォールバック候補にキャッシュ上の他著者も出る。
+        app.update(Msg::Key(key(KeyCode::Char('f'))));
+        app.update(Msg::WorkspaceMembersLoaded {
+            workspace: "acme".to_string(),
+            result: Err(ApiError::Auth),
+        });
+        let modal = app.pr_filter_modal.as_ref().expect("modal stays open");
+        assert_eq!(
+            modal.authors,
+            Some(vec![author("Alice", "{u-1}"), author("bob", "{u-2}")])
+        );
+    }
+
+    #[test]
+    fn pull_requests_cache_is_keyed_by_author_and_does_not_leak_across_authors() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.update(Msg::PullRequestsLoaded {
+            sort: ListSort::RecentlyUpdated,
+            repo: "widget".to_string(),
+            filter: PrStateFilter::only(PrState::Open),
+            prs: vec![make_pr(1, "OPEN")],
+            page_info: single_page(),
+        });
+        assert_eq!(app.pull_requests.items.len(), 1);
+
+        // author 付きフィルタへ切替: author 無しのキャッシュに命中しないこと。
+        let with_author = PrStateFilter {
+            states: BTreeSet::from([PrState::Open]),
+            author: Some(author("Alice", "{u-1}")),
+        };
+        app.pr_state_filter = with_author.clone();
+        let cmd = app.update(Msg::Key(key(KeyCode::Char('r'))));
+        assert!(app.pull_requests.items.is_empty());
+        assert!(matches!(app.status, Status::Loading(_)));
+        assert!(matches!(cmd, Command::LoadPullRequests { .. }));
+
+        app.update(Msg::PullRequestsLoaded {
+            sort: ListSort::RecentlyUpdated,
+            repo: "widget".to_string(),
+            filter: with_author,
+            prs: vec![make_pr(2, "OPEN")],
+            page_info: single_page(),
+        });
+        assert_eq!(app.pull_requests.items[0].id, 2);
+
+        // author 無しへ戻すと元のキャッシュに命中する（別エントリとして共存している）。
+        app.pr_state_filter = PrStateFilter::only(PrState::Open);
+        app.update(Msg::Key(key(KeyCode::Char('r'))));
+        assert_eq!(app.status, Status::Idle);
+        assert_eq!(app.pull_requests.items[0].id, 1);
+    }
+
+    #[test]
+    fn entering_repository_resets_author_filter_but_keeps_states() {
+        // 別 repo からの入場: author はリポジトリ依存なのでリセット、states は維持する。
+        let mut app = review_app();
+        app.screen = Screen::Repositories;
+        app.selected_repo = Some("acme/gadget".to_string());
+        app.repositories
+            .set_items(vec![make_repo("acme/widget", None)]);
+        app.pr_state_filter = PrStateFilter {
+            states: BTreeSet::from([PrState::Merged]),
+            author: Some(author("Alice", "{u-1}")),
+        };
+        app.update(Msg::Key(key(KeyCode::Enter)));
+        assert_eq!(
+            app.pr_state_filter.states,
+            BTreeSet::from([PrState::Merged])
+        );
+        assert!(app.pr_state_filter.author.is_none());
+
+        // 同一 repo への再入場: repo コンテキストは変わらないので author を維持する。
+        app.pr_state_filter.author = Some(author("Alice", "{u-1}"));
+        app.screen = Screen::Repositories;
+        app.update(Msg::Key(key(KeyCode::Enter)));
+        assert_eq!(app.pr_state_filter.author, Some(author("Alice", "{u-1}")));
+    }
+
+    #[test]
+    fn ctrl_k_does_not_open_jump_palette_while_pr_filter_modal_is_open() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.update(Msg::Key(key(KeyCode::Char('f'))));
+        app.update(Msg::Key(ctrl(KeyCode::Char('k'))));
+        assert!(app.jump_palette.is_none());
+        assert!(app.pr_filter_modal.is_some());
     }
 
     #[test]
@@ -8657,7 +9730,7 @@ diff --git a/two.txt b/two.txt\n\
     }
 
     /// アンカー（新側 2 行目 = unified 行 3）にコメント 1 件のスレッドを持つ diff を組む。
-    /// 表示行列: Diff0..Diff3, [Top, Header, Body, Bottom], Diff4（計 9 行）。
+    /// 表示行列: Diff0..Diff3, [Top, Header, Body, Actions, Bottom, Spacer], Diff4（計 11 行）。
     fn diff_with_thread(view_mode: DiffViewMode) -> DiffState {
         let parsed = parse_diff("diff --git a/x.rs b/x.rs\n@@ -1,3 +1,3 @@\n a\n b\n c\n");
         let comment = make_inline_comment(1, "hi", "x.rs", 2, "2026-01-01T00:00:00Z", None);
@@ -8719,8 +9792,9 @@ diff --git a/two.txt b/two.txt\n\
     #[test]
     fn max_scroll_counts_display_rows_including_comments() {
         let diff = diff_with_thread(DiffViewMode::Unified);
-        // 表示行 = 5 diff + 5 comment(Top/Header/Body/Actions/Bottom) = 10。viewport 20 なので上限 0。
-        assert_eq!(diff.display_rows.len(), 10);
+        // 表示行 = 5 diff + 6 comment(Top/Header/Body/Actions/Bottom/Spacer) = 11。
+        // viewport 20 なので上限 0。
+        assert_eq!(diff.display_rows.len(), 11);
         assert_eq!(diff.max_scroll(), 0);
     }
 
@@ -8786,6 +9860,45 @@ diff --git a/two.txt b/two.txt\n\
         assert_eq!(actions, vec![true]);
     }
 
+    #[test]
+    fn display_rows_append_spacer_after_thread_block() {
+        let diff = diff_with_thread(DiffViewMode::Unified);
+        // Diff0..Diff3, Top(4), Header(5), Body(6), Actions(7), Bottom(8), Spacer(9), Diff4(10)。
+        assert!(matches!(
+            diff.display_rows.get(9),
+            Some(DisplayRow::Comment(CommentRow {
+                kind: CommentRowKind::Spacer,
+                ..
+            }))
+        ));
+        assert!(!diff.is_focusable(9), "Spacer はカーソル停止対象でない");
+        assert!(matches!(
+            diff.display_rows.get(10),
+            Some(DisplayRow::Diff(4))
+        ));
+    }
+
+    #[test]
+    fn move_cursor_skips_spacer_and_lands_on_next_diff_line() {
+        let mut diff = diff_with_thread(DiffViewMode::Unified);
+        diff.cursor = thread_header_index(&diff);
+        // ヘッダから下へ 1 ステップ: Body/Actions/Bottom/Spacer を飛ばして Diff4 へ。
+        diff.move_cursor(1);
+        assert_eq!(diff.row_diff_index(diff.cursor), Some(4));
+    }
+
+    #[test]
+    fn click_on_spacer_row_is_noop() {
+        let mut diff = diff_with_thread(DiffViewMode::Unified);
+        assert_eq!(diff.cursor, 0);
+        // Spacer は表示行 9。枠線 1 行を挟むのでクリック座標 y = 1 + 9（scroll=0）。
+        diff.click_body_row(Rect::new(0, 0, 40, 20), (5, 10));
+        assert_eq!(
+            diff.cursor, 0,
+            "Spacer クリックはスレッド先頭選択に落とさず何もしない"
+        );
+    }
+
     /// 解決済みスレッド（コメント 1 件）を持つ diff。
     fn diff_with_resolved_thread() -> DiffState {
         let parsed = parse_diff("diff --git a/x.rs b/x.rs\n@@ -1,3 +1,3 @@\n a\n b\n c\n");
@@ -8832,6 +9945,32 @@ diff --git a/two.txt b/two.txt\n\
                 ..
             })
         )));
+    }
+
+    #[test]
+    fn display_rows_append_spacer_after_collapsed_row() {
+        let diff = diff_with_resolved_thread();
+        let collapsed = diff
+            .display_rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row,
+                    DisplayRow::Comment(CommentRow {
+                        kind: CommentRowKind::Collapsed { .. },
+                        ..
+                    })
+                )
+            })
+            .expect("collapsed row present");
+        assert!(matches!(
+            diff.display_rows.get(collapsed + 1),
+            Some(DisplayRow::Comment(CommentRow {
+                kind: CommentRowKind::Spacer,
+                ..
+            }))
+        ));
+        assert!(!diff.is_focusable(collapsed + 1));
     }
 
     #[test]
@@ -9531,6 +10670,75 @@ diff --git a/two.txt b/two.txt\n\
             }
             other => panic!("expected CreateComment, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn comment_editor_inserts_and_deletes_at_cursor_with_multibyte() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequestDetail;
+        app.current_pr = Some(make_pr(2, "OPEN"));
+        app.update(Msg::Key(key(KeyCode::Char('c'))));
+        for ch in "あいう".chars() {
+            app.update(Msg::Key(key(KeyCode::Char(ch))));
+        }
+        // カーソルは char 単位の末尾。
+        assert_eq!(app.comment_editor.as_ref().expect("editor").cursor, 3);
+        // ← で「う」の前へ → Backspace は直前の「い」を消す。
+        app.update(Msg::Key(key(KeyCode::Left)));
+        app.update(Msg::Key(key(KeyCode::Backspace)));
+        let editor = app.comment_editor.as_ref().expect("editor");
+        assert_eq!(editor.text, "あう");
+        assert_eq!(editor.cursor, 1);
+        // 途中挿入もカーソル位置基準。
+        app.update(Msg::Key(key(KeyCode::Char('X'))));
+        let editor = app.comment_editor.as_ref().expect("editor");
+        assert_eq!(editor.text, "あXう");
+        assert_eq!(editor.cursor, 2);
+    }
+
+    #[test]
+    fn comment_editor_home_end_up_down_move_within_logical_lines() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequestDetail;
+        app.current_pr = Some(make_pr(2, "OPEN"));
+        app.update(Msg::Key(key(KeyCode::Char('c'))));
+        // 2 論理行を入力: "abc\nあい"（カーソルは行 1・列 2 の末尾）。
+        for ch in "abc".chars() {
+            app.update(Msg::Key(key(KeyCode::Char(ch))));
+        }
+        app.update(Msg::Key(key(KeyCode::Enter)));
+        for ch in "あい".chars() {
+            app.update(Msg::Key(key(KeyCode::Char(ch))));
+        }
+        let editor = app.comment_editor.as_ref().expect("editor");
+        assert_eq!(editor.text, "abc\nあい");
+        assert_eq!(editor.cursor_line_col(), (1, 2));
+        // Home → 行 1 の行頭（cursor = "abc\n" の 4 char）。
+        app.update(Msg::Key(key(KeyCode::Home)));
+        assert_eq!(app.comment_editor.as_ref().expect("editor").cursor, 4);
+        // Up → 行 0 列 0。
+        app.update(Msg::Key(key(KeyCode::Up)));
+        assert_eq!(app.comment_editor.as_ref().expect("editor").cursor, 0);
+        // End → 行 0 の行末。
+        app.update(Msg::Key(key(KeyCode::End)));
+        assert_eq!(app.comment_editor.as_ref().expect("editor").cursor, 3);
+        // Down → 行 1 へ。列 3 は行長 2 にクランプされ末尾（cursor=6）。
+        app.update(Msg::Key(key(KeyCode::Down)));
+        assert_eq!(app.comment_editor.as_ref().expect("editor").cursor, 6);
+        // Right は末尾でクランプ、Left で 1 文字戻る。
+        app.update(Msg::Key(key(KeyCode::Right)));
+        assert_eq!(app.comment_editor.as_ref().expect("editor").cursor, 6);
+        app.update(Msg::Key(key(KeyCode::Left)));
+        assert_eq!(app.comment_editor.as_ref().expect("editor").cursor, 5);
+    }
+
+    #[test]
+    fn comment_editor_edit_prefill_puts_cursor_at_end() {
+        let mut app = review_app_with_thread();
+        app.update(Msg::Key(key(KeyCode::Char('e'))));
+        let editor = app.comment_editor.as_ref().expect("edit editor open");
+        assert_eq!(editor.text, "hi");
+        assert_eq!(editor.cursor, 2, "edit プリフィルはカーソルを末尾に置く");
     }
 
     #[test]
@@ -11242,7 +12450,7 @@ diff --git a/two.txt b/two.txt\n\
     fn cycle_pull_requests_sort_reloads_page_one_preserving_filter() {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
-        app.pr_state_filter = PrStateFilter::Merged;
+        app.pr_state_filter = PrStateFilter::only(PrState::Merged);
         app.pull_requests_page_info = page_info(4, Some(5), true);
 
         let cmd = app.update(Msg::Key(key(KeyCode::Char('S'))));
@@ -11253,7 +12461,7 @@ diff --git a/two.txt b/two.txt\n\
             } => {
                 assert_eq!(sort, ListSort::LeastRecentlyUpdated);
                 assert_eq!(page, 1);
-                assert_eq!(filter, PrStateFilter::Merged);
+                assert_eq!(filter, PrStateFilter::only(PrState::Merged));
             }
             other => panic!("expected LoadPullRequests, got {other:?}"),
         }
@@ -11434,10 +12642,10 @@ diff --git a/two.txt b/two.txt\n\
     fn pull_requests_loaded_same_context_revalidation_preserves_selection_by_identity() {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
-        app.pr_state_filter = PrStateFilter::Open;
+        app.pr_state_filter = PrStateFilter::only(PrState::Open);
         app.update(Msg::PullRequestsLoaded {
             repo: "widget".to_string(),
-            filter: PrStateFilter::Open,
+            filter: PrStateFilter::only(PrState::Open),
             sort: ListSort::RecentlyUpdated,
             prs: vec![make_pr(1, "OPEN"), make_pr(2, "OPEN"), make_pr(3, "OPEN")],
             page_info: single_page(),
@@ -11448,7 +12656,7 @@ diff --git a/two.txt b/two.txt\n\
         // 裏側の再検証（同一 repo/filter/sort/page）が同じ内容で届く。
         app.update(Msg::PullRequestsLoaded {
             repo: "widget".to_string(),
-            filter: PrStateFilter::Open,
+            filter: PrStateFilter::only(PrState::Open),
             sort: ListSort::RecentlyUpdated,
             prs: vec![make_pr(1, "OPEN"), make_pr(2, "OPEN"), make_pr(3, "OPEN")],
             page_info: single_page(),
@@ -11462,10 +12670,10 @@ diff --git a/two.txt b/two.txt\n\
     fn pull_requests_context_change_resets_selection_to_top() {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
-        app.pr_state_filter = PrStateFilter::Open;
+        app.pr_state_filter = PrStateFilter::only(PrState::Open);
         app.update(Msg::PullRequestsLoaded {
             repo: "widget".to_string(),
-            filter: PrStateFilter::Open,
+            filter: PrStateFilter::only(PrState::Open),
             sort: ListSort::RecentlyUpdated,
             prs: vec![make_pr(1, "OPEN"), make_pr(2, "OPEN")],
             page_info: single_page(),
@@ -11476,7 +12684,7 @@ diff --git a/two.txt b/two.txt\n\
         app.update(Msg::Key(key(KeyCode::Char('m'))));
         app.update(Msg::PullRequestsLoaded {
             repo: "widget".to_string(),
-            filter: PrStateFilter::Merged,
+            filter: PrStateFilter::only(PrState::Merged),
             sort: ListSort::RecentlyUpdated,
             prs: vec![make_pr(9, "MERGED")],
             page_info: single_page(),
@@ -11518,6 +12726,27 @@ diff --git a/two.txt b/two.txt\n\
         search_app.update(Msg::Key(ctrl(KeyCode::Char('k'))));
         assert!(search_app.jump_palette.is_none());
         assert!(search_app.search_editing);
+    }
+
+    #[test]
+    fn ctrl_k_does_not_open_while_delete_comment_modal_or_page_jump_is_active() {
+        let mut delete_app = review_app();
+        delete_app.screen = Screen::PullRequestDetail;
+        delete_app.delete_comment_modal = Some(DeleteCommentModal {
+            comment_id: 1,
+            submitting: false,
+        });
+        delete_app.update(Msg::Key(ctrl(KeyCode::Char('k'))));
+        assert!(delete_app.jump_palette.is_none());
+        assert!(delete_app.delete_comment_modal.is_some());
+
+        let mut page_jump_app = review_app();
+        page_jump_app.screen = Screen::PullRequests;
+        page_jump_app.update(Msg::Key(key(KeyCode::Char('g'))));
+        assert!(page_jump_app.page_jump.is_some());
+        page_jump_app.update(Msg::Key(ctrl(KeyCode::Char('k'))));
+        assert!(page_jump_app.jump_palette.is_none());
+        assert!(page_jump_app.page_jump.is_some());
     }
 
     #[test]
@@ -11724,6 +12953,29 @@ diff --git a/two.txt b/two.txt\n\
         }
     }
 
+    #[test]
+    fn jump_to_pr_resets_author_filter_only_when_repo_context_changes() {
+        // 別リポジトリへのジャンプ: author はリポジトリ/ワークスペース依存なのでリセット。
+        let mut app = review_app();
+        app.pr_state_filter.author = Some(author("Alice", "{u-1}"));
+        app.jump_to_pr(
+            "acme".to_string(),
+            "acme/other".to_string(),
+            make_pr(5, "OPEN"),
+        );
+        assert!(app.pr_state_filter.author.is_none());
+
+        // 同一リポジトリへのジャンプ: 維持する。
+        let mut app = review_app();
+        app.pr_state_filter.author = Some(author("Alice", "{u-1}"));
+        app.jump_to_pr(
+            "acme".to_string(),
+            "acme/widget".to_string(),
+            make_pr(5, "OPEN"),
+        );
+        assert_eq!(app.pr_state_filter.author, Some(author("Alice", "{u-1}")));
+    }
+
     // ---- キャッシュ（stale-while-revalidate） ----
 
     #[test]
@@ -11864,7 +13116,7 @@ diff --git a/two.txt b/two.txt\n\
         app.update(Msg::PullRequestsLoaded {
             sort: ListSort::RecentlyUpdated,
             repo: "widget".to_string(),
-            filter: PrStateFilter::Open,
+            filter: PrStateFilter::only(PrState::Open),
             prs: vec![make_pr(1, "OPEN")],
             page_info: single_page(),
         });
@@ -11884,11 +13136,11 @@ diff --git a/two.txt b/two.txt\n\
     fn pull_requests_cache_is_keyed_by_filter_and_does_not_leak_across_filters() {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
-        app.pr_state_filter = PrStateFilter::Open;
+        app.pr_state_filter = PrStateFilter::only(PrState::Open);
         app.update(Msg::PullRequestsLoaded {
             sort: ListSort::RecentlyUpdated,
             repo: "widget".to_string(),
-            filter: PrStateFilter::Open,
+            filter: PrStateFilter::only(PrState::Open),
             prs: vec![make_pr(1, "OPEN")],
             page_info: single_page(),
         });
@@ -11899,7 +13151,7 @@ diff --git a/two.txt b/two.txt\n\
         assert!(matches!(app.status, Status::Loading(_)));
         match cmd {
             Command::LoadPullRequests { filter, .. } => {
-                assert_eq!(filter, PrStateFilter::Merged);
+                assert_eq!(filter, PrStateFilter::only(PrState::Merged));
             }
             other => panic!("expected LoadPullRequests, got {other:?}"),
         }
@@ -11911,7 +13163,7 @@ diff --git a/two.txt b/two.txt\n\
         app.screen = Screen::PullRequests;
         app.update(Msg::PullRequestsLoaded {
             repo: "widget".to_string(),
-            filter: PrStateFilter::Open,
+            filter: PrStateFilter::only(PrState::Open),
             sort: ListSort::RecentlyUpdated,
             prs: vec![make_pr(9, "OPEN")],
             page_info: single_page(),
@@ -11920,7 +13172,7 @@ diff --git a/two.txt b/two.txt\n\
         assert_eq!(app.pull_requests_sort, ListSort::LeastRecentlyUpdated);
         app.update(Msg::PullRequestsLoaded {
             repo: "widget".to_string(),
-            filter: PrStateFilter::Open,
+            filter: PrStateFilter::only(PrState::Open),
             sort: ListSort::LeastRecentlyUpdated,
             prs: vec![make_pr(2, "OPEN")],
             page_info: single_page(),
@@ -11985,11 +13237,11 @@ diff --git a/two.txt b/two.txt\n\
     fn review_action_success_invalidates_pull_requests_cache_for_current_repo() {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
-        app.pr_state_filter = PrStateFilter::Open;
+        app.pr_state_filter = PrStateFilter::only(PrState::Open);
         app.update(Msg::PullRequestsLoaded {
             sort: ListSort::RecentlyUpdated,
             repo: "widget".to_string(),
-            filter: PrStateFilter::Open,
+            filter: PrStateFilter::only(PrState::Open),
             prs: vec![make_pr(1, "OPEN")],
             page_info: single_page(),
         });
@@ -12018,11 +13270,11 @@ diff --git a/two.txt b/two.txt\n\
     fn merge_success_invalidates_pull_requests_cache_for_current_repo() {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
-        app.pr_state_filter = PrStateFilter::Open;
+        app.pr_state_filter = PrStateFilter::only(PrState::Open);
         app.update(Msg::PullRequestsLoaded {
             sort: ListSort::RecentlyUpdated,
             repo: "widget".to_string(),
-            filter: PrStateFilter::Open,
+            filter: PrStateFilter::only(PrState::Open),
             prs: vec![make_pr(3, "OPEN")],
             page_info: single_page(),
         });
@@ -12042,11 +13294,11 @@ diff --git a/two.txt b/two.txt\n\
     fn comment_posted_invalidates_pull_requests_cache_for_current_repo() {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
-        app.pr_state_filter = PrStateFilter::Open;
+        app.pr_state_filter = PrStateFilter::only(PrState::Open);
         app.update(Msg::PullRequestsLoaded {
             sort: ListSort::RecentlyUpdated,
             repo: "widget".to_string(),
-            filter: PrStateFilter::Open,
+            filter: PrStateFilter::only(PrState::Open),
             prs: vec![make_pr(5, "OPEN")],
             page_info: single_page(),
         });
@@ -12112,13 +13364,13 @@ diff --git a/two.txt b/two.txt\n\
     fn pull_requests_next_page_preserves_current_filter() {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
-        app.pr_state_filter = PrStateFilter::Merged;
+        app.pr_state_filter = PrStateFilter::only(PrState::Merged);
         app.pull_requests_page_info = page_info(2, Some(5), true);
         let cmd = app.update(Msg::Key(key(KeyCode::Char(']'))));
         match cmd {
             Command::LoadPullRequests { page, filter, .. } => {
                 assert_eq!(page, 3);
-                assert_eq!(filter, PrStateFilter::Merged);
+                assert_eq!(filter, PrStateFilter::only(PrState::Merged));
             }
             other => panic!("expected LoadPullRequests, got {other:?}"),
         }
@@ -12269,12 +13521,12 @@ diff --git a/two.txt b/two.txt\n\
     fn pull_requests_loaded_ignored_when_page_does_not_match_current_request() {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
-        app.pr_state_filter = PrStateFilter::Open;
+        app.pr_state_filter = PrStateFilter::only(PrState::Open);
         app.pull_requests_page_info = page_info(2, None, false);
         app.update(Msg::PullRequestsLoaded {
             sort: ListSort::RecentlyUpdated,
             repo: "widget".to_string(),
-            filter: PrStateFilter::Open,
+            filter: PrStateFilter::only(PrState::Open),
             prs: vec![make_pr(1, "OPEN")],
             page_info: page_info(1, None, true),
         });
@@ -12317,11 +13569,11 @@ diff --git a/two.txt b/two.txt\n\
     fn pull_requests_cache_is_keyed_by_page_and_does_not_leak_across_pages() {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
-        app.pr_state_filter = PrStateFilter::Open;
+        app.pr_state_filter = PrStateFilter::only(PrState::Open);
         app.update(Msg::PullRequestsLoaded {
             sort: ListSort::RecentlyUpdated,
             repo: "widget".to_string(),
-            filter: PrStateFilter::Open,
+            filter: PrStateFilter::only(PrState::Open),
             prs: vec![make_pr(1, "OPEN")],
             page_info: page_info(1, Some(2), true),
         });
@@ -12334,7 +13586,7 @@ diff --git a/two.txt b/two.txt\n\
         app.update(Msg::PullRequestsLoaded {
             sort: ListSort::RecentlyUpdated,
             repo: "widget".to_string(),
-            filter: PrStateFilter::Open,
+            filter: PrStateFilter::only(PrState::Open),
             prs: vec![make_pr(2, "OPEN")],
             page_info: page_info(2, Some(2), false),
         });
@@ -12410,14 +13662,14 @@ diff --git a/two.txt b/two.txt\n\
     fn switching_pr_filter_resets_to_page_one() {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
-        app.pr_state_filter = PrStateFilter::Open;
+        app.pr_state_filter = PrStateFilter::only(PrState::Open);
         app.pull_requests_page_info = page_info(3, Some(5), true);
 
         let cmd = app.update(Msg::Key(key(KeyCode::Char('m')))); // Merged へ切替
         match cmd {
             Command::LoadPullRequests { page, filter, .. } => {
                 assert_eq!(page, 1);
-                assert_eq!(filter, PrStateFilter::Merged);
+                assert_eq!(filter, PrStateFilter::only(PrState::Merged));
             }
             other => panic!("expected LoadPullRequests, got {other:?}"),
         }
@@ -12427,7 +13679,7 @@ diff --git a/two.txt b/two.txt\n\
     fn reload_key_reuses_current_page_not_page_one() {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
-        app.pr_state_filter = PrStateFilter::Open;
+        app.pr_state_filter = PrStateFilter::only(PrState::Open);
         app.pull_requests_page_info = page_info(2, Some(5), true);
 
         let cmd = app.update(Msg::Key(key(KeyCode::Char('r'))));

@@ -168,6 +168,15 @@ pub struct WorkspaceMembership {
     pub workspace: Workspace,
 }
 
+/// `GET /2.0/workspaces/{workspace}/members` の要素（メンバーシップ）。
+///
+/// 実体のユーザーは `user` に入る（`{ "type": "workspace_membership", "user": {..} }`）。
+/// 応答形（`values[].user` の uuid/display_name）は未検証の仮定（`docs/LEDGER.md` 参照）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkspaceMember {
+    pub user: User,
+}
+
 /// `GET /2.0/repositories/{workspace}` の要素。
 #[derive(Debug, Clone, Deserialize)]
 pub struct Repository {

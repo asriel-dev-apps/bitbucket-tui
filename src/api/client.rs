@@ -15,7 +15,7 @@ use crate::api::error::{ApiError, classify_error};
 use crate::api::models::{
     Branch, Comment, CommentSide, Commit, DiffStatEntry, InlineTarget, ListSort, MergeParams,
     PageInfo, Paginated, Pipeline, PipelineStep, PipelineTarget, PullRequest, Repository, SrcEntry,
-    User, Workspace, WorkspaceMembership,
+    User, Workspace, WorkspaceMember, WorkspaceMembership,
 };
 
 /// API のベース URL（Bitbucket Cloud）。
@@ -94,7 +94,7 @@ impl BitbucketClient {
     /// 各要素はメンバーシップ（`{ "workspace": {..} }`）なので `workspace` を取り出す。
     pub async fn get_workspaces_page(&self, page: u32) -> Result<Page<Workspace>, ApiError> {
         let paginated: Paginated<WorkspaceMembership> = self
-            .fetch_single_page("/user/workspaces", &[], page)
+            .fetch_single_page("/user/workspaces", Vec::new(), page)
             .await?;
         let info = PageInfo::from_paginated(&paginated, page, PAGE_SIZE);
         let values = paginated.values.into_iter().map(|m| m.workspace).collect();
@@ -110,8 +110,8 @@ impl BitbucketClient {
         page: u32,
     ) -> Result<Page<Repository>, ApiError> {
         let path = format!("/repositories/{workspace}");
-        let query = repositories_query(sort);
-        let paginated: Paginated<Repository> = self.fetch_single_page(&path, &query, page).await?;
+        let query = owned_query(&repositories_query(sort));
+        let paginated: Paginated<Repository> = self.fetch_single_page(&path, query, page).await?;
         let info = PageInfo::from_paginated(&paginated, page, PAGE_SIZE);
         Ok(Page {
             values: paginated.values,
@@ -121,24 +121,35 @@ impl BitbucketClient {
 
     /// PR 一覧の指定ページを、指定ソート順で取得する（`pagelen` 固定 [`PAGE_SIZE`]）。
     ///
-    /// `states` は繰り返し `state` クエリとして送る（例: `["OPEN","MERGED"]`）。空の場合は
-    /// Bitbucket 既定（OPEN のみ）になる。
+    /// `author_uuid` 指定なしでは `states` を繰り返し `state` クエリとして送る
+    /// （例: `["OPEN","MERGED"]`。空の場合は Bitbucket 既定 = OPEN のみになる）。
+    /// `author_uuid` 指定ありでは `q`（BBQL）へ一本化する（[`pull_requests_query`] 参照）。
     pub async fn get_pull_requests_page(
         &self,
         workspace: &str,
         repo: &str,
         states: &[&str],
+        author_uuid: Option<&str>,
         sort: ListSort,
         page: u32,
     ) -> Result<Page<PullRequest>, ApiError> {
         let path = format!("/repositories/{workspace}/{repo}/pullrequests");
-        let query = pull_requests_query(states, sort);
-        let paginated: Paginated<PullRequest> = self.fetch_single_page(&path, &query, page).await?;
+        let query = pull_requests_query(states, author_uuid, sort);
+        let paginated: Paginated<PullRequest> = self.fetch_single_page(&path, query, page).await?;
         let info = PageInfo::from_paginated(&paginated, page, PAGE_SIZE);
         Ok(Page {
             values: paginated.values,
             info,
         })
+    }
+
+    /// ワークスペースの全メンバーを取得する（`GET /2.0/workspaces/{workspace}/members`、
+    /// `next` に従いページング追従）。各要素はメンバーシップ（`{ "user": {..} }`）なので
+    /// `user` を取り出す。応答形は未検証の仮定（`docs/LEDGER.md` 参照）。
+    pub async fn get_workspace_members(&self, workspace: &str) -> Result<Vec<User>, ApiError> {
+        let path = format!("/workspaces/{workspace}/members");
+        let members: Vec<WorkspaceMember> = self.get_paged(&path, &[("pagelen", "100")]).await?;
+        Ok(members.into_iter().map(|member| member.user).collect())
     }
 
     /// PR 詳細を取得する。
@@ -349,8 +360,8 @@ impl BitbucketClient {
         page: u32,
     ) -> Result<Page<Pipeline>, ApiError> {
         let path = format!("/repositories/{workspace}/{repo}/pipelines/");
-        let query = pipelines_query();
-        let paginated: Paginated<Pipeline> = self.fetch_single_page(&path, &query, page).await?;
+        let query = owned_query(&pipelines_query());
+        let paginated: Paginated<Pipeline> = self.fetch_single_page(&path, query, page).await?;
         let info = PageInfo::from_paginated(&paginated, page, PAGE_SIZE);
         Ok(Page {
             values: paginated.values,
@@ -440,8 +451,8 @@ impl BitbucketClient {
         page: u32,
     ) -> Result<Page<Branch>, ApiError> {
         let path = format!("/repositories/{workspace}/{repo}/refs/branches");
-        let query = branches_query();
-        let paginated: Paginated<Branch> = self.fetch_single_page(&path, &query, page).await?;
+        let query = owned_query(&branches_query());
+        let paginated: Paginated<Branch> = self.fetch_single_page(&path, query, page).await?;
         let info = PageInfo::from_paginated(&paginated, page, PAGE_SIZE);
         Ok(Page {
             values: paginated.values,
@@ -625,7 +636,7 @@ impl BitbucketClient {
     async fn fetch_single_page<T: DeserializeOwned>(
         &self,
         path: &str,
-        extra_query: &[(&str, &str)],
+        extra_query: Vec<(String, String)>,
         page: u32,
     ) -> Result<Paginated<T>, ApiError> {
         let url = format!("{BASE_URL}{path}");
@@ -790,11 +801,45 @@ fn repositories_query(sort: ListSort) -> [(&'static str, &'static str); 2] {
     [("role", "member"), ("sort", sort.query_value())]
 }
 
-/// PR 一覧取得の追加クエリ（state フィルタの繰り返し + 現在のソート）。
-fn pull_requests_query<'a>(states: &'a [&'a str], sort: ListSort) -> Vec<(&'a str, &'a str)> {
-    let mut query: Vec<(&str, &str)> = states.iter().map(|state| ("state", *state)).collect();
-    query.push(("sort", sort.query_value()));
+/// PR 一覧取得の追加クエリ。
+///
+/// - author 指定なし: 実績のある `state` 繰り返しパラメータを維持する（OR として有効）。
+/// - author 指定あり: `q`（BBQL）へ一本化する。**`q` と `state` パラメータを同時指定すると
+///   `state` 側が黙って無視される**（実測）ため、混在させない。値の URL エンコードは
+///   reqwest のクエリ機構（[`BitbucketClient::send_get`] の `.query()`）に委ねる。
+///
+/// `sort` はどちらの経路でも併用する。ネットワークを介さずに検証できるよう純粋関数として
+/// 切り出している（[`repositories_query`] と同じ狙い）。
+fn pull_requests_query(
+    states: &[&str],
+    author_uuid: Option<&str>,
+    sort: ListSort,
+) -> Vec<(String, String)> {
+    let mut query: Vec<(String, String)> = match author_uuid {
+        Some(uuid) => vec![("q".to_string(), bbql_filter(states, uuid))],
+        None => states
+            .iter()
+            .map(|state| ("state".to_string(), (*state).to_string()))
+            .collect(),
+    };
+    query.push(("sort".to_string(), sort.query_value().to_string()));
     query
+}
+
+/// BBQL のフィルタ式（`state IN ("OPEN","MERGED") AND author.uuid="{uuid}"`）を組み立てる。
+///
+/// `states` が空なら author 条件のみ（UI 側は空 state の適用を拒否するため防御的な分岐）。
+fn bbql_filter(states: &[&str], author_uuid: &str) -> String {
+    let author = format!("author.uuid=\"{author_uuid}\"");
+    if states.is_empty() {
+        return author;
+    }
+    let state_list = states
+        .iter()
+        .map(|state| format!("\"{state}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("state IN ({state_list}) AND {author}")
 }
 
 /// ブランチ一覧取得の追加クエリ（最終コミット日時降順で固定）。ページを跨いでも順序が
@@ -810,14 +855,22 @@ fn pipelines_query() -> [(&'static str, &'static str); 1] {
     [("sort", "-created_on")]
 }
 
-/// 単一ページ取得のクエリを組み立てる。`extra` の後ろに `page`/`pagelen`（固定 [`PAGE_SIZE`]）
-/// を追加する。ネットワークを介さずに検証できるよう、実際のリクエスト送信
-/// （[`BitbucketClient::fetch_single_page`]）から切り出した純粋関数にしている。
-fn page_query(extra: &[(&str, &str)], page: u32) -> Vec<(String, String)> {
-    let mut query: Vec<(String, String)> = extra
+/// `&str` ペアの固定クエリを所有クエリ（`Vec<(String, String)>`）へ変換する。
+/// [`BitbucketClient::fetch_single_page`] は動的な値（PR 一覧の `q` フィルタ等）も受けられる
+/// よう所有クエリに統一しているため、固定クエリ（[`repositories_query`] 等）はこれで変換して
+/// 渡す。
+fn owned_query(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-        .collect();
+        .collect()
+}
+
+/// 単一ページ取得のクエリを組み立てる。`query` の後ろに `page`/`pagelen`（固定 [`PAGE_SIZE`]）
+/// を追加する。動的な値（PR 一覧の `q` フィルタ等）も受けられるよう所有クエリで受ける。
+/// ネットワークを介さずに検証できるよう、実際のリクエスト送信
+/// （[`BitbucketClient::fetch_single_page`]）から切り出した純粋関数にしている。
+fn page_query(mut query: Vec<(String, String)>, page: u32) -> Vec<(String, String)> {
     query.push(("page".to_string(), page.to_string()));
     query.push(("pagelen".to_string(), PAGE_SIZE.to_string()));
     query
@@ -1101,23 +1154,76 @@ mod tests {
     }
 
     #[test]
-    fn pull_requests_query_repeats_state_and_appends_selected_sort() {
+    fn pull_requests_query_without_author_repeats_state_and_appends_selected_sort() {
         assert_eq!(
-            pull_requests_query(&["OPEN", "MERGED"], ListSort::Newest),
-            vec![
+            pull_requests_query(&["OPEN", "MERGED"], None, ListSort::Newest),
+            owned_query(&[
                 ("state", "OPEN"),
                 ("state", "MERGED"),
                 ("sort", "-created_on"),
-            ]
+            ])
         );
     }
 
     #[test]
     fn pull_requests_query_with_no_states_only_has_sort() {
         assert_eq!(
-            pull_requests_query(&[], ListSort::LeastRecentlyUpdated),
-            vec![("sort", "updated_on")]
+            pull_requests_query(&[], None, ListSort::LeastRecentlyUpdated),
+            owned_query(&[("sort", "updated_on")])
         );
+    }
+
+    #[test]
+    fn pull_requests_query_with_author_uses_single_q_and_omits_state_params() {
+        // 実測で `q` と `state` の併用は `state` 側が黙って無視されるため、author 指定時は
+        // `q` に一本化し `state` パラメータを一切付けない。`sort` は併用する。
+        let query = pull_requests_query(
+            &["OPEN", "MERGED"],
+            Some("{d3f5e4b0-1234-5678-9abc-def012345678}"),
+            ListSort::Newest,
+        );
+        assert_eq!(
+            query,
+            owned_query(&[
+                (
+                    "q",
+                    r#"state IN ("OPEN","MERGED") AND author.uuid="{d3f5e4b0-1234-5678-9abc-def012345678}""#,
+                ),
+                ("sort", "-created_on"),
+            ])
+        );
+        assert!(query.iter().all(|(key, _)| key != "state"));
+    }
+
+    #[test]
+    fn pull_requests_query_with_author_and_no_states_filters_by_author_only() {
+        // UI は空 state の適用を拒否するが、防御的に `state IN ()`（不正な BBQL）を作らない。
+        assert_eq!(
+            pull_requests_query(&[], Some("{u-1}"), ListSort::RecentlyUpdated),
+            owned_query(&[("q", r#"author.uuid="{u-1}""#), ("sort", "-updated_on")])
+        );
+    }
+
+    #[test]
+    fn pull_requests_q_value_is_url_encoded_by_reqwest_query_mechanism() {
+        // `q` の値の URL エンコードは手組みせず reqwest の `.query()` に委ねる。
+        // 空白・引用符・波括弧が生のまま URL に残らないことを確認する。
+        let query = pull_requests_query(&["OPEN", "MERGED"], Some("{u-1}"), ListSort::Newest);
+        let request = HttpClient::new()
+            .get("https://api.bitbucket.org/2.0/repositories/ws/repo/pullrequests")
+            .query(&query)
+            .build()
+            .expect("test request should build");
+        let url = request.url().as_str();
+        assert!(url.contains("q=state"));
+        assert!(url.contains("sort=-created_on"));
+        assert!(
+            !url.contains("state="),
+            "q 使用時は state パラメータを付けない: {url}"
+        );
+        assert!(!url.contains(' '), "空白がエンコードされていない: {url}");
+        assert!(!url.contains('"'), "引用符がエンコードされていない: {url}");
+        assert!(!url.contains('{'), "波括弧がエンコードされていない: {url}");
     }
 
     #[test]
@@ -1132,7 +1238,7 @@ mod tests {
 
     #[test]
     fn page_query_for_pipelines_includes_sort_page_and_fixed_pagelen() {
-        let query = page_query(&pipelines_query(), 2);
+        let query = page_query(owned_query(&pipelines_query()), 2);
         assert_eq!(
             query,
             vec![
@@ -1145,7 +1251,7 @@ mod tests {
 
     #[test]
     fn page_query_for_branches_includes_sort_page_and_fixed_pagelen() {
-        let query = page_query(&branches_query(), 2);
+        let query = page_query(owned_query(&branches_query()), 2);
         assert_eq!(
             query,
             vec![
@@ -1158,7 +1264,10 @@ mod tests {
 
     #[test]
     fn page_query_includes_page_and_fixed_pagelen_after_extra_query() {
-        let query = page_query(&[("role", "member"), ("sort", "-updated_on")], 3);
+        let query = page_query(
+            owned_query(&[("role", "member"), ("sort", "-updated_on")]),
+            3,
+        );
         assert_eq!(
             query,
             vec![
@@ -1172,7 +1281,7 @@ mod tests {
 
     #[test]
     fn page_query_with_no_extra_query() {
-        let query = page_query(&[], 1);
+        let query = page_query(Vec::new(), 1);
         assert_eq!(
             query,
             vec![
