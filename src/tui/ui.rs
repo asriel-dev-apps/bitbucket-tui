@@ -26,8 +26,8 @@ use crate::tui::app::{
     App, CommentAction, CommentActionHit, CommentEditor, CommentRow, CommentRowKind, ConfirmModal,
     DeleteCommentModal, DetailFocus, DiffFocus, DiffState, DiffViewMode, DisplayRow, HintLayout,
     ImageHit, JumpPaletteState, LinkPalette, ListKind, ListLayout, MergeModal, ModalKind,
-    ModalLayout, PageJumpModal, PaneKind, PrFilterModal, PrFilterSection, PrState, Screen,
-    SelectList, Status, comment_action_labels, format_when, now_unix,
+    ModalLayout, PageJumpModal, PaneKind, PrFilterModal, PrFilterRow, PrFilterSection, PrState,
+    Screen, SelectList, Status, comment_action_labels, format_when, now_unix,
 };
 use crate::tui::diff::{DiffLineKind, FileStatus, ParsedDiff, SidebarRow};
 use crate::tui::onboarding::Field;
@@ -114,7 +114,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         });
     }
     if let Some(modal) = &app.pr_filter_modal {
-        let area = centered_rect(52, 62, frame.area());
+        // Target branch セクションの追加（M8 8.6）で行数が増えたため縦を広めに取る。
+        let area = centered_rect(52, 75, frame.area());
         render_pr_filter_modal(frame, area, modal, &app.theme);
         // モーダルとして登録し、モーダル外クリックを Esc（取消）として扱う既存機構に乗せる。
         app.layout.modal = Some(ModalLayout {
@@ -623,7 +624,7 @@ fn pull_request_row(pr: &PullRequest, theme: &Theme) -> Line<'static> {
         .as_deref()
         .map(|value| value.chars().take(10).collect::<String>())
         .unwrap_or_default();
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(format!("#{:<5}", pr.id), Style::new().fg(theme.warning)),
         Span::styled(
             format!("{:<9}", pr.state_str()),
@@ -635,11 +636,16 @@ fn pull_request_row(pr: &PullRequest, theme: &Theme) -> Line<'static> {
             Style::new().fg(theme.info),
         ),
         Span::styled(format!("  {updated}"), Style::new().dim()),
-        Span::styled(
+    ];
+    // レビュアーが 1 人もいない PR に `✔0/0` を出しても意味がないため省く
+    // （詳細画面の承認パネルは現状維持）。
+    if pr.reviewer_count() > 0 {
+        spans.push(Span::styled(
             format!("  ✔{}/{}", pr.approved_count(), pr.reviewer_count()),
             Style::new().fg(theme.success),
-        ),
-    ])
+        ));
+    }
+    Line::from(spans)
 }
 
 /// PR の `state` に対応する前景色。OPEN=成功 / MERGED=強調 / DECLINED=危険 /
@@ -1250,7 +1256,7 @@ fn render_diff_sidebar(frame: &mut Frame, area: Rect, diff: &DiffState, theme: &
 }
 
 /// サイドバーのツリー 1 行を [`ListItem`] に整形する。フォルダは淡色 + `name/`、ファイルは
-/// `basename  +A -R  🗨N`（値が 0 の要素は省略）。深さぶんインデントし、`content_width` に
+/// `basename  +A -R  💬N`（値が 0 の要素は省略）。深さぶんインデントし、`content_width` に
 /// 収まるよう名前を中略して統計・バッジが右端で切れないようにする。
 fn sidebar_row_item(
     row: &SidebarRow,
@@ -1314,7 +1320,7 @@ fn sidebar_row_item(
                 .unwrap_or(0);
             if count > 0 {
                 suffix.push(Span::styled(
-                    format!("  🗨{count}"),
+                    format!("  💬{count}"),
                     Style::new().fg(theme.info),
                 ));
             }
@@ -1373,6 +1379,11 @@ fn truncate_file_name(name: &str, max_width: u16) -> String {
     format!("…{tail}")
 }
 
+/// 行番号ガター 1 列の桁数（最大行番号の 10 進桁数。行番号を 1 つも持たない diff は 1）。
+fn line_no_width(max: Option<u32>) -> usize {
+    max.map_or(1, |value| value.to_string().len())
+}
+
 /// 差分の可視範囲 `[start, end)` を計算する。
 ///
 /// `scroll`/`viewport`/総行数のどんな組み合わせでも `start <= end <= len` を保証する
@@ -1396,15 +1407,39 @@ fn render_diff_body(
     let position = diff_cursor_position_label(diff);
     let title = format!(" diff {} ({total} 行){position} ", diff.title);
     if diff.rendered_lines.is_none() {
+        // 各行の左に旧/新行番号の 2 列ガター（`{old:>ow$} {new:>nw$} `、桁数はその diff 全体の
+        // 最大行番号）を焼き込む。削除行=旧のみ・追加行=新のみ・文脈行=両方で、行番号を持たない
+        // FileHeader/Hunk/Meta 行は空白になる（`DiffLine::old_no`/`new_no` が `None` のため）。
+        // テキスト先頭に span が 1 つ増えるだけなので、表示行モデル・コメントボックス（全幅）・
+        // アクションリンクのヒットボックスには影響しない。split 表示は対象外。
+        let old_width = line_no_width(
+            diff.parsed
+                .lines
+                .iter()
+                .filter_map(|line| line.old_no)
+                .max(),
+        );
+        let new_width = line_no_width(
+            diff.parsed
+                .lines
+                .iter()
+                .filter_map(|line| line.new_no)
+                .max(),
+        );
         diff.rendered_lines = Some(
             diff.parsed
                 .lines
                 .iter()
                 .map(|line| {
-                    Line::from(Span::styled(
-                        line.text.clone(),
-                        diff_line_style(theme, line.kind),
-                    ))
+                    let old_no = line.old_no.map_or(String::new(), |no| no.to_string());
+                    let new_no = line.new_no.map_or(String::new(), |no| no.to_string());
+                    Line::from(vec![
+                        Span::styled(
+                            format!("{old_no:>old_width$} {new_no:>new_width$} "),
+                            Style::new().fg(theme.muted),
+                        ),
+                        Span::styled(line.text.clone(), diff_line_style(theme, line.kind)),
+                    ])
                 })
                 .collect(),
         );
@@ -1511,7 +1546,7 @@ fn comment_box_line(
             resolved,
         } => {
             let budget = width.saturating_sub(4);
-            let marker = if *reply { "↳ " } else { "🗨 " };
+            let marker = if *reply { "↳ " } else { "💬 " };
             // 枠がずれないよう、固定部（marker/when/解決）を差し引いて著者名をクリップする。
             // `when` は生の created_on。相対時刻はこの場（毎フレーム）で整形する。
             let when_part = if when.is_empty() {
@@ -1572,7 +1607,7 @@ fn comment_box_line(
             let text = if *resolved {
                 format!("▸ ✓ {author} resolved this thread ({count})")
             } else {
-                format!("▸ 🗨 {author} · thread ({count})")
+                format!("▸ 💬 {author} · thread ({count})")
             };
             let shown = clip_to_width(&text, width.max(1));
             let style = if *resolved {
@@ -2701,8 +2736,13 @@ fn render_status(frame: &mut Frame, area: Rect, status: &Status, theme: &Theme) 
 /// 画面ごとのキーヒント（`(key, 説明)` の並び）。フッターとヘルプ双方の元データにはしない
 /// （ヘルプは操作範囲が広く独立して管理する方が読みやすいため）。フッターは要点のみ。
 ///
-/// `Ctrl+K`（ジャンプパレット）/ `?`（ヘルプ）/ `q`（終了）は `on_key` の優先度チェーン上
-/// Onboarding を除く全画面で有効なため、末尾に共通で付与する（画面ごとの重複記述を避ける）。
+/// 並び順の方針は「`?`（ヘルプ）→ 画面固有のアクションキー → 汎用（`Enter`/`Esc`/`↑↓jk`/
+/// `Ctrl+K`/`q` 等）」。[`render_hints`] は収まらないエントリを末尾から落とすため、幅が
+/// 足りないときは汎用側から消える（`?` は先頭に置くので絶対に落ちない）。`PgUp/PgDn` と
+/// `Shift+J/K` は機能・ヘルプ全文には残すがフッターには出さない（要点を絞る方針）。
+///
+/// `?`/`Ctrl+K`/`q` は `on_key` の優先度チェーン上 Onboarding を除く全画面で有効なため、
+/// 先頭（`?`）と末尾（`Ctrl+K`/`q`）へ共通で付与する（画面ごとの重複記述を避ける）。
 /// Onboarding だけは対象外: `Ctrl+K` は emacs 風の「行末まで削除」に使用中で、`?` もヘルプでは
 /// なく通常の入力文字として扱われる（[`crate::tui::app::App::on_key_onboarding`] 参照）。
 fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
@@ -2714,17 +2754,13 @@ fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("Ctrl+C", "終了"),
         ],
         Screen::Workspaces => vec![
-            ("↑↓/jk", "移動"),
-            ("Shift+J/K", "10件移動"),
-            ("Enter", "開く"),
             ("/", "検索"),
             ("[/]", "前/次ページ"),
             ("g", "ページ番号ジャンプ"),
+            ("↑↓/jk", "移動"),
+            ("Enter", "開く"),
         ],
         Screen::Repositories => vec![
-            ("↑↓/jk", "移動"),
-            ("Shift+J/K", "10件移動"),
-            ("Enter", "PR"),
             ("p", "パイプライン"),
             ("b", "ブランチ"),
             ("s", "ソース"),
@@ -2732,16 +2768,13 @@ fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("S", "並び替え"),
             ("[/]", "前/次ページ"),
             ("g", "ページ番号ジャンプ"),
+            ("↑↓/jk", "移動"),
+            ("Enter", "PR"),
             ("Esc", "戻る"),
         ],
+        // 状態フィルタの単発キー（o/m/d/a）は機能・ヘルプに残すがフッターには出さない
+        // （フィルタ系の入口は `f` に一本化する）。
         Screen::PullRequests => vec![
-            ("↑↓/jk", "移動"),
-            ("Shift+J/K", "10件移動"),
-            ("Enter", "詳細"),
-            ("o", "Open"),
-            ("m", "Merged"),
-            ("d", "Declined"),
-            ("a", "All"),
             ("f", "フィルタ"),
             ("r", "再読込"),
             ("P", "パイプライン"),
@@ -2751,14 +2784,12 @@ fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("S", "並び替え"),
             ("[/]", "前/次ページ"),
             ("g", "ページ番号ジャンプ"),
+            ("↑↓/jk", "移動"),
+            ("Enter", "詳細"),
             ("Esc", "戻る"),
         ],
         Screen::PullRequestDetail => vec![
             ("Tab", "ペイン移動"),
-            ("↑↓/jk", "フォーカス先を移動"),
-            ("Shift+J/K", "10行/10件"),
-            ("PgUp/PgDn", "1画面"),
-            ("g/G", "先頭/末尾"),
             ("d", "Diff"),
             ("c", "コメント"),
             ("a", "承認"),
@@ -2767,15 +2798,12 @@ fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("o", "ブラウザで開く"),
             ("i", "画像を表示"),
             ("L", "リンク"),
+            ("↑↓/jk", "フォーカス先を移動"),
+            ("g/G", "先頭/末尾"),
             ("Esc", "戻る"),
         ],
         Screen::Diff => vec![
             ("Tab", "一覧/本文"),
-            ("↑↓/jk", "選択/現在行移動"),
-            ("Shift+J/K", "10行"),
-            ("n/N", "ファイル境界"),
-            ("PgUp/PgDn", "1画面"),
-            ("g/G", "先頭/末尾"),
             ("v", "表示切替(unified/split)"),
             ("t", "ファイル一覧 表示/非表示"),
             ("c", "コメント"),
@@ -2783,74 +2811,63 @@ fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("e", "編集"),
             ("d", "削除"),
             ("R", "解決"),
+            ("n/N", "ファイル境界"),
+            ("↑↓/jk", "選択/現在行移動"),
+            ("g/G", "先頭/末尾"),
             ("Enter", "折りたたみ"),
             ("Esc", "戻る"),
         ],
         Screen::Pipelines => vec![
-            ("↑↓/jk", "移動"),
-            ("Shift+J/K", "10件移動"),
-            ("Enter", "詳細"),
             ("r", "再読込"),
             ("a", "自動更新"),
             ("S", "停止"),
             ("R", "再実行"),
             ("[/]", "前/次ページ"),
             ("g", "ページ番号ジャンプ"),
+            ("↑↓/jk", "移動"),
+            ("Enter", "詳細"),
             ("Esc", "戻る"),
         ],
         Screen::PipelineDetail => vec![
-            ("↑↓/jk", "ステップ"),
-            ("Shift+J/K", "10件移動"),
-            ("Enter", "ログ"),
             ("r", "再読込"),
             ("a", "自動更新"),
             ("S", "停止"),
             ("R", "再実行"),
+            ("↑↓/jk", "ステップ"),
+            ("Enter", "ログ"),
             ("Esc", "戻る"),
         ],
         Screen::StepLog => vec![
-            ("↑↓/jk", "スクロール"),
-            ("Shift+J/K", "10行"),
-            ("PgUp/PgDn", "1画面"),
-            ("g/G", "先頭/末尾"),
             ("r", "再取得"),
+            ("↑↓/jk", "スクロール"),
+            ("g/G", "先頭/末尾"),
             ("Esc", "戻る"),
         ],
         Screen::Branches => vec![
-            ("↑↓/jk", "移動"),
-            ("Shift+J/K", "10件移動"),
-            ("Enter", "コミット履歴"),
             ("s", "ソース"),
             ("r", "再読込"),
             ("[/]", "前/次ページ"),
             ("g", "ページ番号ジャンプ"),
+            ("↑↓/jk", "移動"),
+            ("Enter", "コミット履歴"),
             ("Esc", "戻る"),
         ],
         Screen::Commits => vec![
-            ("↑↓/jk", "移動"),
-            ("Shift+J/K", "10件移動"),
-            ("Enter", "詳細"),
             ("r", "再読込"),
             ("[/]", "前/次ページ"),
-            ("Esc", "戻る"),
-        ],
-        Screen::CommitDetail => vec![
-            ("d", "Diff"),
-            ("↑↓/jk/PgUp/PgDn", "スクロール"),
-            ("Shift+J/K", "10行"),
-            ("Esc", "戻る"),
-        ],
-        Screen::Source => vec![
             ("↑↓/jk", "移動"),
-            ("Shift+J/K", "10件移動"),
+            ("Enter", "詳細"),
+            ("Esc", "戻る"),
+        ],
+        Screen::CommitDetail => vec![("d", "Diff"), ("↑↓/jk", "スクロール"), ("Esc", "戻る")],
+        Screen::Source => vec![
+            ("r", "再読込"),
+            ("↑↓/jk", "移動"),
             ("Enter", "開く"),
             ("Backspace/Esc", "親へ（ルートは戻る）"),
-            ("r", "再読込"),
         ],
         Screen::FileView => vec![
             ("↑↓/jk", "スクロール"),
-            ("Shift+J/K", "10行"),
-            ("PgUp/PgDn", "1画面"),
             ("g/G", "先頭/末尾"),
             ("Esc", "戻る"),
         ],
@@ -2858,8 +2875,8 @@ fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
     };
 
     if screen != Screen::Onboarding {
+        entries.insert(0, ("?", "ヘルプ"));
         entries.push(("Ctrl+K", "ジャンプ"));
-        entries.push(("?", "ヘルプ"));
         entries.push(("q", "終了"));
     }
 
@@ -2901,13 +2918,11 @@ fn hint_key(label: &str) -> KeyEvent {
     let (code, modifiers) = match label {
         value if value.starts_with("Ctrl+C") => (KeyCode::Char('c'), KeyModifiers::CONTROL),
         value if value.starts_with("Ctrl+K") => (KeyCode::Char('k'), KeyModifiers::CONTROL),
-        value if value.starts_with("Shift+J") => (KeyCode::Char('J'), KeyModifiers::SHIFT),
         value if value.starts_with("Tab") => (KeyCode::Tab, KeyModifiers::NONE),
         value if value.starts_with("Enter") => (KeyCode::Enter, KeyModifiers::NONE),
         value if value.starts_with("Esc") || value.starts_with("Backspace/Esc") => {
             (KeyCode::Esc, KeyModifiers::NONE)
         }
-        value if value.starts_with("PgUp") => (KeyCode::PageDown, KeyModifiers::NONE),
         value if value.starts_with("↑↓") => (KeyCode::Down, KeyModifiers::NONE),
         value if value.starts_with("←→") => (KeyCode::Right, KeyModifiers::NONE),
         value if value.starts_with("[/]") => (KeyCode::Char(']'), KeyModifiers::NONE),
@@ -3066,13 +3081,26 @@ fn render_merge_modal(
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// PR フィルタモーダル（`f`）。上段は state のチェックボックス（Space でトグル）、下段は
-/// author の単一選択（カーソル位置＝選択）。フォーカス中セクションの見出しを強調し、
-/// カーソル行に `▶` を出す。author 候補が多い場合はカーソルに追従する窓で切り出す。
+/// PR フィルタモーダル（`f`）。上段は state のチェックボックス（Space でトグル）、中段は
+/// author、下段は target branch の単一選択（カーソル位置＝選択）。フォーカス中セクションの
+/// 見出しを強調し、カーソル行に `▶` を出す。候補が多い場合はカーソルに追従する窓で切り出す
+/// （固定行（見出し・検索行・キー案内等）は積む行数から導出し、残りを両セクションで
+/// 分け合う。低い端末では候補窓を 0 行まで縮めて固定行を守り、内側の高さを超えない）。
+///
+/// Author / Target セクションは印字文字で fuzzy 検索できる（`author_query`/`target_query`）。
+/// 見出し直下に検索クエリ行を常置し、Author はクエリ非空のときは「All authors」行を出さず
+/// マッチした候補のみを表示する（0 件は「(該当なし)」）。Target は先頭に「All branches」、
+/// クエリ非空なら次に「『{query}』で部分一致」、続いてマッチした実在ブランチ候補を表示する。
+/// 行 → 選択の写像は適用側と共有する [`PrFilterModal::author_row`] /
+/// [`PrFilterModal::target_row`] に従う（読み込み中は選択可能な行を出さず
+/// 「読み込み中…」プレースホルダのみ。ただし Target はクエリ入力済みなら All branches /
+/// 部分一致行が候補なしでも選べる）。
 fn render_pr_filter_modal(frame: &mut Frame, area: Rect, modal: &PrFilterModal, theme: &Theme) {
     frame.render_widget(Clear, area);
 
     let states_focused = modal.section == PrFilterSection::States;
+    let author_focused = modal.section == PrFilterSection::Author;
+    let target_focused = modal.section == PrFilterSection::Target;
     let section_style = |focused: bool| {
         if focused {
             Style::new().fg(theme.accent).bold()
@@ -3080,7 +3108,24 @@ fn render_pr_filter_modal(frame: &mut Frame, area: Rect, modal: &PrFilterModal, 
             Style::new().fg(theme.muted).bold()
         }
     };
+    let query_line = |query: &str, focused: bool| {
+        Line::from(vec![
+            Span::styled("  検索: ", Style::new().fg(theme.muted)),
+            Span::raw(query.to_string()),
+            Span::styled(
+                "▏",
+                Style::new().fg(if focused { theme.accent } else { theme.muted }),
+            ),
+        ])
+    };
+    let placeholder_line = |text: &str| {
+        Line::from(Span::styled(
+            format!("    {text}"),
+            Style::new().fg(theme.muted),
+        ))
+    };
 
+    // ---- 固定行（author 窓より前）----
     let mut lines = vec![Line::from(Span::styled(
         "State",
         section_style(states_focused),
@@ -3101,47 +3146,105 @@ fn render_pr_filter_modal(frame: &mut Frame, area: Rect, modal: &PrFilterModal, 
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         "Author",
-        section_style(!states_focused),
+        section_style(author_focused),
     )));
+    // 検索クエリ行（Author セクションで印字文字を追記・Backspace で削除。カーソルは常に末尾）。
+    lines.push(query_line(&modal.author_query, author_focused));
 
-    match &modal.authors {
-        None => lines.push(Line::from(Span::styled(
-            "    読み込み中…",
-            Style::new().fg(theme.muted),
-        ))),
-        Some(authors) => {
-            // 固定行: 枠 2 + ここまでに積んだ行（State 見出し + state + 空行 + Author 見出し）
-            // + この後に積む行（空行 + キー案内）2。残りを author 行の窓にする。
-            let fixed_rows = 2 + lines.len() + 2;
-            let capacity = usize::from(area.height).saturating_sub(fixed_rows).max(1);
-            let total_rows = authors.len() + 1;
-            let start = modal
-                .author_cursor
-                .saturating_sub(capacity.saturating_sub(1));
-            for row in start..total_rows.min(start + capacity) {
-                let radio = if row == modal.author_cursor {
-                    "(x)"
-                } else {
-                    "( )"
-                };
-                let label = if row == 0 {
-                    "All authors"
-                } else {
-                    authors
-                        .get(row - 1)
-                        .map(|author| author.display_name.as_str())
-                        .unwrap_or("?")
-                };
-                let hot = !states_focused && row == modal.author_cursor;
-                lines.push(pr_filter_row(hot, &format!("{radio} {label}"), theme));
+    // ---- 固定行（author 窓と target 窓の間・末尾）----
+    let mid = vec![
+        Line::raw(""),
+        Line::from(Span::styled("Target branch", section_style(target_focused))),
+        query_line(&modal.target_query, target_focused),
+    ];
+    let tail = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            "↑↓: 移動   Space: 切替   Tab: セクション   Enter: 適用   Esc: 取消",
+            Style::new().dim(),
+        )),
+    ];
+
+    // ---- 候補窓の割り当て（author / target で残り高さを分け合う） ----
+    // 固定行（枠 2 + ここまでに積んだ行 + mid + tail）を除いた残りが候補窓の予算。
+    // 読み込み中/該当なしのプレースホルダ行も予算に数え、合計が内側の高さを超えない
+    // ようにする（予算が足りなければ候補窓は 0 行まで縮む）。
+    let available =
+        usize::from(area.height).saturating_sub(2 + lines.len() + mid.len() + tail.len());
+    let author_query_empty = modal.author_query.is_empty();
+    let author_total = match &modal.authors {
+        None => 1,                                                              // 読み込み中…
+        Some(_) if !author_query_empty && modal.author_matches.is_empty() => 1, // (該当なし)
+        Some(_) => modal.author_row_count(),
+    };
+    // Target は候補行に加え、読み込み中はその表示行が 1 行付く。
+    let target_total = modal.target_row_count() + usize::from(modal.branches.is_none());
+    let author_capacity =
+        author_total.min(available.saturating_sub(target_total.min(available / 2)));
+    let target_capacity = target_total.min(available.saturating_sub(author_capacity));
+
+    // ---- author 窓 ----
+    if author_capacity > 0 {
+        match &modal.authors {
+            // 読み込み中は選択可能な行を出さない（Enter は現用維持。表示と適用を一致させる）。
+            None => lines.push(placeholder_line("読み込み中…")),
+            Some(_) if !author_query_empty && modal.author_matches.is_empty() => {
+                // Enter しても現用 author を維持する（app 側の適用ロジックと対応）。
+                lines.push(placeholder_line("(該当なし)"));
+            }
+            Some(_) => {
+                let total_rows = modal.author_row_count();
+                let start = modal
+                    .author_cursor
+                    .saturating_sub(author_capacity.saturating_sub(1));
+                for row in start..total_rows.min(start + author_capacity) {
+                    let radio = if row == modal.author_cursor {
+                        "(x)"
+                    } else {
+                        "( )"
+                    };
+                    let label = match modal.author_row(row) {
+                        PrFilterRow::All => "All authors",
+                        PrFilterRow::Candidate(author) => author.display_name.as_str(),
+                        PrFilterRow::Partial | PrFilterRow::Missing => "?",
+                    };
+                    let hot = author_focused && row == modal.author_cursor;
+                    lines.push(pr_filter_row(hot, &format!("{radio} {label}"), theme));
+                }
             }
         }
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        "↑↓/jk: 移動   Space: 切替   Tab: セクション   Enter: 適用   Esc: 取消",
-        Style::new().dim(),
-    )));
+    lines.extend(mid);
+
+    // ---- target 窓 ----
+    {
+        let total_rows = modal.target_row_count();
+        // 読み込み中はその表示行を予算から確保し、残りへ候補行（クエリ入力済みの
+        // All branches / 部分一致行）を出す。
+        let rows_capacity = target_capacity.saturating_sub(usize::from(modal.branches.is_none()));
+        let start = modal
+            .target_cursor
+            .saturating_sub(rows_capacity.saturating_sub(1));
+        for row in start..total_rows.min(start + rows_capacity) {
+            let radio = if row == modal.target_cursor {
+                "(x)"
+            } else {
+                "( )"
+            };
+            let label: String = match modal.target_row(row) {
+                PrFilterRow::All => "All branches".to_string(),
+                PrFilterRow::Partial => format!("『{}』で部分一致", modal.target_query),
+                PrFilterRow::Candidate(name) => name.to_string(),
+                PrFilterRow::Missing => "?".to_string(),
+            };
+            let hot = target_focused && row == modal.target_cursor;
+            lines.push(pr_filter_row(hot, &format!("{radio} {label}"), theme));
+        }
+        if modal.branches.is_none() && target_capacity > 0 {
+            lines.push(placeholder_line("読み込み中…"));
+        }
+    }
+    lines.extend(tail);
 
     // 非破壊的な入力オーバーレイなのでフォーカス色の枠線（コメントエディタと同じ方針）。
     let block = rounded_block(theme, theme.border_focus)
@@ -3209,8 +3312,9 @@ fn render_help(frame: &mut Frame, area: Rect, screen: Screen, theme: &Theme) {
             "m              状態フィルタ: Merged",
             "d              状態フィルタ: Declined",
             "a              状態フィルタ: All",
-            "f              フィルタモーダル（state 複数選択 + author。↑↓/jk 移動,",
-            "               Space 切替, Tab セクション, Enter 適用, Esc 取消）",
+            "f              フィルタモーダル（state 複数選択 + author / target branch 検索。",
+            "               State は ↑↓/jk 移動 + Space 切替, Author/Target は文字入力で絞込み +",
+            "               ↑↓ 候補移動, Tab セクション, Enter 適用, Esc 取消）",
             "r              再読込（現在ページ）",
             "Enter          PR 詳細を開く",
             "P              パイプライン一覧を開く",
@@ -3822,9 +3926,9 @@ mod tests {
             content.contains('└'),
             "box bottom border missing: {content}"
         );
-        // アクションリンク行（Reply）と 🗨 アイコンも出る。
+        // アクションリンク行（Reply）と 💬 アイコンも出る。
         assert!(content.contains("Reply"), "action links missing: {content}");
-        assert!(content.contains('🗨'), "bubble icon missing: {content}");
+        assert!(content.contains('💬'), "bubble icon missing: {content}");
     }
 
     #[test]
@@ -3859,6 +3963,85 @@ mod tests {
         assert!(hits.iter().all(|hit| hit.comment_id == 1));
         // ヒットボックスの行はボックス内のアクション行（枠+diff3行+Top+Header+Body の次 = y7）。
         assert!(hits.iter().all(|hit| hit.area.height == 1));
+    }
+
+    #[test]
+    fn render_diff_body_prefixes_unified_lines_with_line_number_gutter() {
+        // 旧最大 10（2 桁）・新最大 99〜100（3 桁）→ ガターは `{old:>2} {new:>3} `。
+        let mut diff = DiffState {
+            parsed: parse_diff(
+                "diff --git a/x.rs b/x.rs\n@@ -9,2 +99,2 @@\n ctx\n-removed\n+added\n",
+            ),
+            viewport: 8,
+            view_mode: DiffViewMode::Unified,
+            ..Default::default()
+        };
+        let theme = Theme::default();
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| {
+                render_diff_body(frame, frame.area(), &mut diff, &theme);
+            })
+            .expect("draw succeeds");
+        let content = buffer_text(terminal.backend().buffer());
+        // 文脈行 = 旧/新の両方、削除行 = 旧のみ、追加行 = 新のみ（いずれも右詰め・桁揃え）。
+        assert!(content.contains(" 9  99  ctx"), "context gutter: {content}");
+        assert!(
+            content.contains("10     -removed"),
+            "removed gutter: {content}"
+        );
+        assert!(content.contains("   100 +added"), "added gutter: {content}");
+    }
+
+    #[test]
+    fn render_diff_body_gutter_blank_on_meta_rows_and_keeps_comment_hitboxes() {
+        // FileHeader/Hunk/Meta 行のガターは空白（本文の開始列は他行と揃う）。またガターは
+        // diff 行の先頭に span が増えるだけで、コメントボックス（全幅・左枠 x=2）と
+        // アクションリンクのヒットボックス座標（内容開始列 = area.x + 4 + インデント 2）は
+        // 従来のまま動かないことを固定する。
+        let parsed = parse_diff("diff --git a/x.rs b/x.rs\n@@ -0,0 +1 @@\n+new line\n");
+        let json = r#"{ "id": 1, "content": { "raw": "hi" },
+                        "user": { "display_name": "Bob" }, "deleted": false,
+                        "created_on": "2026-05-27T00:00:00Z",
+                        "inline": { "path": "x.rs", "to": 1 } }"#;
+        let comment: Comment = serde_json::from_str(json).expect("valid inline comment json");
+        let comment_layout = build_comment_layout(&parsed, &[comment], &Default::default());
+        let mut diff = DiffState {
+            parsed,
+            viewport: 12,
+            view_mode: DiffViewMode::Unified,
+            comment_layout,
+            ..Default::default()
+        };
+        diff.rebuild_display_rows();
+        let theme = Theme::default();
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        let mut hits = Vec::new();
+        terminal
+            .draw(|frame| {
+                hits = render_diff_body(frame, frame.area(), &mut diff, &theme);
+            })
+            .expect("draw succeeds");
+        let buffer = terminal.backend().buffer();
+        // 本文開始列: 旧番号なし・新最大 1 → ガター幅 4（`{"":>1} {new:>1} `）。
+        let (fx, _) = find_text_position(buffer, "diff --git").expect("header row drawn");
+        let (hx, hy) = find_text_position(buffer, "@@").expect("hunk row drawn");
+        let (nx, _) = find_text_position(buffer, "+new line").expect("added row drawn");
+        assert_eq!(hx, fx, "ハンク行の本文開始列はヘッダ行と揃う");
+        assert_eq!(nx, fx, "追加行の本文開始列も揃う（ガター幅ぶん右へ）");
+        // ハンク行のガター 4 桁はすべて空白（ペイン内側 x=2 から本文直前まで）。
+        for dx in 1..=4 {
+            let cell = buffer.cell((hx - dx, hy)).expect("gutter cell");
+            assert_eq!(cell.symbol(), " ", "ハンク行のガターは空白");
+        }
+        // コメントボックス左枠は従来どおり x=2（`collect_action_hits` の座標規約）。
+        let (_, by) = find_text_position(buffer, "Bob").expect("comment drawn");
+        let border_cell = buffer.cell((2, by)).expect("box border cell");
+        assert_eq!(border_cell.symbol(), "│");
+        // Reply リンクのヒットボックスも従来位置（area.x + 4 + インデント 2 = x 6）。
+        assert_eq!(hits.first().map(|hit| hit.area.x), Some(6));
     }
 
     #[test]
@@ -4037,7 +4220,7 @@ mod tests {
         assert!(content.contains("lib"), "folder row missing: {content}");
         assert!(content.contains("a.rs"), "file row missing: {content}");
         assert!(content.contains("+1"), "added stat missing: {content}");
-        assert!(content.contains('🗨'), "comment badge missing: {content}");
+        assert!(content.contains('💬'), "comment badge missing: {content}");
         // 変更ファイルの状態マーカー（M）。
         assert!(content.contains('M'), "status marker missing: {content}");
     }
@@ -5348,6 +5531,7 @@ mod tests {
     fn render_hints_stops_at_entry_boundary_when_width_is_narrow() {
         let entries = hint_entries(Screen::ImageView);
         let first = entries.first().expect("entries non-empty");
+        assert_eq!(first.0, "?", "先頭エントリはヘルプ（8.1 の並び順方針）");
         let first_width =
             UnicodeWidthStr::width(format!("{} {}", first.0, first.1).as_str()) as u16;
         // 1 個目は丸ごと収まり、2 個目は（区切り 2 桁を含めて）1 文字も収まらない幅。
@@ -5365,12 +5549,12 @@ mod tests {
         // `buffer_text` は全角文字をセル単位で空白区切りに展開するため、空白を除いて照合する。
         let compact = buffer_text(terminal.backend().buffer()).replace(' ', "");
         assert!(
-            compact.contains("前/次の画像"),
-            "先頭エントリは丸ごと描画される: {compact}"
+            compact.contains('?') && compact.contains("ヘルプ"),
+            "先頭エントリ（?）は丸ごと描画される: {compact}"
         );
-        // 2 個目（"Esc 戻る"）は部分描画もされない（旧実装では "E" だけ残っていた）。
+        // 2 個目（"←→/np 前/次の画像"）は部分描画もされない（エントリ境界で打ち切る）。
         assert!(
-            !compact.contains('E'),
+            !compact.contains('←'),
             "収まらないエントリは 1 文字も描画しない: {compact}"
         );
         // ヒットボックスも描画されたエントリぶんだけ登録される。
@@ -5422,12 +5606,33 @@ mod tests {
         assert_eq!(cursor_cell.symbol(), " ");
     }
 
+    /// `PrFilterModal` のテスト用ベース（Author/Target とも候補未取得・クエリ空）。
+    /// 各テストは必要なフィールドだけ上書きする。
+    fn base_pr_filter_modal() -> PrFilterModal {
+        use std::collections::BTreeSet;
+
+        PrFilterModal {
+            section: PrFilterSection::Author,
+            states: BTreeSet::from([PrState::Open]),
+            state_cursor: 0,
+            author_cursor: 0,
+            authors: None,
+            author_query: String::new(),
+            author_matches: Vec::new(),
+            target_cursor: 0,
+            branches: None,
+            target_query: String::new(),
+            target_matches: Vec::new(),
+        }
+    }
+
     #[test]
     fn render_registers_pr_filter_modal_and_title_shows_filter_label() {
         use std::collections::BTreeSet;
 
+        use crate::api::TargetBranch;
         use crate::config::Config;
-        use crate::tui::app::{PrAuthor, PrFilterModal, PrStateFilter};
+        use crate::tui::app::{PrAuthor, PrStateFilter};
 
         let mut app = App::new(Config::default(), None);
         app.theme = Theme::default();
@@ -5441,16 +5646,23 @@ mod tests {
                 uuid: "{u-1}".to_string(),
                 display_name: "Alice".to_string(),
             }),
+            target_branch: Some(TargetBranch {
+                text: "main".to_string(),
+                exact: true,
+            }),
         };
         app.pr_filter_modal = Some(PrFilterModal {
             section: PrFilterSection::States,
             states: app.pr_state_filter.states.clone(),
-            state_cursor: 0,
             author_cursor: 1,
             authors: Some(vec![PrAuthor {
                 uuid: "{u-1}".to_string(),
                 display_name: "Alice".to_string(),
             }]),
+            author_matches: vec![0],
+            branches: Some(vec!["main".to_string()]),
+            target_matches: vec![0],
+            ..base_pr_filter_modal()
         });
 
         let backend = TestBackend::new(80, 24);
@@ -5465,14 +5677,16 @@ mod tests {
             Some(ModalKind::PrFilter)
         );
         let compact = buffer_text(terminal.backend().buffer()).replace(' ', "");
-        // 一覧タイトルにフィルタ内容が出る。
+        // 一覧タイトルにフィルタ内容（author + 完全一致 target）が出る。
         assert!(
-            compact.contains("OPEN+MERGED,author:Alice"),
+            compact.contains("OPEN+MERGED,author:Alice,target:main"),
             "タイトルにフィルタ内容が出ていない: {compact}"
         );
-        // モーダルの構成要素（見出し・チェックボックス・All authors 行）。
+        // モーダルの構成要素（見出し・チェックボックス・All authors / All branches 行）。
         assert!(compact.contains("PRフィルタ"));
         assert!(compact.contains("Allauthors"));
+        assert!(compact.contains("Targetbranch"));
+        assert!(compact.contains("Allbranches"));
         assert!(compact.contains("[x]OPEN"));
         // 空白除去後の未チェック表現（`[ ]` → `[]`）。
         assert!(compact.contains("[]DECLINED"));
@@ -5480,18 +5694,8 @@ mod tests {
 
     #[test]
     fn render_pr_filter_modal_shows_loading_while_authors_are_none() {
-        use std::collections::BTreeSet;
-
-        use crate::tui::app::PrFilterModal;
-
         let theme = Theme::default();
-        let modal = PrFilterModal {
-            section: PrFilterSection::Author,
-            states: BTreeSet::from([PrState::Open]),
-            state_cursor: 0,
-            author_cursor: 0,
-            authors: None,
-        };
+        let modal = base_pr_filter_modal();
         let backend = TestBackend::new(50, 16);
         let mut terminal = Terminal::new(backend).expect("terminal builds");
         terminal
@@ -5506,9 +5710,7 @@ mod tests {
 
     #[test]
     fn render_pr_filter_modal_author_window_follows_cursor_with_fixed_rows_derived() {
-        use std::collections::BTreeSet;
-
-        use crate::tui::app::{PrAuthor, PrFilterModal};
+        use crate::tui::app::PrAuthor;
 
         let theme = Theme::default();
         let authors: Vec<PrAuthor> = (0..20)
@@ -5518,38 +5720,348 @@ mod tests {
             })
             .collect();
         let modal = PrFilterModal {
-            section: PrFilterSection::Author,
-            states: BTreeSet::from([PrState::Open]),
-            state_cursor: 0,
             author_cursor: 20, // 末尾の author（user19）。
             authors: Some(authors),
+            author_matches: (0..20).collect(),
+            ..base_pr_filter_modal()
         };
-        // 高さ 16 = 固定行 11（枠 2 + State 見出し 1 + state 4 + 空行 1 + Author 見出し 1 +
-        // 空行 1 + キー案内 1）+ author 窓 5 行、の従来レイアウトを固定する回帰テスト。
-        let backend = TestBackend::new(80, 16);
+        // 高さ 22 = 固定行 15（枠 2 + State 見出し 1 + state 4 + 空行 1 + Author 見出し 1 +
+        // 検索行 1 + 空行 1 + Target 見出し 1 + 検索行 1 + 空行 1 + キー案内 1）+ author 窓
+        // 6 行 + Target（読み込み中プレースホルダ）1 行、のレイアウトを固定する回帰テスト
+        // （M8 8.6 の Target セクション追加で固定行が 3 行増え、残りは author/target で
+        // 分け合う。読み込み中の Target は選択可能な行を出さないため 1 行に収まる）。
+        let backend = TestBackend::new(80, 22);
         let mut terminal = Terminal::new(backend).expect("terminal builds");
         terminal
             .draw(|frame| render_pr_filter_modal(frame, frame.area(), &modal, &theme))
             .expect("draw succeeds");
         let compact = buffer_text(terminal.backend().buffer()).replace(' ', "");
-        // 窓はカーソルに追従し、末尾 5 件（user15..user19）だけが見える。
+        // 窓はカーソルに追従し、末尾 6 件（user14..user19）だけが見える。
         assert!(
             compact.contains("(x)user19"),
             "カーソル行が見えない: {compact}"
         );
-        assert!(compact.contains("user15"), "窓の先頭が見えない: {compact}");
+        assert!(compact.contains("user14"), "窓の先頭が見えない: {compact}");
         assert!(
-            !compact.contains("user14"),
+            !compact.contains("user13"),
             "窓の外の候補が見えている: {compact}"
         );
         assert!(
             !compact.contains("Allauthors"),
             "窓の外の先頭行が見えている: {compact}"
         );
+        // Target セクション（読み込み中の間は選択可能な行を出さずプレースホルダのみ）と、
         // 窓の後ろに積むキー案内行も欠けずに描画される。
+        assert!(
+            compact.contains("読み込み中…"),
+            "Target セクションが欠けた: {compact}"
+        );
+        assert!(
+            !compact.contains("Allbranches"),
+            "読み込み中に All branches 行が出ている: {compact}"
+        );
         assert!(
             compact.contains("Enter:適用"),
             "キー案内が欠けた: {compact}"
         );
+    }
+
+    /// 8.6: Target セクションは All branches → 部分一致行 → fuzzy マッチした実在ブランチの
+    /// 順に並び、マッチしないブランチは出さない。
+    #[test]
+    fn render_pr_filter_modal_target_section_shows_partial_row_and_candidates() {
+        let theme = Theme::default();
+        let modal = PrFilterModal {
+            section: PrFilterSection::Target,
+            authors: Some(Vec::new()),
+            branches: Some(vec!["main".to_string(), "release/1.0".to_string()]),
+            target_query: "rel".to_string(),
+            target_matches: vec![1],
+            target_cursor: 1,
+            ..base_pr_filter_modal()
+        };
+        let backend = TestBackend::new(60, 22);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| render_pr_filter_modal(frame, frame.area(), &modal, &theme))
+            .expect("draw succeeds");
+        let compact = buffer_text(terminal.backend().buffer()).replace(' ', "");
+        assert!(compact.contains("Targetbranch"), "見出しが無い: {compact}");
+        assert!(compact.contains("検索:rel▏"), "クエリ行が無い: {compact}");
+        assert!(compact.contains("Allbranches"), "先頭行が無い: {compact}");
+        assert!(
+            compact.contains("(x)『rel』で部分一致"),
+            "部分一致行（カーソル）が無い: {compact}"
+        );
+        assert!(
+            compact.contains("release/1.0"),
+            "マッチした候補が無い: {compact}"
+        );
+        assert!(
+            !compact.contains("main"),
+            "マッチしない候補が出ている: {compact}"
+        );
+    }
+
+    /// M8 レビュー修正 F4: 読み込み中の Target セクションは「読み込み中…」プレースホルダ
+    /// のみで、選択可能な All branches 行を出さない（Enter は現用維持のため、表示と適用を
+    /// 一致させる）。クエリ入力済みなら部分一致行は従来どおり表示・適用できる。
+    #[test]
+    fn render_pr_filter_modal_target_loading_hides_all_branches_but_keeps_partial_row() {
+        let theme = Theme::default();
+        // クエリ空: プレースホルダのみ（author 側は取得済みにして、読み込み中表示が
+        // Target のものであることを曖昧にしない）。
+        let modal = PrFilterModal {
+            authors: Some(Vec::new()),
+            ..base_pr_filter_modal()
+        };
+        let backend = TestBackend::new(60, 22);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| render_pr_filter_modal(frame, frame.area(), &modal, &theme))
+            .expect("draw succeeds");
+        let compact = buffer_text(terminal.backend().buffer()).replace(' ', "");
+        assert!(
+            !compact.contains("Allbranches"),
+            "読み込み中に All branches 行が出ている: {compact}"
+        );
+        assert!(
+            !compact.contains('?'),
+            "読み込み中に選択できないラジオ行が出ている: {compact}"
+        );
+        assert!(
+            compact.contains("読み込み中…"),
+            "プレースホルダが無い: {compact}"
+        );
+
+        // クエリ入力済み: 部分一致行は候補が未着でも表示される（適用もできる）。
+        let modal = PrFilterModal {
+            authors: Some(Vec::new()),
+            section: PrFilterSection::Target,
+            target_query: "rel".to_string(),
+            target_cursor: 1,
+            ..base_pr_filter_modal()
+        };
+        let backend = TestBackend::new(60, 22);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| render_pr_filter_modal(frame, frame.area(), &modal, &theme))
+            .expect("draw succeeds");
+        let compact = buffer_text(terminal.backend().buffer()).replace(' ', "");
+        assert!(
+            compact.contains("(x)『rel』で部分一致"),
+            "部分一致行が無い: {compact}"
+        );
+        assert!(
+            compact.contains("読み込み中…"),
+            "プレースホルダが無い: {compact}"
+        );
+    }
+
+    /// M8 レビュー修正 F3: 低い端末では候補窓を（0 行まで）縮めて固定行を守り、Target の
+    /// 検索行とキー案内行が内側の高さからあふれて欠けない。
+    #[test]
+    fn render_pr_filter_modal_low_terminal_keeps_target_query_and_key_hints_visible() {
+        use crate::tui::app::PrAuthor;
+
+        let theme = Theme::default();
+        let authors: Vec<PrAuthor> = (0..5)
+            .map(|index| PrAuthor {
+                uuid: format!("{{u-{index}}}"),
+                display_name: format!("user{index:02}"),
+            })
+            .collect();
+        let modal = PrFilterModal {
+            section: PrFilterSection::Target,
+            authors: Some(authors),
+            author_matches: (0..5).collect(),
+            branches: Some(vec!["main".to_string(), "develop".to_string()]),
+            target_matches: vec![0, 1],
+            ..base_pr_filter_modal()
+        };
+        // 高さ 16 = 固定行 15 + 候補窓 1 行分。固定行（両セクションの検索行・キー案内）を
+        // 優先し、候補窓が予算を奪って下端が欠けないこと。
+        let backend = TestBackend::new(60, 16);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| render_pr_filter_modal(frame, frame.area(), &modal, &theme))
+            .expect("draw succeeds");
+        let compact = buffer_text(terminal.backend().buffer()).replace(' ', "");
+        assert!(compact.contains("Targetbranch"), "見出しが無い: {compact}");
+        assert_eq!(
+            compact.matches("検索:").count(),
+            2,
+            "検索行が欠けた: {compact}"
+        );
+        assert!(
+            compact.contains("Enter:適用"),
+            "キー案内が欠けた: {compact}"
+        );
+    }
+
+    /// 8.1: `?` は各画面のヒント先頭（幅切詰めは末尾から落ちるため絶対に消えない）。
+    /// Onboarding は `?` が通常の入力文字のため対象外（既存のフッター方針のまま）。
+    #[test]
+    fn hint_entries_put_help_key_first_on_every_screen_except_onboarding() {
+        for screen in [
+            Screen::Workspaces,
+            Screen::Repositories,
+            Screen::PullRequests,
+            Screen::PullRequestDetail,
+            Screen::Diff,
+            Screen::Pipelines,
+            Screen::PipelineDetail,
+            Screen::StepLog,
+            Screen::Branches,
+            Screen::Commits,
+            Screen::CommitDetail,
+            Screen::Source,
+            Screen::FileView,
+            Screen::ImageView,
+        ] {
+            let entries = hint_entries(screen);
+            assert_eq!(
+                entries.first().map(|(key, _)| *key),
+                Some("?"),
+                "{screen:?} のヒント先頭が ? ではありません"
+            );
+            // 二重表示しない（`?` は先頭の 1 回だけ）。
+            let count = entries.iter().filter(|(key, _)| *key == "?").count();
+            assert_eq!(count, 1, "{screen:?} で ? が重複しています");
+        }
+    }
+
+    /// 8.1: `PgUp/PgDn`（`f`/`b` 表記含む）と `Shift+J/K` はフッターから外す
+    /// （機能とヘルプ全文には残る）。
+    #[test]
+    fn hint_entries_exclude_page_and_bulk_move_keys_on_every_screen() {
+        for screen in [
+            Screen::Onboarding,
+            Screen::Workspaces,
+            Screen::Repositories,
+            Screen::PullRequests,
+            Screen::PullRequestDetail,
+            Screen::Diff,
+            Screen::Pipelines,
+            Screen::PipelineDetail,
+            Screen::StepLog,
+            Screen::Branches,
+            Screen::Commits,
+            Screen::CommitDetail,
+            Screen::Source,
+            Screen::FileView,
+            Screen::ImageView,
+        ] {
+            for (key, _) in hint_entries(screen) {
+                assert!(
+                    !key.contains("PgUp") && !key.contains("PgDn") && !key.contains("Shift+J"),
+                    "{screen:?} のフッターに {key} が残っています"
+                );
+            }
+        }
+    }
+
+    /// 8.1: PR 一覧のフィルタ系ヒントは `f` のみ（`o`/`m`/`d`/`a` の単発キーは機能・ヘルプ
+    /// には残すがフッターには出さない）。
+    #[test]
+    fn hint_entries_pull_requests_show_filter_modal_key_only() {
+        let keys: Vec<&str> = hint_entries(Screen::PullRequests)
+            .iter()
+            .map(|(key, _)| *key)
+            .collect();
+        assert!(keys.contains(&"f"), "f が無い: {keys:?}");
+        for excluded in ["o", "m", "d", "a"] {
+            assert!(
+                !keys.contains(&excluded),
+                "PR 一覧のフッターに {excluded} が残っています: {keys:?}"
+            );
+        }
+    }
+
+    /// 8.1: 幅が極端に狭くても先頭の `?` は必ず描画される。
+    #[test]
+    fn render_hints_keeps_help_key_even_when_width_is_very_narrow() {
+        let mut app = App::new(crate::config::Config::default(), None);
+        app.theme = Theme::default();
+        app.screen = Screen::PullRequests;
+
+        // "? ヘルプ"（幅 8）だけがちょうど収まる幅。
+        let backend = TestBackend::new(8, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| render_hints(frame, frame.area(), &mut app))
+            .expect("draw succeeds");
+        let compact = buffer_text(terminal.backend().buffer()).replace(' ', "");
+        assert!(
+            compact.contains('?') && compact.contains("ヘルプ"),
+            "狭幅でも ? は落ちない: {compact}"
+        );
+        assert_eq!(app.layout.hints.len(), 1);
+    }
+
+    /// 8.4: 検索クエリ行が表示され、クエリ非空で候補 0 件なら「(該当なし)」を出す
+    /// （All authors 行はクエリ非空の間は出さない）。
+    #[test]
+    fn render_pr_filter_modal_shows_query_line_and_no_match_placeholder() {
+        use crate::tui::app::PrAuthor;
+
+        let theme = Theme::default();
+        let modal = PrFilterModal {
+            authors: Some(vec![PrAuthor {
+                uuid: "{u-1}".to_string(),
+                display_name: "Alice".to_string(),
+            }]),
+            author_query: "zz".to_string(),
+            ..base_pr_filter_modal()
+        };
+        let backend = TestBackend::new(60, 19);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| render_pr_filter_modal(frame, frame.area(), &modal, &theme))
+            .expect("draw succeeds");
+        let compact = buffer_text(terminal.backend().buffer()).replace(' ', "");
+        assert!(compact.contains("検索:zz▏"), "クエリ行が無い: {compact}");
+        assert!(compact.contains("(該当なし)"), "0 件表示が無い: {compact}");
+        assert!(
+            !compact.contains("Allauthors"),
+            "クエリ非空では All authors を出さない: {compact}"
+        );
+        assert!(
+            !compact.contains("Alice"),
+            "マッチしない候補は出さない: {compact}"
+        );
+    }
+
+    /// 8.5: `✔n/m` バッジはレビュアー 0 のとき出さない（1 人以上なら従来どおり）。
+    #[test]
+    fn pull_request_row_hides_review_badge_when_there_are_no_reviewers() {
+        let theme = Theme::default();
+        let no_reviewers = make_pr_with_participants(
+            r#"{ "id": 1, "title": "PR 1", "state": "OPEN", "participants": [] }"#,
+        );
+        let line = pull_request_row(&no_reviewers, &theme);
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            !text.contains('✔'),
+            "レビュアー 0 でバッジが出ている: {text}"
+        );
+
+        let with_reviewer = make_pr_with_participants(
+            r#"{ "id": 2, "title": "PR 2", "state": "OPEN", "participants": [
+                { "user": { "display_name": "Bob" }, "approved": true,
+                  "state": "approved", "role": "REVIEWER" }
+            ] }"#,
+        );
+        let line = pull_request_row(&with_reviewer, &theme);
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains("✔1/1"), "バッジが出ない: {text}");
     }
 }

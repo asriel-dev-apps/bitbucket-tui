@@ -11,7 +11,7 @@ use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyEventKind, MouseButton, MouseEventKind};
 use tokio::sync::mpsc;
 
-use crate::api::{BitbucketClient, InlineTarget};
+use crate::api::{BitbucketClient, InlineTarget, PrListFilter};
 use crate::tui::Tui;
 use crate::tui::app::{App, Command, Msg, PipelineAction};
 use crate::tui::imageview::MAX_IMAGE_BYTES;
@@ -161,15 +161,13 @@ fn dispatch(command: Command, api_tx: &mpsc::Sender<Msg>) -> bool {
             let tx = api_tx.clone();
             tokio::spawn(async move {
                 let states = filter.state_values();
+                let query = PrListFilter {
+                    states: &states,
+                    author_uuid: filter.author_uuid(),
+                    target_branch: filter.target_branch.as_ref(),
+                };
                 let msg = match client
-                    .get_pull_requests_page(
-                        &workspace,
-                        &repo,
-                        &states,
-                        filter.author_uuid(),
-                        sort,
-                        page,
-                    )
+                    .get_pull_requests_page(&workspace, &repo, query, sort, page)
                     .await
                 {
                     Ok(result) => Msg::PullRequestsLoaded {
@@ -185,12 +183,41 @@ fn dispatch(command: Command, api_tx: &mpsc::Sender<Msg>) -> bool {
             });
             true
         }
-        Command::LoadWorkspaceMembers { client, workspace } => {
+        Command::LoadPrAuthors {
+            client,
+            workspace,
+            repo,
+            repo_full_name,
+        } => {
             let tx = api_tx.clone();
             tokio::spawn(async move {
-                let result = client.get_workspace_members(&workspace).await;
+                let result = client.list_pr_author_source(&workspace, &repo).await;
                 let _ = tx
-                    .send(Msg::WorkspaceMembersLoaded { workspace, result })
+                    .send(Msg::PrAuthorsLoaded {
+                        repo_full_name,
+                        result,
+                    })
+                    .await;
+            });
+            true
+        }
+        Command::LoadFilterBranches {
+            client,
+            workspace,
+            repo,
+            repo_full_name,
+        } => {
+            let tx = api_tx.clone();
+            tokio::spawn(async move {
+                let result = client
+                    .get_branches_page(&workspace, &repo, 1)
+                    .await
+                    .map(|page| page.values);
+                let _ = tx
+                    .send(Msg::FilterBranchesLoaded {
+                        repo_full_name,
+                        result,
+                    })
                     .await;
             });
             true

@@ -168,13 +168,26 @@ pub struct WorkspaceMembership {
     pub workspace: Workspace,
 }
 
-/// `GET /2.0/workspaces/{workspace}/members` の要素（メンバーシップ）。
+/// PR 一覧の target branch フィルタ（BBQL `destination.branch.name` の条件）。
 ///
-/// 実体のユーザーは `user` に入る（`{ "type": "workspace_membership", "user": {..} }`）。
-/// 応答形（`values[].user` の uuid/display_name）は未検証の仮定（`docs/LEDGER.md` 参照）。
-#[derive(Debug, Clone, Deserialize)]
-pub struct WorkspaceMember {
-    pub user: User,
+/// `exact=true` は完全一致（`=`）、`false` は部分一致（`~`。大文字小文字は区別しない）。
+/// `Hash`/`Eq` は PR 一覧キャッシュ（`tui::app` の `PullRequestsCache`）のキーの一部として
+/// 使うために導出する。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TargetBranch {
+    pub text: String,
+    pub exact: bool,
+}
+
+/// PR 一覧のサーバサイドフィルタ条件（states + author + target branch）。
+///
+/// [`crate::api::client::BitbucketClient::get_pull_requests_page`] の引数が
+/// `clippy::too_many_arguments` に触れるためまとめている（[`InlineTarget`] と同じ狙い）。
+#[derive(Debug, Clone, Copy)]
+pub struct PrListFilter<'a> {
+    pub states: &'a [&'a str],
+    pub author_uuid: Option<&'a str>,
+    pub target_branch: Option<&'a TargetBranch>,
 }
 
 /// `GET /2.0/repositories/{workspace}` の要素。

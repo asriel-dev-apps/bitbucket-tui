@@ -14,8 +14,8 @@ use serde::de::DeserializeOwned;
 use crate::api::error::{ApiError, classify_error};
 use crate::api::models::{
     Branch, Comment, CommentSide, Commit, DiffStatEntry, InlineTarget, ListSort, MergeParams,
-    PageInfo, Paginated, Pipeline, PipelineStep, PipelineTarget, PullRequest, Repository, SrcEntry,
-    User, Workspace, WorkspaceMember, WorkspaceMembership,
+    PageInfo, Paginated, Pipeline, PipelineStep, PipelineTarget, PrListFilter, PullRequest,
+    Repository, SrcEntry, TargetBranch, User, Workspace, WorkspaceMembership,
 };
 
 /// API のベース URL（Bitbucket Cloud）。
@@ -34,6 +34,16 @@ pub const PAGE_SIZE: u32 = 40;
 
 /// `User-Agent` ヘッダ値。
 const USER_AGENT: &str = concat!("bitbucket-tui/", env!("CARGO_PKG_VERSION"));
+
+/// PR フィルタの author 候補ソース取得のページ上限（`next` が残っていても打ち切る）。
+///
+/// 候補は「直近 150 件（3 ページ × 50 件）の PR の著者」で十分という設計判断。それより
+/// 古い PR にしか登場しない著者は候補に出ないが、author フィルタの目的上、直近に PR が
+/// 無い著者で絞る需要は低い想定。
+const AUTHOR_SOURCE_MAX_PAGES: usize = 3;
+
+/// PR フィルタの author 候補ソース取得の 1 ページあたりの件数。
+const AUTHOR_SOURCE_PAGELEN: u32 = 50;
 
 /// TCP 接続確立のタイムアウト。ネットワーク不調時に無限に固まらないための早期打ち切り。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -121,20 +131,20 @@ impl BitbucketClient {
 
     /// PR 一覧の指定ページを、指定ソート順で取得する（`pagelen` 固定 [`PAGE_SIZE`]）。
     ///
-    /// `author_uuid` 指定なしでは `states` を繰り返し `state` クエリとして送る
+    /// author / target branch の指定なしでは `states` を繰り返し `state` クエリとして送る
     /// （例: `["OPEN","MERGED"]`。空の場合は Bitbucket 既定 = OPEN のみになる）。
-    /// `author_uuid` 指定ありでは `q`（BBQL）へ一本化する（[`pull_requests_query`] 参照）。
+    /// author か target branch の指定ありでは `q`（BBQL）へ一本化する
+    /// （[`pull_requests_query`] 参照）。
     pub async fn get_pull_requests_page(
         &self,
         workspace: &str,
         repo: &str,
-        states: &[&str],
-        author_uuid: Option<&str>,
+        filter: PrListFilter<'_>,
         sort: ListSort,
         page: u32,
     ) -> Result<Page<PullRequest>, ApiError> {
         let path = format!("/repositories/{workspace}/{repo}/pullrequests");
-        let query = pull_requests_query(states, author_uuid, sort);
+        let query = pull_requests_query(filter, sort);
         let paginated: Paginated<PullRequest> = self.fetch_single_page(&path, query, page).await?;
         let info = PageInfo::from_paginated(&paginated, page, PAGE_SIZE);
         Ok(Page {
@@ -143,13 +153,24 @@ impl BitbucketClient {
         })
     }
 
-    /// ワークスペースの全メンバーを取得する（`GET /2.0/workspaces/{workspace}/members`、
-    /// `next` に従いページング追従）。各要素はメンバーシップ（`{ "user": {..} }`）なので
-    /// `user` を取り出す。応答形は未検証の仮定（`docs/LEDGER.md` 参照）。
-    pub async fn get_workspace_members(&self, workspace: &str) -> Result<Vec<User>, ApiError> {
-        let path = format!("/workspaces/{workspace}/members");
-        let members: Vec<WorkspaceMember> = self.get_paged(&path, &[("pagelen", "100")]).await?;
-        Ok(members.into_iter().map(|member| member.user).collect())
+    /// PR フィルタの author 候補ソースとして、この repo の PR を全 state・最新順
+    /// （`sort=-updated_on`）で最大 [`AUTHOR_SOURCE_MAX_PAGES`] ページ取得する
+    /// （`pagelen` 固定 [`AUTHOR_SOURCE_PAGELEN`]。`next` が残っていても打ち切る）。
+    ///
+    /// author（uuid 重複排除・表示名昇順）への集約は呼び出し側（`tui::app`）が行う。
+    pub async fn list_pr_author_source(
+        &self,
+        workspace: &str,
+        repo: &str,
+    ) -> Result<Vec<PullRequest>, ApiError> {
+        let url = format!("{BASE_URL}/repositories/{workspace}/{repo}/pullrequests");
+        paginate(
+            url,
+            pr_author_source_query(),
+            AUTHOR_SOURCE_MAX_PAGES,
+            |url, query| Box::pin(self.send_get::<Paginated<PullRequest>>(url, query)),
+        )
+        .await
     }
 
     /// PR 詳細を取得する。
@@ -803,43 +824,88 @@ fn repositories_query(sort: ListSort) -> [(&'static str, &'static str); 2] {
 
 /// PR 一覧取得の追加クエリ。
 ///
-/// - author 指定なし: 実績のある `state` 繰り返しパラメータを維持する（OR として有効）。
-/// - author 指定あり: `q`（BBQL）へ一本化する。**`q` と `state` パラメータを同時指定すると
-///   `state` 側が黙って無視される**（実測）ため、混在させない。値の URL エンコードは
-///   reqwest のクエリ機構（[`BitbucketClient::send_get`] の `.query()`）に委ねる。
+/// - author / target branch の指定なし: 実績のある `state` 繰り返しパラメータを維持する
+///   （OR として有効）。
+/// - author か target branch の指定あり: `q`（BBQL）へ一本化する。**`q` と `state`
+///   パラメータを同時指定すると `state` 側が黙って無視される**（実測）ため、混在させない。
+///   値の URL エンコードは reqwest のクエリ機構（[`BitbucketClient::send_get`] の
+///   `.query()`）に委ねる。空文字の target branch は未指定と同じ扱い（不正な BBQL を
+///   作らない防御）。
 ///
 /// `sort` はどちらの経路でも併用する。ネットワークを介さずに検証できるよう純粋関数として
 /// 切り出している（[`repositories_query`] と同じ狙い）。
-fn pull_requests_query(
-    states: &[&str],
-    author_uuid: Option<&str>,
-    sort: ListSort,
-) -> Vec<(String, String)> {
-    let mut query: Vec<(String, String)> = match author_uuid {
-        Some(uuid) => vec![("q".to_string(), bbql_filter(states, uuid))],
-        None => states
+fn pull_requests_query(filter: PrListFilter<'_>, sort: ListSort) -> Vec<(String, String)> {
+    let target = filter
+        .target_branch
+        .filter(|target| !target.text.is_empty());
+    let mut query: Vec<(String, String)> = if filter.author_uuid.is_some() || target.is_some() {
+        vec![(
+            "q".to_string(),
+            bbql_filter(filter.states, filter.author_uuid, target),
+        )]
+    } else {
+        filter
+            .states
             .iter()
             .map(|state| ("state".to_string(), (*state).to_string()))
-            .collect(),
+            .collect()
     };
     query.push(("sort".to_string(), sort.query_value().to_string()));
     query
 }
 
-/// BBQL のフィルタ式（`state IN ("OPEN","MERGED") AND author.uuid="{uuid}"`）を組み立てる。
+/// BBQL のフィルタ式（`state IN ("OPEN","MERGED") AND author.uuid="{uuid}" AND
+/// destination.branch.name ~ "release"`）を組み立てる。
 ///
-/// `states` が空なら author 条件のみ（UI 側は空 state の適用を拒否するため防御的な分岐）。
-fn bbql_filter(states: &[&str], author_uuid: &str) -> String {
-    let author = format!("author.uuid=\"{author_uuid}\"");
-    if states.is_empty() {
-        return author;
+/// target branch は `exact` に応じて `=`（完全一致）/`~`（部分一致。実測で大文字小文字を
+/// 区別しない）を使う。`states` が空なら state 条件を省く（UI 側は空 state の適用を拒否する
+/// ため防御的な分岐）。
+fn bbql_filter(
+    states: &[&str],
+    author_uuid: Option<&str>,
+    target: Option<&TargetBranch>,
+) -> String {
+    let mut conditions = Vec::new();
+    if !states.is_empty() {
+        let state_list = states
+            .iter()
+            .map(|state| format!("\"{state}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        conditions.push(format!("state IN ({state_list})"));
     }
-    let state_list = states
+    if let Some(uuid) = author_uuid {
+        conditions.push(format!("author.uuid={}", bbql_quote(uuid)));
+    }
+    if let Some(target) = target {
+        let operator = if target.exact { "=" } else { "~" };
+        conditions.push(format!(
+            "destination.branch.name {operator} {}",
+            bbql_quote(&target.text)
+        ));
+    }
+    conditions.join(" AND ")
+}
+
+/// BBQL の文字列リテラル（`"..."`）へ値を埋め込む。バックスラッシュ → `\\`、ダブル
+/// クォート → `\"` の順でエスケープする（逆順だとエスケープで足した `\` を二重に
+/// エスケープしてしまう）。target branch の自由入力・ブランチ名と author の uuid の
+/// 双方をこのヘルパへ通し、引用符入りの値でも式が壊れないようにする。
+fn bbql_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', r"\\").replace('"', r#"\""#))
+}
+
+/// author 候補ソース取得の追加クエリ（全 4 state の繰り返し + 最新順 +
+/// [`AUTHOR_SOURCE_PAGELEN`]）。ネットワークを介さずに検証できるよう純粋関数として
+/// 切り出している（[`pull_requests_query`] と同じ狙い）。
+fn pr_author_source_query() -> Vec<(String, String)> {
+    let mut query: Vec<(String, String)> = ["OPEN", "MERGED", "DECLINED", "SUPERSEDED"]
         .iter()
-        .map(|state| format!("\"{state}\""))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("state IN ({state_list}) AND {author}")
+        .map(|state| ("state".to_string(), (*state).to_string()))
+        .collect();
+    query.push(("sort".to_string(), "-updated_on".to_string()));
+    query.push(("pagelen".to_string(), AUTHOR_SOURCE_PAGELEN.to_string()));
+    query
 }
 
 /// ブランチ一覧取得の追加クエリ（最終コミット日時降順で固定）。ページを跨いでも順序が
@@ -993,7 +1059,7 @@ where
                 if page == max_pages {
                     tracing::warn!(
                         max_pages,
-                        "get_paged がページ上限に達したため結果を打ち切りました"
+                        "ページング取得がページ上限に達したため残りのページを打ち切りました"
                     );
                     break;
                 }
@@ -1153,10 +1219,31 @@ mod tests {
         );
     }
 
+    /// `pull_requests_query` へ渡すフィルタ指定を組み立てるテストヘルパ。
+    fn pr_filter<'a>(
+        states: &'a [&'a str],
+        author_uuid: Option<&'a str>,
+        target_branch: Option<&'a TargetBranch>,
+    ) -> PrListFilter<'a> {
+        PrListFilter {
+            states,
+            author_uuid,
+            target_branch,
+        }
+    }
+
+    /// target branch 条件のテストヘルパ。
+    fn target(text: &str, exact: bool) -> TargetBranch {
+        TargetBranch {
+            text: text.to_string(),
+            exact,
+        }
+    }
+
     #[test]
     fn pull_requests_query_without_author_repeats_state_and_appends_selected_sort() {
         assert_eq!(
-            pull_requests_query(&["OPEN", "MERGED"], None, ListSort::Newest),
+            pull_requests_query(pr_filter(&["OPEN", "MERGED"], None, None), ListSort::Newest),
             owned_query(&[
                 ("state", "OPEN"),
                 ("state", "MERGED"),
@@ -1168,7 +1255,7 @@ mod tests {
     #[test]
     fn pull_requests_query_with_no_states_only_has_sort() {
         assert_eq!(
-            pull_requests_query(&[], None, ListSort::LeastRecentlyUpdated),
+            pull_requests_query(pr_filter(&[], None, None), ListSort::LeastRecentlyUpdated),
             owned_query(&[("sort", "updated_on")])
         );
     }
@@ -1178,8 +1265,11 @@ mod tests {
         // 実測で `q` と `state` の併用は `state` 側が黙って無視されるため、author 指定時は
         // `q` に一本化し `state` パラメータを一切付けない。`sort` は併用する。
         let query = pull_requests_query(
-            &["OPEN", "MERGED"],
-            Some("{d3f5e4b0-1234-5678-9abc-def012345678}"),
+            pr_filter(
+                &["OPEN", "MERGED"],
+                Some("{d3f5e4b0-1234-5678-9abc-def012345678}"),
+                None,
+            ),
             ListSort::Newest,
         );
         assert_eq!(
@@ -1199,16 +1289,175 @@ mod tests {
     fn pull_requests_query_with_author_and_no_states_filters_by_author_only() {
         // UI は空 state の適用を拒否するが、防御的に `state IN ()`（不正な BBQL）を作らない。
         assert_eq!(
-            pull_requests_query(&[], Some("{u-1}"), ListSort::RecentlyUpdated),
+            pull_requests_query(
+                pr_filter(&[], Some("{u-1}"), None),
+                ListSort::RecentlyUpdated
+            ),
             owned_query(&[("q", r#"author.uuid="{u-1}""#), ("sort", "-updated_on")])
         );
+    }
+
+    #[test]
+    fn pull_requests_query_with_partial_target_uses_single_q_with_tilde() {
+        let branch = target("release", false);
+        let query = pull_requests_query(
+            pr_filter(&["OPEN"], None, Some(&branch)),
+            ListSort::RecentlyUpdated,
+        );
+        assert_eq!(
+            query,
+            owned_query(&[
+                (
+                    "q",
+                    r#"state IN ("OPEN") AND destination.branch.name ~ "release""#,
+                ),
+                ("sort", "-updated_on"),
+            ])
+        );
+        assert!(query.iter().all(|(key, _)| key != "state"));
+    }
+
+    #[test]
+    fn pull_requests_query_with_exact_target_uses_equals_operator() {
+        let branch = target("main", true);
+        let query = pull_requests_query(
+            pr_filter(&["OPEN", "MERGED"], None, Some(&branch)),
+            ListSort::Newest,
+        );
+        assert_eq!(
+            query,
+            owned_query(&[
+                (
+                    "q",
+                    r#"state IN ("OPEN","MERGED") AND destination.branch.name = "main""#,
+                ),
+                ("sort", "-created_on"),
+            ])
+        );
+    }
+
+    #[test]
+    fn pull_requests_query_with_author_and_target_joins_conditions_with_and() {
+        let branch = target("release", false);
+        let query = pull_requests_query(
+            pr_filter(&["OPEN"], Some("{u-1}"), Some(&branch)),
+            ListSort::RecentlyUpdated,
+        );
+        assert_eq!(
+            query,
+            owned_query(&[
+                (
+                    "q",
+                    r#"state IN ("OPEN") AND author.uuid="{u-1}" AND destination.branch.name ~ "release""#,
+                ),
+                ("sort", "-updated_on"),
+            ])
+        );
+    }
+
+    #[test]
+    fn bbql_filter_escapes_backslashes_and_quotes_in_target_and_author() {
+        // 自由入力の `"` はエスケープされ、BBQL の文字列リテラルが途中で閉じない。
+        let branch = target(r#"re""#, false);
+        assert_eq!(
+            pull_requests_query(
+                pr_filter(&["OPEN"], None, Some(&branch)),
+                ListSort::RecentlyUpdated
+            ),
+            owned_query(&[
+                (
+                    "q",
+                    r#"state IN ("OPEN") AND destination.branch.name ~ "re\"""#,
+                ),
+                ("sort", "-updated_on"),
+            ])
+        );
+
+        // `\` は `\\` へ（完全一致のブランチ名でも同じヘルパを通る）。
+        let branch = target(r"a\b", true);
+        assert_eq!(
+            pull_requests_query(
+                pr_filter(&["OPEN"], None, Some(&branch)),
+                ListSort::RecentlyUpdated
+            ),
+            owned_query(&[
+                (
+                    "q",
+                    r#"state IN ("OPEN") AND destination.branch.name = "a\\b""#,
+                ),
+                ("sort", "-updated_on"),
+            ])
+        );
+
+        // 両方を含む場合はバックスラッシュ→引用符の順（`\"` → `\\\"`）。
+        let branch = target(r#"\""#, false);
+        assert_eq!(
+            pull_requests_query(
+                pr_filter(&["OPEN"], None, Some(&branch)),
+                ListSort::RecentlyUpdated
+            ),
+            owned_query(&[
+                (
+                    "q",
+                    r#"state IN ("OPEN") AND destination.branch.name ~ "\\\"""#,
+                ),
+                ("sort", "-updated_on"),
+            ])
+        );
+
+        // author の uuid も同じヘルパを通る（通常の uuid には `"`/`\` は含まれないが、
+        // 埋め込み経路を統一して防御する）。
+        assert_eq!(
+            pull_requests_query(
+                pr_filter(&[], Some(r#"{u"1}"#), None),
+                ListSort::RecentlyUpdated
+            ),
+            owned_query(&[("q", r#"author.uuid="{u\"1}""#), ("sort", "-updated_on")])
+        );
+    }
+
+    #[test]
+    fn pull_requests_query_treats_empty_target_text_as_absent() {
+        // 空文字の target は None 扱い（従来の `state` 繰り返し経路のまま）。
+        let branch = target("", false);
+        assert_eq!(
+            pull_requests_query(
+                pr_filter(&["OPEN"], None, Some(&branch)),
+                ListSort::RecentlyUpdated
+            ),
+            owned_query(&[("state", "OPEN"), ("sort", "-updated_on")])
+        );
+    }
+
+    #[test]
+    fn pr_author_source_query_repeats_all_states_with_latest_sort_and_pagelen_50() {
+        assert_eq!(
+            pr_author_source_query(),
+            owned_query(&[
+                ("state", "OPEN"),
+                ("state", "MERGED"),
+                ("state", "DECLINED"),
+                ("state", "SUPERSEDED"),
+                ("sort", "-updated_on"),
+                ("pagelen", "50"),
+            ])
+        );
+    }
+
+    #[test]
+    fn author_source_page_cap_is_three() {
+        // 3 ページ打切りの実挙動は `paginate_truncates_at_max_pages`（max_pages=3）で担保する。
+        assert_eq!(AUTHOR_SOURCE_MAX_PAGES, 3);
     }
 
     #[test]
     fn pull_requests_q_value_is_url_encoded_by_reqwest_query_mechanism() {
         // `q` の値の URL エンコードは手組みせず reqwest の `.query()` に委ねる。
         // 空白・引用符・波括弧が生のまま URL に残らないことを確認する。
-        let query = pull_requests_query(&["OPEN", "MERGED"], Some("{u-1}"), ListSort::Newest);
+        let query = pull_requests_query(
+            pr_filter(&["OPEN", "MERGED"], Some("{u-1}"), None),
+            ListSort::Newest,
+        );
         let request = HttpClient::new()
             .get("https://api.bitbucket.org/2.0/repositories/ws/repo/pullrequests")
             .query(&query)

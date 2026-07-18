@@ -10,6 +10,6 @@ pub use client::BitbucketClient;
 pub use error::ApiError;
 pub use models::{
     Branch, Comment, CommentSide, Commit, DiffStatEntry, InlineTarget, ListSort, MergeParams,
-    MergeStrategy, PageInfo, Pipeline, PipelineStatus, PipelineStep, PipelineTarget, PullRequest,
-    Repository, SrcEntry, User, Workspace,
+    MergeStrategy, PageInfo, Pipeline, PipelineStatus, PipelineStep, PipelineTarget, PrListFilter,
+    PullRequest, Repository, SrcEntry, TargetBranch, User, Workspace,
 };
