@@ -11,7 +11,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-keyring = { version = "3", features = ["apple-native"] }
 directories = "6"
 toml = "1"
 anyhow = "1"
@@ -38,3 +37,9 @@ image = { version = "0.25.10", default-features = false, features = [
     "webp",
     "bmp",
 ] }
+# libloading は Linux の Secret Service(libsecret)を実行時 dlopen で呼ぶための依存(cargo 公式の
+# cargo-credential-libsecret と同方式)。ビルド時リンクや zbus 系の重い依存を避ける。target 依存に
+# せず通常依存にしているのは意図的: libsecret バックエンドのモジュールを全 OS でコンパイル対象に
+# して、macOS 上の check/clippy/test でも Linux 向けコードの大半を検証できるようにするため
+# (dlopen は実行時にしか起きないので macOS ビルドに実害はない)。
+libloading = "0.8"

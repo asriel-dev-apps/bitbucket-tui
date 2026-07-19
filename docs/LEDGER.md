@@ -4,6 +4,7 @@
 
 ## マイルストーン状況
 
+- **M10 認証情報保存の刷新（実装完了、2026-07-19）**: macOS は `/usr/bin/security` サブプロセス、Linux は `libloading` による libsecret の実行時 dlopen へ移行し、`keyring` crate を削除。`BBTUI_EMAIL` / `BBTUI_TOKEN` が揃う場合は config の UI 設定を維持しつつ、config の email / セキュアストアの token を資格情報として参照せず非永続で起動する。通常テストは純粋な引用・終了コード写像・hex変換・FFI schema・環境変数組合せを検証し、実 Keychain roundtrip は `#[ignore]`。指定の fmt/clippy/test は green。
 - **M5 PR 詳細の閲覧体験強化（実装完了、2026-07-11）**: 5.1（ペインフォーカス/スクロール）、5.2（概要リッチドキュメント/インライン画像/リンク位置）、5.3（リンクパレット）、5.4（マウス）、5.5（Bitbucket 添付画像の取得不能エラー/ホスト別認証）を実装。指定の fmt/clippy/test は green。実端末での画像プロトコル・マウス・マルチプレクサ経由パススルーの手動確認は未実施。
 
 - **M0 基盤**: **実装完了(2026-07-09)**。`cargo build/clippy(--all-targets -D warnings)/fmt --check/test` すべて green(--offline)。ユニット22件 pass + ネットワーク依存の smoke テスト1件 `#[ignore]`。実 API 結合確認(`GET /2.0/user`)は環境に実 token が無いためスキップ(下記の未検証の仮定は据え置き)。
@@ -23,14 +24,21 @@
 
 ## M0 実装メモ (2026-07-09)
 
-- モジュール構成(実装): `main`(clap/tokio runtime/logout) / `config`(directories+toml) / `auth`(keyring) / `logging`(BBTUI_LOG時のみfile出力) / `api`{`error`(thiserror), `models`(serde), `client`(reqwest Basic + get_paged)} / `tui`{`mod`(端末RAIIガード Tui + panic hook), `app`(App/Screen/Msg/Command/update), `onboarding`(入力状態), `ui`(描画), `event`(ループ+dispatch)}。
+- モジュール構成(実装): `main`(clap/tokio runtime/logout) / `config`(directories+toml) / `auth`(macOS=`/usr/bin/security`、Linux=libsecret dlopen) / `logging`(BBTUI_LOG時のみfile出力) / `api`{`error`(thiserror), `models`(serde), `client`(reqwest Basic + get_paged)} / `tui`{`mod`(端末RAIIガード Tui + panic hook), `app`(App/Screen/Msg/Command/update), `onboarding`(入力状態), `ui`(描画), `event`(ループ+dispatch)}。
 - 画面遷移: Onboarding → Workspaces → Repositories → RepoSelected(プレースホルダ)。Elm風 `update()->Command`、非同期は `event::dispatch` が `tokio::spawn` して結果を `Msg` で返す。
 - **イベントループの実装判断(design から逸脱)**: crossterm の非同期 `EventStream`(`.next()`)は `StreamExt`(futures-util)を **直接依存として宣言**しないと使えない。futures-util は vendor 済みだが transitive のみで、直接 `use` するには Cargo.toml への追加(=依存追加)が必要。依存凍結ルールを厳守するため、**入力は専用スレッドで blocking `event::read()` し `mpsc` へ橋渡し**する構成にした。メインループは「入力チャネル」「API結果チャネル」の2系統を `tokio::select!` で待つ(mpsc + select! の設計意図は維持)。crossterm の `event-stream` feature は結果的に未使用。
 - **paginate の Send 問題**: `impl AsyncFnMut` クロージャで組んだ get_paged は高階ライフタイムにより `tokio::spawn` で "Send is not general enough" になる。→ ページ取得を `Pin<Box<dyn Future + Send + 'a>>`(型エイリアス `PageFuture`)を返す `FnMut` フェッチャに変更して解消。`get_paged` はこの `paginate` を使い、テストはモックフェッチャで next 追跡/クエリ初回限定/上限打切り/エラー伝播を検証。
 - **crossterm 型は `ratatui::crossterm` 再エクスポート経由**で統一(直接依存 crossterm 0.28.1 と一致)。端末ガードは RAII(`Drop`)+ panic hook の二重で復元。
-- **秘密情報**: token は keyring のみ。`BitbucketClient` の `Debug` は手動実装で token を `<redacted>`。config.toml には email/display_name/default_workspace のみ(token 非保存)。
-- **keyring バックエンド → 解決済み(2026-07-09)**: `keyring = { features = ["apple-native"] }` を有効化し、`security-framework`/`core-foundation`(+ `-sys`)を vendor 追加。実行時は **macOS Keychain 実バックエンド**を使用し、token はプロセス再起動を跨いで永続化される(受け入れ条件「再起動で Onboarding スキップ」を実挙動で満たす)。全ゲート green を再確認済み。token は Keychain のみ・平文保存なしは不変。
-  - 注: 現状 macOS 専用(`apple-native`)。Linux ビルド時は `keyring` に `linux-native` 等の feature を足して再 vendor が必要。
+- **秘密情報**: token の永続化は macOS Keychain / Linux Secret Service のみ。`BitbucketClient` の `Debug` は手動実装で token を `<redacted>`。config.toml には email/display_name/default_workspace のみ(token 非保存)。環境変数経路も保存しない。
+- **旧 keyring バックエンド → M10 で置換済み(2026-07-19)**: macOS は `/usr/bin/security` の安定した署名を介して Keychain を操作し、アプリ更新時の ACL 破損を回避する。Linux は libsecret を dlopen して Secret Service を使う。平文フォールバックは無い。
+
+## M10 実装メモ (2026-07-19)
+
+- `auth` の公開 API（save/load/delete）は維持し、`thiserror` の `AuthError` へ変更。`security_cli` と `libsecret` は全 OS でコンパイルし、公開 dispatcher だけを target cfg で分岐する。
+- **macOS Keychain 実測（2026-07-19）**: `security find-generic-password -w` は非 ASCII password を UTF-8 bytes の hex 文字列で返し、rawのhex文字列との判別が曖昧になる。token は常に UTF-8 bytes を小文字hex化して保存し、load時にhex decodeする方式へ変更した。これによりASCII/非ASCII/制御文字を一意にroundtripできる。不正な保存値はlogout→再ログインを案内する。
+- macOS save は service/email の C0 制御文字を拒否し、旧項目を delete 後、`security -i` の stdin に引用済み add コマンドを渡すため token は argv に出ない。token は先にhex化するため任意文字を安全に保存できる。load/delete は exit 44 を未登録として扱う。
+- Linux は attributes `service` / `user` の schema で store/lookup/clear し、GError と返却 password を対応する free 関数で必ず解放する。libsecret/DBus 不在時は環境変数経路を案内する。
+- `BBTUI_EMAIL` / `BBTUI_TOKEN` が両方あれば config は UI 設定として読み込む一方、config の email とセキュアストアの token は資格情報として参照せず直接 client を構築する。片方だけなら警告して通常フローへ戻り、logout は永続物だけを削除する。
 - ログ出力先はポータブルに `ProjectDirs::cache_dir()` を採用(Linux=`~/.cache/bitbucket-tui/`、macOS=`~/Library/Caches/dev.bitbucket-tui/`)。spec の `~/.cache/...` は Linux 表記。
 
 ## M1 実装メモ (2026-07-09)
@@ -212,10 +220,13 @@
 - **ネットワーク制約 → vendored で解決済み**: ビルド環境から crates.io へ到達できない。`cargo vendor vendor` で全依存を vendor 化し、`.cargo/config.toml`(vendored-sources) を配置。以降 `cargo build/clippy/test --offline` が green。`vendor/` と `.cargo/config.toml` は `.gitignore` 済み(再生成は `cargo vendor`)。
 - **cargo 呼び出し(重要)**: `rustup run stable cargo <sub>` は `cargo vendor` 等で `rustc` を見つけられず失敗する。**ツールチェーン bin を PATH 前置**して直接呼ぶこと: `export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"` → `cargo <sub> --offline`。
 - **crossterm はバージョン競合注意**: ratatui 0.29 は crossterm 0.28 を要求。直接依存も **0.28** に統一済み(0.29 だとバックエンド型不一致)。コード内では `ratatui::crossterm` 再エクスポートを使うこと。
-- 依存確定版(Cargo.lock): ratatui 0.29 / crossterm 0.28.1 / tokio 1.52 / reqwest 0.12.28(rustls-tls,json) / serde 1.0.228 / serde_json 1.0.150 / keyring 3.6.3 / directories 6.0 / toml 1.1 / anyhow 1.0 / thiserror 2.0 / tracing 0.1 / tracing-subscriber 0.3 / clap 4.6 / base64 0.22。**依存は凍結。`cargo add`/`update`/`vendor` はネットワーク不可のため実行禁止**。
+- 依存確定版(Cargo.lock): ratatui 0.29 / crossterm 0.28.1 / tokio 1.52 / reqwest 0.12.28(rustls-tls,json) / serde 1.0.228 / serde_json 1.0.150 / libloading 0.8 / directories 6.0 / toml 1.1 / anyhow 1.0 / thiserror 2.0 / tracing 0.1 / tracing-subscriber 0.3 / clap 4.6 / base64 0.22。**依存は凍結。`cargo add`/`update`/`vendor` はネットワーク不可のため実行禁止**。
 
 ## 未検証の仮定
 
+- ~~**(M10) macOS Keychain の特殊文字roundtrip**~~: 2026-07-19に実機で検証し、非ASCII passwordが`security -w`でhex表示されることが判明。常時hex保存・decode方式へ変更し、再検収対象とした。
+- **(M10) Linux 実機の Secret Service roundtrip**: macOS 上では libsecret モジュールの compile/lint と純粋部分のみ検証。libsecret + DBus のある Linux 実機で store→lookup→clear を検収時に確認する。
+- **(M10) 旧 keyring 項目からの移行**: 旧項目が残る macOS 実機で、save の delete→`security -i` add により ACL 所有者の異なる項目へ確実に置換できることを検収時に確認する。
 - 必要スコープの**粒度スコープ名**は確定済み（上の「検証済みの事実」参照）。残るは各エンドポイントでの 200/403 実挙動の確認のみ。
 - `GET /2.0/repositories/{workspace}?role=member` のパラメータ挙動 — 実データで確認。
 - **(M1) PR/Comment/DiffStat の serde フィールド**: 仕様書の推定名で実装(`PullRequest.participants[].{approved,state,role}`、`DiffStatEntry.{status,lines_added,lines_removed,old.path,new.path}`、`Comment.{content.raw,inline.{path,from,to},deleted}` 等)。実 API 初回応答で有無/名称/値(特に `participant.state` の `changes_requested` 表記、`status` の `modified/added/removed/renamed`、PR `state` の `OPEN/MERGED/DECLINED/SUPERSEDED`)を確定し、モデルとフィルタ判定を補正する。

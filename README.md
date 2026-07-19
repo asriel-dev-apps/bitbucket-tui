@@ -23,7 +23,13 @@ username / password ではなく、**Atlassian アカウントのメールアド
    - `read:pipeline:bitbucket` / `write:pipeline:bitbucket`（stop・re-run）
 3. 生成された token を控える（再表示不可）。
 
-起動後のログイン画面で **Email**（Atlassian アカウントのメール）と **Token** を入力する。token は **OS Keychain** にのみ保存し、平文ファイルには書かない（email と表示名は `config.toml` に保存）。
+起動後のログイン画面で **Email**（Atlassian アカウントのメール）と **Token** を入力する。token は macOS では Keychain、Linux では Secret Service（libsecret）に保存し、平文ファイルには書かない（email と表示名は `config.toml` に保存）。
+
+環境変数 `BBTUI_EMAIL` と `BBTUI_TOKEN` を両方設定すると、設定ファイルや OS セキュアストアを使わず、認証情報を保存せずに起動できる。headless Linux ではこの方法を使う。
+
+```sh
+BBTUI_EMAIL=me@example.com BBTUI_TOKEN=your-token bitbucket-tui
+```
 
 ## インストール
 
@@ -35,7 +41,9 @@ cargo install --git https://github.com/asriel-dev-apps/bitbucket-tui.git
 
 更新は同じコマンドに `--force` を付けて再実行する。
 
-> 現状は macOS 向け（token 保存に macOS Keychain / `keyring` の `apple-native` を使用）。
+`--force` で再インストールしても保存済み token の再入力は不要。旧バージョンから移行する場合だけ、初回に 1 回再入力する必要がある。
+
+macOS と Linux に対応（Linux の永続保存には libsecret と Secret Service が必要）。Windows は未対応。
 
 ### ソースからビルド
 

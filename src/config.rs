@@ -1,7 +1,7 @@
 //! 設定ファイル（`directories` + `toml`）。
 //!
 //! 保存先は `ProjectDirs::from("dev", "", "bitbucket-tui")` の config ディレクトリ配下
-//! `config.toml`。**token は含めない**（token は Keychain のみ）。email は平文で保存してよい。
+//! `config.toml`。**token は含めない**（永続化する場合は OS セキュアストアのみ）。email は平文で保存してよい。
 
 use std::path::PathBuf;
 

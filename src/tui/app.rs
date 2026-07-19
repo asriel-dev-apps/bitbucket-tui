@@ -3742,7 +3742,7 @@ impl App {
         }
     }
 
-    /// 認証成功時: token を Keychain へ、email/表示名を config へ保存し、Workspaces へ遷移。
+    /// 認証成功時: token を OS セキュアストアへ、email/表示名を config へ保存し、Workspaces へ遷移。
     fn on_auth_validated(&mut self, email: String, token: String, user: User) -> Command {
         self.onboarding.validating = false;
         self.onboarding.error = None;

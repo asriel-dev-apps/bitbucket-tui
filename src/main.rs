@@ -24,7 +24,7 @@ use crate::tui::App;
     about = "Bitbucket Cloud 用の TUI クライアント"
 )]
 struct Cli {
-    /// 起動前に保存済みの認証情報（Keychain の token と config）を消去する。
+    /// 起動前に保存済みの認証情報（OS セキュアストアの token と config）を消去する。
     #[arg(long)]
     reset_auth: bool,
 
@@ -34,7 +34,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// 保存済みの認証情報（Keychain の token と config）を消去する。
+    /// 保存済みの認証情報（OS セキュアストアの token と config）を消去する。
     Logout,
 }
 
@@ -66,18 +66,21 @@ fn main() -> Result<()> {
 fn logout() -> Result<()> {
     let config = Config::load().unwrap_or_default();
     if let Some(email) = config.email.as_deref() {
-        auth::delete_token(email)
-            .with_context(|| format!("Keychain からの token 削除に失敗しました（{email}）"))?;
+        auth::delete_token(email).with_context(|| {
+            format!("OS セキュアストアからの token 削除に失敗しました（{email}）")
+        })?;
     }
     Config::clear().context("設定ファイルの削除に失敗しました")?;
     println!("認証情報を消去しました。");
+    if matches!(env_credentials(), EnvCredentials::Complete { .. }) {
+        println!("BBTUI_EMAIL / BBTUI_TOKEN の環境変数は消去できません。");
+    }
     Ok(())
 }
 
 /// 設定を読み、可能ならクライアントを復元して TUI を起動する。
 async fn run_tui() -> Result<()> {
-    let config = Config::load().unwrap_or_default();
-    let client = restore_client(&config);
+    let (config, client) = restore_client();
     let mut app = App::new(config, client);
 
     let mut terminal = tui::Tui::init()?;
@@ -111,10 +114,46 @@ fn detect_image_picker() -> Option<ratatui_image::picker::Picker> {
     ratatui_image::picker::Picker::from_query_stdio().ok()
 }
 
-/// config の email と Keychain の token から、可能ならクライアントを復元する。
+/// 環境変数、または config の email と OS セキュアストアの token からクライアントを復元する。
 ///
-/// token 未保存・Keychain アクセス不可などの場合は `None`（→ Onboarding へ）。
-fn restore_client(config: &Config) -> Option<BitbucketClient> {
+/// `BBTUI_EMAIL` / `BBTUI_TOKEN` が揃っている場合、config は UI 設定として読み込むが、
+/// config の email と OS セキュアストアの token は資格情報として参照しない。
+/// token 未保存・ストアへアクセス不可などの場合は `None`（→ Onboarding へ）。
+fn restore_client() -> (Config, Option<BitbucketClient>) {
+    match env_credentials() {
+        EnvCredentials::Complete { email, token } => {
+            let config = Config::load().unwrap_or_default();
+            return restore_env_client(config, email, token);
+        }
+        EnvCredentials::Incomplete => {
+            tracing::warn!(
+                "BBTUI_EMAIL / BBTUI_TOKEN は両方設定してください。通常の認証フローを使います"
+            );
+        }
+        EnvCredentials::Absent => {}
+    }
+
+    let config = Config::load().unwrap_or_default();
+    let client = restore_persisted_client(&config);
+    (config, client)
+}
+
+fn restore_env_client(
+    config: Config,
+    email: String,
+    token: String,
+) -> (Config, Option<BitbucketClient>) {
+    let client = match BitbucketClient::new(email, token) {
+        Ok(client) => Some(client),
+        Err(error) => {
+            tracing::warn!(%error, "環境変数からのクライアント復元に失敗しました");
+            None
+        }
+    };
+    (config, client)
+}
+
+fn restore_persisted_client(config: &Config) -> Option<BitbucketClient> {
     let email = config.email.as_deref()?;
     match auth::load_token(email) {
         Ok(Some(token)) => match BitbucketClient::new(email.to_string(), token) {
@@ -126,8 +165,85 @@ fn restore_client(config: &Config) -> Option<BitbucketClient> {
         },
         Ok(None) => None,
         Err(error) => {
-            tracing::warn!(%error, "Keychain からの token 読み出しに失敗しました");
+            tracing::warn!(%error, "OS セキュアストアからの token 読み出しに失敗しました");
             None
         }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum EnvCredentials {
+    Complete { email: String, token: String },
+    Incomplete,
+    Absent,
+}
+
+fn env_credentials() -> EnvCredentials {
+    classify_env_credentials(
+        std::env::var("BBTUI_EMAIL").ok(),
+        std::env::var("BBTUI_TOKEN").ok(),
+    )
+}
+
+fn classify_env_credentials(email: Option<String>, token: Option<String>) -> EnvCredentials {
+    match (email, token) {
+        (Some(email), Some(token)) => EnvCredentials::Complete { email, token },
+        (None, None) => EnvCredentials::Absent,
+        _ => EnvCredentials::Incomplete,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_credentials_require_both_values() {
+        assert_eq!(
+            classify_env_credentials(
+                Some("me@example.com".to_string()),
+                Some("secret".to_string())
+            ),
+            EnvCredentials::Complete {
+                email: "me@example.com".to_string(),
+                token: "secret".to_string()
+            }
+        );
+        assert_eq!(
+            classify_env_credentials(Some("me@example.com".to_string()), None),
+            EnvCredentials::Incomplete
+        );
+        assert_eq!(
+            classify_env_credentials(None, Some("secret".to_string())),
+            EnvCredentials::Incomplete
+        );
+        assert_eq!(classify_env_credentials(None, None), EnvCredentials::Absent);
+    }
+
+    #[test]
+    fn env_client_preserves_loaded_ui_config() {
+        let config = Config {
+            default_workspace: Some("workspace".to_string()),
+            theme: Some("dracula".to_string()),
+            diff_view: Some("split".to_string()),
+            diff_sidebar_visible: Some(false),
+            diff_sidebar_width: Some(42),
+            pr_states: Some(vec!["MERGED".to_string()]),
+            ..Config::default()
+        };
+
+        let (restored, client) = restore_env_client(
+            config,
+            "env@example.com".to_string(),
+            "env-token".to_string(),
+        );
+
+        assert!(client.is_some());
+        assert_eq!(restored.default_workspace.as_deref(), Some("workspace"));
+        assert_eq!(restored.theme.as_deref(), Some("dracula"));
+        assert_eq!(restored.diff_view.as_deref(), Some("split"));
+        assert_eq!(restored.diff_sidebar_visible, Some(false));
+        assert_eq!(restored.diff_sidebar_width, Some(42));
+        assert_eq!(restored.pr_states, Some(vec!["MERGED".to_string()]));
     }
 }
