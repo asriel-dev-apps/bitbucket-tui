@@ -1631,6 +1631,9 @@ fn comment_box_line(
             let content = vec![Span::styled(shown, Style::new().fg(theme.fg))];
             comment_box_content_line(content, budget, border, hot, theme)
         }
+        CommentRowKind::InnerSpacer => {
+            comment_box_content_line(Vec::new(), width.saturating_sub(4), border, false, theme)
+        }
         // スレッド間の間隔用の空行（unified/split どちらも空行のまま）。
         CommentRowKind::Spacer => Line::raw(""),
     }
@@ -2736,13 +2739,13 @@ fn render_status(frame: &mut Frame, area: Rect, status: &Status, theme: &Theme) 
 /// 画面ごとのキーヒント（`(key, 説明)` の並び）。フッターとヘルプ双方の元データにはしない
 /// （ヘルプは操作範囲が広く独立して管理する方が読みやすいため）。フッターは要点のみ。
 ///
-/// 並び順の方針は「`?`（ヘルプ）→ 画面固有のアクションキー → 汎用（`Enter`/`Esc`/`↑↓jk`/
-/// `Ctrl+K`/`q` 等）」。[`render_hints`] は収まらないエントリを末尾から落とすため、幅が
-/// 足りないときは汎用側から消える（`?` は先頭に置くので絶対に落ちない）。`PgUp/PgDn` と
+/// 並び順の方針は「`Enter`（存在する画面のみ）→ 画面固有キー（相対順を維持）→ `Esc` →
+/// `Ctrl+K` → `q` → `?`（末尾）」。[`render_hints`] は末尾の `?` の幅を先に予約し、残りへ
+/// 先頭から丸ごと収まるエントリを詰める。`PgUp/PgDn` と
 /// `Shift+J/K` は機能・ヘルプ全文には残すがフッターには出さない（要点を絞る方針）。
 ///
 /// `?`/`Ctrl+K`/`q` は `on_key` の優先度チェーン上 Onboarding を除く全画面で有効なため、
-/// 先頭（`?`）と末尾（`Ctrl+K`/`q`）へ共通で付与する（画面ごとの重複記述を避ける）。
+/// 末尾（`Ctrl+K`/`q`/`?`）へ共通で付与する（画面ごとの重複記述を避ける）。
 /// Onboarding だけは対象外: `Ctrl+K` は emacs 風の「行末まで削除」に使用中で、`?` もヘルプでは
 /// なく通常の入力文字として扱われる（[`crate::tui::app::App::on_key_onboarding`] 参照）。
 fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
@@ -2875,9 +2878,13 @@ fn hint_entries(screen: Screen) -> Vec<(&'static str, &'static str)> {
     };
 
     if screen != Screen::Onboarding {
-        entries.insert(0, ("?", "ヘルプ"));
+        if let Some(index) = entries.iter().position(|(key, _)| *key == "Enter") {
+            let enter = entries.remove(index);
+            entries.insert(0, enter);
+        }
         entries.push(("Ctrl+K", "ジャンプ"));
         entries.push(("q", "終了"));
+        entries.push(("?", "ヘルプ"));
     }
 
     entries
@@ -2887,12 +2894,49 @@ fn render_hints(frame: &mut Frame, area: Rect, app: &mut App) {
     let screen = app.screen;
     let theme = app.theme;
     let mut spans = Vec::new();
+    let entries = hint_entries(screen);
+    let mut visible = Vec::new();
+    if screen != Screen::Onboarding {
+        let help = entries.last().copied().unwrap_or(("?", "ヘルプ"));
+        let help_width = UnicodeWidthStr::width(format!("{} {}", help.0, help.1).as_str())
+            .min(usize::from(u16::MAX)) as u16;
+        if area.width < help_width {
+            visible.push(("?", ""));
+        } else {
+            let mut used = 0u16;
+            for entry in &entries[..entries.len().saturating_sub(1)] {
+                let item_width = UnicodeWidthStr::width(format!("{} {}", entry.0, entry.1).as_str())
+                    .min(usize::from(u16::MAX)) as u16;
+                let before = if visible.is_empty() { 0 } else { 2 };
+                let before_help = 2;
+                if used
+                    .saturating_add(before)
+                    .saturating_add(item_width)
+                    .saturating_add(before_help)
+                    .saturating_add(help_width)
+                    > area.width
+                {
+                    break;
+                }
+                used = used.saturating_add(before).saturating_add(item_width);
+                visible.push(*entry);
+            }
+            visible.push(help);
+        }
+    } else {
+        visible = entries;
+    }
+
     let mut x = area.x;
     let right = area.x.saturating_add(area.width);
-    for (index, (key, description)) in hint_entries(screen).iter().enumerate() {
+    for (index, (key, description)) in visible.iter().enumerate() {
         let sep_width: u16 = if index > 0 { 2 } else { 0 };
-        let item_width = UnicodeWidthStr::width(format!("{key} {description}").as_str())
-            .min(usize::from(u16::MAX)) as u16;
+        let label = if description.is_empty() {
+            (*key).to_string()
+        } else {
+            format!("{key} {description}")
+        };
+        let item_width = UnicodeWidthStr::width(label.as_str()).min(usize::from(u16::MAX)) as u16;
         // 次のエントリが（区切りを含めて）丸ごと収まらなければ、そこで打ち切る
         // （部分描画も省略記号も出さない。描画されないエントリはクリック不可のまま）。
         if x.saturating_add(sep_width).saturating_add(item_width) > right {
@@ -2908,8 +2952,10 @@ fn render_hints(frame: &mut Frame, area: Rect, app: &mut App) {
         });
         x = x.saturating_add(item_width);
         spans.push(Span::styled(*key, Style::new().fg(theme.accent)));
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(*description, Style::new().fg(theme.muted)));
+        if !description.is_empty() {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(*description, Style::new().fg(theme.muted)));
+        }
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -3082,19 +3128,16 @@ fn render_merge_modal(
 }
 
 /// PR フィルタモーダル（`f`）。上段は state のチェックボックス（Space でトグル）、中段は
-/// author、下段は target branch の単一選択（カーソル位置＝選択）。フォーカス中セクションの
+/// author、下段は target branch のチェックボックス複数選択。フォーカス中セクションの
 /// 見出しを強調し、カーソル行に `▶` を出す。候補が多い場合はカーソルに追従する窓で切り出す
 /// （固定行（見出し・検索行・キー案内等）は積む行数から導出し、残りを両セクションで
 /// 分け合う。低い端末では候補窓を 0 行まで縮めて固定行を守り、内側の高さを超えない）。
 ///
 /// Author / Target セクションは印字文字で fuzzy 検索できる（`author_query`/`target_query`）。
-/// 見出し直下に検索クエリ行を常置し、Author はクエリ非空のときは「All authors」行を出さず
-/// マッチした候補のみを表示する（0 件は「(該当なし)」）。Target は先頭に「All branches」、
-/// クエリ非空なら次に「『{query}』で部分一致」、続いてマッチした実在ブランチ候補を表示する。
+/// 見出し直下に検索クエリ行を常置し、All は常に row 0。クエリ空では選択済み pin と未選択
+/// 候補、クエリ非空では fuzzy マッチ候補（Target は部分一致行も）を表示する。
 /// 行 → 選択の写像は適用側と共有する [`PrFilterModal::author_row`] /
-/// [`PrFilterModal::target_row`] に従う（読み込み中は選択可能な行を出さず
-/// 「読み込み中…」プレースホルダのみ。ただし Target はクエリ入力済みなら All branches /
-/// 部分一致行が候補なしでも選べる）。
+/// [`PrFilterModal::target_row`] に従い、読み込み中も All と pending の pin を表示する。
 fn render_pr_filter_modal(frame: &mut Frame, area: Rect, modal: &PrFilterModal, theme: &Theme) {
     frame.render_widget(Clear, area);
 
@@ -3172,11 +3215,11 @@ fn render_pr_filter_modal(frame: &mut Frame, area: Rect, modal: &PrFilterModal, 
     let available =
         usize::from(area.height).saturating_sub(2 + lines.len() + mid.len() + tail.len());
     let author_query_empty = modal.author_query.is_empty();
-    let author_total = match &modal.authors {
-        None => 1,                                                              // 読み込み中…
-        Some(_) if !author_query_empty && modal.author_matches.is_empty() => 1, // (該当なし)
-        Some(_) => modal.author_row_count(),
-    };
+    let author_total = modal.author_row_count()
+        + usize::from(modal.authors.is_none())
+        + usize::from(
+            modal.authors.is_some() && !author_query_empty && modal.author_matches.is_empty(),
+        );
     // Target は候補行に加え、読み込み中はその表示行が 1 行付く。
     let target_total = modal.target_row_count() + usize::from(modal.branches.is_none());
     let author_capacity =
@@ -3185,33 +3228,34 @@ fn render_pr_filter_modal(frame: &mut Frame, area: Rect, modal: &PrFilterModal, 
 
     // ---- author 窓 ----
     if author_capacity > 0 {
-        match &modal.authors {
-            // 読み込み中は選択可能な行を出さない（Enter は現用維持。表示と適用を一致させる）。
-            None => lines.push(placeholder_line("読み込み中…")),
-            Some(_) if !author_query_empty && modal.author_matches.is_empty() => {
-                // Enter しても現用 author を維持する（app 側の適用ロジックと対応）。
-                lines.push(placeholder_line("(該当なし)"));
-            }
-            Some(_) => {
-                let total_rows = modal.author_row_count();
-                let start = modal
-                    .author_cursor
-                    .saturating_sub(author_capacity.saturating_sub(1));
-                for row in start..total_rows.min(start + author_capacity) {
-                    let radio = if row == modal.author_cursor {
-                        "(x)"
-                    } else {
-                        "( )"
-                    };
-                    let label = match modal.author_row(row) {
-                        PrFilterRow::All => "All authors",
-                        PrFilterRow::Candidate(author) => author.display_name.as_str(),
-                        PrFilterRow::Partial | PrFilterRow::Missing => "?",
-                    };
-                    let hot = author_focused && row == modal.author_cursor;
-                    lines.push(pr_filter_row(hot, &format!("{radio} {label}"), theme));
-                }
-            }
+        let total_rows = modal.author_row_count();
+        let start = modal
+            .author_cursor
+            .saturating_sub(author_capacity.saturating_sub(1));
+        for row in start..total_rows.min(start + author_capacity) {
+            let (checked, label) = match modal.author_row(row) {
+                PrFilterRow::All => (modal.author_selected.is_empty(), "All authors"),
+                PrFilterRow::Candidate(author) => (
+                    modal
+                        .author_selected
+                        .iter()
+                        .any(|selected| selected.uuid == author.uuid),
+                    author.display_name.as_str(),
+                ),
+                PrFilterRow::Partial | PrFilterRow::Missing => (false, "?"),
+            };
+            let checkbox = if checked { "[x]" } else { "[ ]" };
+            let hot = author_focused && row == modal.author_cursor;
+            lines.push(pr_filter_row(hot, &format!("{checkbox} {label}"), theme));
+        }
+        if modal.authors.is_none() && total_rows < author_capacity {
+            lines.push(placeholder_line("読み込み中…"));
+        } else if modal.authors.is_some()
+            && !author_query_empty
+            && modal.author_matches.is_empty()
+            && total_rows < author_capacity
+        {
+            lines.push(placeholder_line("(該当なし)"));
         }
     }
     lines.extend(mid);
@@ -3221,26 +3265,42 @@ fn render_pr_filter_modal(frame: &mut Frame, area: Rect, modal: &PrFilterModal, 
         let total_rows = modal.target_row_count();
         // 読み込み中はその表示行を予算から確保し、残りへ候補行（クエリ入力済みの
         // All branches / 部分一致行）を出す。
-        let rows_capacity = target_capacity.saturating_sub(usize::from(modal.branches.is_none()));
+        let rows_capacity = target_capacity.min(total_rows);
         let start = modal
             .target_cursor
             .saturating_sub(rows_capacity.saturating_sub(1));
         for row in start..total_rows.min(start + rows_capacity) {
-            let radio = if row == modal.target_cursor {
-                "(x)"
-            } else {
-                "( )"
+            let (checked, label): (bool, String) = match modal.target_row(row) {
+                PrFilterRow::All => (modal.target_selected.is_empty(), "All branches".to_string()),
+                PrFilterRow::Partial => (
+                    modal
+                        .target_selected
+                        .iter()
+                        .any(|selected| !selected.exact && selected.text == modal.target_query),
+                    format!("『{}』で部分一致", modal.target_query),
+                ),
+                PrFilterRow::Candidate(crate::tui::app::TargetFilterRow::Pinned(target)) => (
+                    modal.target_selected.contains(target),
+                    if target.exact {
+                        target.text.clone()
+                    } else {
+                        format!("~ \"{}\"", target.text)
+                    },
+                ),
+                PrFilterRow::Candidate(crate::tui::app::TargetFilterRow::Candidate(name)) => (
+                    modal
+                        .target_selected
+                        .iter()
+                        .any(|selected| selected.exact && selected.text == name),
+                    name.to_string(),
+                ),
+                PrFilterRow::Missing => (false, "?".to_string()),
             };
-            let label: String = match modal.target_row(row) {
-                PrFilterRow::All => "All branches".to_string(),
-                PrFilterRow::Partial => format!("『{}』で部分一致", modal.target_query),
-                PrFilterRow::Candidate(name) => name.to_string(),
-                PrFilterRow::Missing => "?".to_string(),
-            };
+            let checkbox = if checked { "[x]" } else { "[ ]" };
             let hot = target_focused && row == modal.target_cursor;
-            lines.push(pr_filter_row(hot, &format!("{radio} {label}"), theme));
+            lines.push(pr_filter_row(hot, &format!("{checkbox} {label}"), theme));
         }
-        if modal.branches.is_none() && target_capacity > 0 {
+        if modal.branches.is_none() && target_capacity > rows_capacity {
             lines.push(placeholder_line("読み込み中…"));
         }
     }
@@ -3320,7 +3380,7 @@ fn render_help(frame: &mut Frame, area: Rect, screen: Screen, theme: &Theme) {
             "P              パイプライン一覧を開く",
             "b              ブランチ一覧を開く",
             "s              ソースを開く",
-            "S              並び替え（更新が新しい順→古い順→作成が新しい順→古い順の巡回。",
+            "S              並び替え（Recently Updated→Least Recently Updated→Newest→Oldest の巡回。",
             "               タイトルに現在のソートを表示）",
             "Shift+J / K    10 件下 / 上へ移動",
             "[ / ]          前 / 次ページ（1 ページ 40 件）",
@@ -3363,7 +3423,7 @@ fn render_help(frame: &mut Frame, area: Rect, screen: Screen, theme: &Theme) {
             "p              パイプライン一覧を開く",
             "b              ブランチ一覧を開く",
             "s              ソース（既定ブランチのルート）を開く",
-            "S              並び替え（更新が新しい順→古い順→作成が新しい順→古い順の巡回。",
+            "S              並び替え（Recently Updated→Least Recently Updated→Newest→Oldest の巡回。",
             "               タイトルに現在のソートを表示）",
             "Shift+J / K    10 件下 / 上へ移動",
             "[ / ]          前 / 次ページ（1 ページ 40 件）",
@@ -4093,6 +4153,26 @@ mod tests {
         };
         let line = comment_box_line(&row, 30, &theme, None, None, 0);
         assert_eq!(line.width(), 0, "Spacer は空行として描画する");
+    }
+
+    #[test]
+    fn comment_box_line_inner_spacer_keeps_thread_border() {
+        let theme = Theme::default();
+        let row = CommentRow {
+            thread_root: 1,
+            comment_id: None,
+            kind: CommentRowKind::InnerSpacer,
+        };
+        let line = comment_box_line(&row, 30, &theme, None, None, 0);
+        let rendered: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(line.width(), 30);
+        assert!(rendered.starts_with('│'));
+        assert!(rendered.ends_with('│'));
+        assert!(rendered[3..rendered.len() - 3].trim().is_empty());
     }
 
     #[test]
@@ -5531,11 +5611,13 @@ mod tests {
     fn render_hints_stops_at_entry_boundary_when_width_is_narrow() {
         let entries = hint_entries(Screen::ImageView);
         let first = entries.first().expect("entries non-empty");
-        assert_eq!(first.0, "?", "先頭エントリはヘルプ（8.1 の並び順方針）");
+        assert_eq!(first.0, "←→/np");
         let first_width =
             UnicodeWidthStr::width(format!("{} {}", first.0, first.1).as_str()) as u16;
-        // 1 個目は丸ごと収まり、2 個目は（区切り 2 桁を含めて）1 文字も収まらない幅。
-        let width = first_width + 3;
+        let help = entries.last().expect("help entry present");
+        let help_width = UnicodeWidthStr::width(format!("{} {}", help.0, help.1).as_str()) as u16;
+        // 先頭と末尾の help は丸ごと収まり、2 個目は収まらない幅。
+        let width = first_width + 2 + help_width;
         let mut app = App::new(crate::config::Config::default(), None);
         app.theme = Theme::default();
         app.screen = Screen::ImageView;
@@ -5549,16 +5631,16 @@ mod tests {
         // `buffer_text` は全角文字をセル単位で空白区切りに展開するため、空白を除いて照合する。
         let compact = buffer_text(terminal.backend().buffer()).replace(' ', "");
         assert!(
-            compact.contains('?') && compact.contains("ヘルプ"),
-            "先頭エントリ（?）は丸ごと描画される: {compact}"
+            compact.contains('?') && compact.contains("ヘルプ") && compact.contains('←'),
+            "先頭エントリと末尾の help は丸ごと描画される: {compact}"
         );
-        // 2 個目（"←→/np 前/次の画像"）は部分描画もされない（エントリ境界で打ち切る）。
+        // 2 個目（"Esc 戻る"）は部分描画もされない（エントリ境界で打ち切る）。
         assert!(
-            !compact.contains('←'),
+            !compact.contains("Esc"),
             "収まらないエントリは 1 文字も描画しない: {compact}"
         );
         // ヒットボックスも描画されたエントリぶんだけ登録される。
-        assert_eq!(app.layout.hints.len(), 1);
+        assert_eq!(app.layout.hints.len(), 2);
     }
 
     #[test]
@@ -5616,10 +5698,14 @@ mod tests {
             states: BTreeSet::from([PrState::Open]),
             state_cursor: 0,
             author_cursor: 0,
+            author_selected: Vec::new(),
+            author_pins: Vec::new(),
             authors: None,
             author_query: String::new(),
             author_matches: Vec::new(),
             target_cursor: 0,
+            target_selected: Vec::new(),
+            target_pins: Vec::new(),
             branches: None,
             target_query: String::new(),
             target_matches: Vec::new(),
@@ -5642,14 +5728,14 @@ mod tests {
         )]);
         app.pr_state_filter = PrStateFilter {
             states: BTreeSet::from([PrState::Open, PrState::Merged]),
-            author: Some(PrAuthor {
+            authors: vec![PrAuthor {
                 uuid: "{u-1}".to_string(),
                 display_name: "Alice".to_string(),
-            }),
-            target_branch: Some(TargetBranch {
+            }],
+            target_branches: vec![TargetBranch {
                 text: "main".to_string(),
                 exact: true,
-            }),
+            }],
         };
         app.pr_filter_modal = Some(PrFilterModal {
             section: PrFilterSection::States,
@@ -5696,7 +5782,7 @@ mod tests {
     fn render_pr_filter_modal_shows_loading_while_authors_are_none() {
         let theme = Theme::default();
         let modal = base_pr_filter_modal();
-        let backend = TestBackend::new(50, 16);
+        let backend = TestBackend::new(50, 22);
         let mut terminal = Terminal::new(backend).expect("terminal builds");
         terminal
             .draw(|frame| render_pr_filter_modal(frame, frame.area(), &modal, &theme))
@@ -5729,21 +5815,21 @@ mod tests {
         // 検索行 1 + 空行 1 + Target 見出し 1 + 検索行 1 + 空行 1 + キー案内 1）+ author 窓
         // 6 行 + Target（読み込み中プレースホルダ）1 行、のレイアウトを固定する回帰テスト
         // （M8 8.6 の Target セクション追加で固定行が 3 行増え、残りは author/target で
-        // 分け合う。読み込み中の Target は選択可能な行を出さないため 1 行に収まる）。
+        // 分け合う。読み込み中も All を優先し、余裕があればプレースホルダを出す）。
         let backend = TestBackend::new(80, 22);
         let mut terminal = Terminal::new(backend).expect("terminal builds");
         terminal
             .draw(|frame| render_pr_filter_modal(frame, frame.area(), &modal, &theme))
             .expect("draw succeeds");
         let compact = buffer_text(terminal.backend().buffer()).replace(' ', "");
-        // 窓はカーソルに追従し、末尾 6 件（user14..user19）だけが見える。
+        // 窓はカーソルに追従する。
         assert!(
-            compact.contains("(x)user19"),
+            compact.contains("▶[]user19"),
             "カーソル行が見えない: {compact}"
         );
-        assert!(compact.contains("user14"), "窓の先頭が見えない: {compact}");
+        assert!(compact.contains("user15"), "窓の先頭が見えない: {compact}");
         assert!(
-            !compact.contains("user13"),
+            !compact.contains("user14"),
             "窓の外の候補が見えている: {compact}"
         );
         assert!(
@@ -5757,8 +5843,8 @@ mod tests {
             "Target セクションが欠けた: {compact}"
         );
         assert!(
-            !compact.contains("Allbranches"),
-            "読み込み中に All branches 行が出ている: {compact}"
+            compact.contains("Allbranches"),
+            "読み込み中も All branches 行が必要: {compact}"
         );
         assert!(
             compact.contains("Enter:適用"),
@@ -5790,7 +5876,7 @@ mod tests {
         assert!(compact.contains("検索:rel▏"), "クエリ行が無い: {compact}");
         assert!(compact.contains("Allbranches"), "先頭行が無い: {compact}");
         assert!(
-            compact.contains("(x)『rel』で部分一致"),
+            compact.contains("▶[]『rel』で部分一致"),
             "部分一致行（カーソル）が無い: {compact}"
         );
         assert!(
@@ -5807,7 +5893,7 @@ mod tests {
     /// のみで、選択可能な All branches 行を出さない（Enter は現用維持のため、表示と適用を
     /// 一致させる）。クエリ入力済みなら部分一致行は従来どおり表示・適用できる。
     #[test]
-    fn render_pr_filter_modal_target_loading_hides_all_branches_but_keeps_partial_row() {
+    fn render_pr_filter_modal_target_loading_keeps_all_and_partial_rows() {
         let theme = Theme::default();
         // クエリ空: プレースホルダのみ（author 側は取得済みにして、読み込み中表示が
         // Target のものであることを曖昧にしない）。
@@ -5821,10 +5907,7 @@ mod tests {
             .draw(|frame| render_pr_filter_modal(frame, frame.area(), &modal, &theme))
             .expect("draw succeeds");
         let compact = buffer_text(terminal.backend().buffer()).replace(' ', "");
-        assert!(
-            !compact.contains("Allbranches"),
-            "読み込み中に All branches 行が出ている: {compact}"
-        );
+        assert!(compact.contains("[x]Allbranches"));
         assert!(
             !compact.contains('?'),
             "読み込み中に選択できないラジオ行が出ている: {compact}"
@@ -5832,6 +5915,18 @@ mod tests {
         assert!(
             compact.contains("読み込み中…"),
             "プレースホルダが無い: {compact}"
+        );
+
+        // Target の予算が 1 行だけでも、プレースホルダより All を優先する。
+        let backend = TestBackend::new(60, 17);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| render_pr_filter_modal(frame, frame.area(), &modal, &theme))
+            .expect("draw succeeds");
+        let compact = buffer_text(terminal.backend().buffer()).replace(' ', "");
+        assert!(
+            compact.contains("[x]Allbranches"),
+            "All が欠けた: {compact}"
         );
 
         // クエリ入力済み: 部分一致行は候補が未着でも表示される（適用もできる）。
@@ -5849,7 +5944,7 @@ mod tests {
             .expect("draw succeeds");
         let compact = buffer_text(terminal.backend().buffer()).replace(' ', "");
         assert!(
-            compact.contains("(x)『rel』で部分一致"),
+            compact.contains("▶[]『rel』で部分一致"),
             "部分一致行が無い: {compact}"
         );
         assert!(
@@ -5899,10 +5994,10 @@ mod tests {
         );
     }
 
-    /// 8.1: `?` は各画面のヒント先頭（幅切詰めは末尾から落ちるため絶対に消えない）。
+    /// 9.1: `?` は各画面のヒント末尾（描画時に幅を予約するため絶対に消えない）。
     /// Onboarding は `?` が通常の入力文字のため対象外（既存のフッター方針のまま）。
     #[test]
-    fn hint_entries_put_help_key_first_on_every_screen_except_onboarding() {
+    fn hint_entries_put_help_key_last_on_every_screen_except_onboarding() {
         for screen in [
             Screen::Workspaces,
             Screen::Repositories,
@@ -5921,13 +6016,35 @@ mod tests {
         ] {
             let entries = hint_entries(screen);
             assert_eq!(
-                entries.first().map(|(key, _)| *key),
+                entries.last().map(|(key, _)| *key),
                 Some("?"),
-                "{screen:?} のヒント先頭が ? ではありません"
+                "{screen:?} のヒント末尾が ? ではありません"
             );
             // 二重表示しない（`?` は先頭の 1 回だけ）。
             let count = entries.iter().filter(|(key, _)| *key == "?").count();
             assert_eq!(count, 1, "{screen:?} で ? が重複しています");
+        }
+    }
+
+    #[test]
+    fn hint_entries_put_enter_first_on_every_screen_that_has_it() {
+        for screen in [
+            Screen::Workspaces,
+            Screen::Repositories,
+            Screen::PullRequests,
+            Screen::Diff,
+            Screen::Pipelines,
+            Screen::PipelineDetail,
+            Screen::Branches,
+            Screen::Commits,
+            Screen::Source,
+        ] {
+            let entries = hint_entries(screen);
+            assert_eq!(
+                entries.first().map(|(key, _)| *key),
+                Some("Enter"),
+                "{screen:?} の Enter が先頭ではありません: {entries:?}"
+            );
         }
     }
 
@@ -5978,7 +6095,7 @@ mod tests {
         }
     }
 
-    /// 8.1: 幅が極端に狭くても先頭の `?` は必ず描画される。
+    /// 9.1: 幅が極端に狭くても末尾の `?` は必ず描画される。
     #[test]
     fn render_hints_keeps_help_key_even_when_width_is_very_narrow() {
         let mut app = App::new(crate::config::Config::default(), None);
@@ -6000,7 +6117,7 @@ mod tests {
     }
 
     /// 8.4: 検索クエリ行が表示され、クエリ非空で候補 0 件なら「(該当なし)」を出す
-    /// （All authors 行はクエリ非空の間は出さない）。
+    /// （All authors 行は常時表示する）。
     #[test]
     fn render_pr_filter_modal_shows_query_line_and_no_match_placeholder() {
         use crate::tui::app::PrAuthor;
@@ -6023,13 +6140,47 @@ mod tests {
         assert!(compact.contains("検索:zz▏"), "クエリ行が無い: {compact}");
         assert!(compact.contains("(該当なし)"), "0 件表示が無い: {compact}");
         assert!(
-            !compact.contains("Allauthors"),
-            "クエリ非空では All authors を出さない: {compact}"
+            compact.contains("Allauthors"),
+            "All は常時 row 0: {compact}"
         );
         assert!(
             !compact.contains("Alice"),
             "マッチしない候補は出さない: {compact}"
         );
+    }
+
+    #[test]
+    fn render_pr_filter_modal_shows_checked_substring_pin_and_checked_all_when_empty() {
+        use crate::api::TargetBranch;
+
+        let theme = Theme::default();
+        let substring = TargetBranch {
+            text: "release".to_string(),
+            exact: false,
+        };
+        let modal = PrFilterModal {
+            authors: Some(Vec::new()),
+            branches: Some(Vec::new()),
+            target_selected: vec![substring.clone()],
+            target_pins: vec![substring],
+            ..base_pr_filter_modal()
+        };
+        let backend = TestBackend::new(60, 22);
+        let mut terminal = Terminal::new(backend).expect("terminal builds");
+        terminal
+            .draw(|frame| render_pr_filter_modal(frame, frame.area(), &modal, &theme))
+            .expect("draw succeeds");
+        let compact = buffer_text(terminal.backend().buffer()).replace(' ', "");
+        assert!(compact.contains("[]Allbranches"));
+        assert!(compact.contains("[x]~\"release\""));
+
+        let all = base_pr_filter_modal();
+        terminal
+            .draw(|frame| render_pr_filter_modal(frame, frame.area(), &all, &theme))
+            .expect("draw succeeds");
+        let compact = buffer_text(terminal.backend().buffer()).replace(' ', "");
+        assert!(compact.contains("[x]Allauthors"));
+        assert!(compact.contains("[x]Allbranches"));
     }
 
     /// 8.5: `✔n/m` バッジはレビュアー 0 のとき出さない（1 人以上なら従来どおり）。

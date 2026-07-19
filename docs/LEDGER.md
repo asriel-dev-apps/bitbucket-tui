@@ -113,6 +113,26 @@
 - **多角レビュー反映**: (1) 削除確認モーダルを `layout.modal` に登録し、表示中はモーダル外のアクションリンクを遮断（未登録だと確認待ちの裏で別コメントの Delete リンクが押せて誤削除し得た）。破壊的モーダルのクリック決定不可の対象にも追加。(2) スレッドの解決状態が変わったら折りたたみの手動上書きを破棄（展開したまま再解決しても自動コラプスへ戻る）。(3) 相対時刻を焼き込みから描画時整形へ変更（`CommentView.when` は生の created_on を保持し、`comment_box_line` が毎フレーム `format_when`。PR 詳細ペインと常に一致）。(4) `format_when` は 5 分を超える未来（時計ずれ超過）を「just now」にせず日付へフォールバック。(5) 返信ヘッダにカーソルがある状態で解決→自動コラプスされた場合、カーソルは同スレッドのコラプス行へ再アンカー（diff 行へ落ちて R の再トグルが効かなくなるのを防止）。🗨 の端末依存幅（絵文字表示端末で 2 セル描画され枠が 1 列ずれ得る）はアイコン選定時に合意済みのトレードオフとして許容。
 - テスト 527→543（時刻パース/ラベル構成/自動コラプス/トグル/クリックディスパッチ/描画/モーダルゲート/上書き破棄/再アンカー）。fmt/clippy(-D warnings)/test(--offline) green。**resolve/edit/delete の実 API 挙動は未検証の仮定のまま**。
 
+## M9 実装メモ (2026-07-19): キーヒント順序反転・フィルタ複数選択化・ソートラベル英語化・スレッド内コメント間隔
+
+仕様書 `docs/specs/M9.md`。2 フェーズに分けて委譲し、フェーズ毎にゲート（fmt/clippy -D warnings/test --offline）を再実行して検収した。
+
+**Phase 1（小粒 3 件）**:
+- キーヒント: M8 の「`?` 先頭固定」方針を反転（ユーザー指示）。並びは「`Enter`（存在する画面のみ先頭）→ 画面固有（相対順維持）→ `Esc` → `Ctrl+K` → `q` → `?`（末尾）」。`render_hints` は末尾 `?` の幅を先に予約し、狭い幅でも `?` は必ず表示（極小幅は `?` のみ）。ヒットボックスは描画と一致。
+- ソートラベル: `ListSort::label()` を英語化（Recently Updated / Least Recently Updated / Newest / Oldest）。ヘルプ全文の巡回説明も追従。ラベル文字列はテストで固定。
+- スレッド内コメント間隔: `CommentRowKind::InnerSpacer` を追加し、同一スレッド内の各コメントの Actions 行と次コメントの Header の間に枠線付き空行（`│ … │`）を 1 行挿入。non-focusable・クリック no-op。スレッド末尾と collapsed 行には入れない。
+- テスト 617→622。
+
+**Phase 2（Author/Target フィルタの複数選択化）**:
+- `PrStateFilter` を `authors: Vec<PrAuthor>` / `target_branches: Vec<TargetBranch>`（空 = All）へ変更。適用時に正規化（uuid/(text,exact) で重複排除・author は表示名 case-insensitive 昇順・target は text 昇順）し、Eq/Hash のキャッシュキーを安定化。
+- BBQL: 複数時は `(x OR y)` の括弧連結で AND 結合。**OR 連結は 2026-07-19 に公開リポジトリ（atlassian/aui・無認証）で実測済み**（author.uuid の OR・destination.branch.name の `=`/`~` 混在 OR とも期待どおり和集合）。`q=` 一本化規則・`bbql_quote` エスケープは M7/M8 のまま。
+- モーダル: States と同じ「チェックボックス複数選択 + 作業コピー」へ統一。Space がカーソル行のトグル（`[x]/[ ]` 即時反映。クエリへは入力されない）、Enter で pending 一括適用、Esc で全破棄。All 行は両セクションとも**常時 row 0**（M8 の「クエリ非空で All 非表示」「ローディング中 All 非表示」は Enter=カーソル行適用が前提の回避策だったため撤廃）。All の Space で全解除、pending 空 ⇔ All が `[x]`。
+- pin: クエリ空のとき選択済みを All 直下に表示（author: 表示名昇順 / target: text 昇順。`exact=false` は `~ "text"` 表示）。再計算は open/refilter 時のみ（Space では行順を動かさない）。未選択候補からは選択済みを除外。部分一致フィルタの「クエリへの復元」（M8）は廃止し pin 行で表現。
+- 旧単一選択の行分岐（Enter がカーソル行を適用する `All/Candidate/Partial/Missing` 分岐）と `insert_current_author`/`author_cursor_for` 等は pending/pin 方式へ置換。行→意味の写像は `author_row`/`target_row` への一元化を維持。
+- **未検証の仮定（実 token 未検証）**: OR 連結の認証付きリポジトリでの実挙動（公開リポジトリでは実測済み。実利用確認はユーザーに委ねる）。
+- テスト 622→628。fmt/clippy(-D warnings)/test(--offline) green。
+- 検収時修正（親側）: 旧仕様のまま残っていたコメント 1 箇所（「空白も文字」→ Space はトグル）とテスト名 2 件（`restores_partial_target_into_query…`→`shows_applied_partial_target_as_pin…`、`clearing_query_returns_cursor_to_current_filter_row`→`clearing_query_resets_cursor_and_enter_keeps_applied_filter`）を実態に合わせて改名・修正。挙動変更なし、628 green 維持。
+
 ## M8 実装メモ (2026-07-18): ヒント刷新・行番号ガター・author検索/ソース切替・Target branch フィルタ
 
 仕様書 `docs/specs/M7.md` の M8 節。2 フェーズに分けて委譲し、フェーズ毎にゲートを再実行して検収した。

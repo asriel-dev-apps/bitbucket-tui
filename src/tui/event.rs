@@ -163,8 +163,8 @@ fn dispatch(command: Command, api_tx: &mpsc::Sender<Msg>) -> bool {
                 let states = filter.state_values();
                 let query = PrListFilter {
                     states: &states,
-                    author_uuid: filter.author_uuid(),
-                    target_branch: filter.target_branch.as_ref(),
+                    author_uuids: &filter.author_uuids(),
+                    target_branches: &filter.target_branches,
                 };
                 let msg = match client
                     .get_pull_requests_page(&workspace, &repo, query, sort, page)

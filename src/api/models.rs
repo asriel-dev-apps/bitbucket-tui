@@ -112,10 +112,10 @@ impl ListSort {
     /// UI 表示ラベル。
     pub fn label(self) -> &'static str {
         match self {
-            ListSort::RecentlyUpdated => "更新が新しい順",
-            ListSort::LeastRecentlyUpdated => "更新が古い順",
-            ListSort::Newest => "作成が新しい順",
-            ListSort::Oldest => "作成が古い順",
+            ListSort::RecentlyUpdated => "Recently Updated",
+            ListSort::LeastRecentlyUpdated => "Least Recently Updated",
+            ListSort::Newest => "Newest",
+            ListSort::Oldest => "Oldest",
         }
     }
 }
@@ -186,8 +186,8 @@ pub struct TargetBranch {
 #[derive(Debug, Clone, Copy)]
 pub struct PrListFilter<'a> {
     pub states: &'a [&'a str],
-    pub author_uuid: Option<&'a str>,
-    pub target_branch: Option<&'a TargetBranch>,
+    pub author_uuids: &'a [&'a str],
+    pub target_branches: &'a [TargetBranch],
 }
 
 /// `GET /2.0/repositories/{workspace}` の要素。
@@ -1178,6 +1178,17 @@ mod tests {
         assert_eq!(ListSort::LeastRecentlyUpdated.query_value(), "updated_on");
         assert_eq!(ListSort::Newest.query_value(), "-created_on");
         assert_eq!(ListSort::Oldest.query_value(), "created_on");
+    }
+
+    #[test]
+    fn list_sort_labels_match_ui_copy() {
+        assert_eq!(ListSort::RecentlyUpdated.label(), "Recently Updated");
+        assert_eq!(
+            ListSort::LeastRecentlyUpdated.label(),
+            "Least Recently Updated"
+        );
+        assert_eq!(ListSort::Newest.label(), "Newest");
+        assert_eq!(ListSort::Oldest.label(), "Oldest");
     }
 
     #[test]

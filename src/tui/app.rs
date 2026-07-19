@@ -229,11 +229,11 @@ pub struct PrAuthor {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PrStateFilter {
     pub states: BTreeSet<PrState>,
-    /// author フィルタ。リポジトリ/ワークスペース依存のためセッション内のみ（保存しない）。
-    pub author: Option<PrAuthor>,
-    /// target branch フィルタ（BBQL `destination.branch.name`）。author と同じく
+    /// author フィルタ（空 = All）。リポジトリ/ワークスペース依存のためセッション内のみ。
+    pub authors: Vec<PrAuthor>,
+    /// target branch フィルタ（空 = All、BBQL `destination.branch.name`）。author と同じく
     /// リポジトリ依存のためセッション内のみ（保存しない）。
-    pub target_branch: Option<TargetBranch>,
+    pub target_branches: Vec<TargetBranch>,
 }
 
 impl Default for PrStateFilter {
@@ -248,8 +248,8 @@ impl PrStateFilter {
     pub fn only(state: PrState) -> Self {
         Self {
             states: BTreeSet::from([state]),
-            author: None,
-            target_branch: None,
+            authors: Vec::new(),
+            target_branches: Vec::new(),
         }
     }
 
@@ -257,8 +257,8 @@ impl PrStateFilter {
     pub fn all() -> Self {
         Self {
             states: BTreeSet::from(PrState::ALL),
-            author: None,
-            target_branch: None,
+            authors: Vec::new(),
+            target_branches: Vec::new(),
         }
     }
 
@@ -276,8 +276,8 @@ impl PrStateFilter {
         } else {
             Self {
                 states: parsed,
-                author: None,
-                target_branch: None,
+                authors: Vec::new(),
+                target_branches: Vec::new(),
             }
         }
     }
@@ -296,8 +296,30 @@ impl PrStateFilter {
     }
 
     /// author の uuid（`q` フィルタ用）。
-    pub fn author_uuid(&self) -> Option<&str> {
-        self.author.as_ref().map(|author| author.uuid.as_str())
+    pub fn author_uuids(&self) -> Vec<&str> {
+        self.authors
+            .iter()
+            .map(|author| author.uuid.as_str())
+            .collect()
+    }
+
+    fn normalize(&mut self) {
+        self.authors.sort_by(|left, right| {
+            left.display_name
+                .to_lowercase()
+                .cmp(&right.display_name.to_lowercase())
+                .then_with(|| left.uuid.cmp(&right.uuid))
+        });
+        let mut author_uuids = HashSet::new();
+        self.authors
+            .retain(|author| author_uuids.insert(author.uuid.clone()));
+        self.target_branches.sort_by(|left, right| {
+            left.text
+                .cmp(&right.text)
+                .then(left.exact.cmp(&right.exact))
+        });
+        self.target_branches
+            .dedup_by(|left, right| left.text == right.text && left.exact == right.exact);
     }
 
     /// UI 表示ラベル（例: `OPEN+MERGED, author: Alice, target~"release"`。全 state 選択時は
@@ -308,13 +330,32 @@ impl PrStateFilter {
         } else {
             self.state_values().join("+")
         };
-        if let Some(author) = &self.author {
-            label = format!("{label}, author: {}", author.display_name);
+        if !self.authors.is_empty() {
+            label = format!(
+                "{label}, author: {}",
+                self.authors
+                    .iter()
+                    .map(|author| author.display_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
-        match &self.target_branch {
-            Some(target) if target.exact => format!("{label}, target: {}", target.text),
-            Some(target) => format!("{label}, target~\"{}\"", target.text),
-            None => label,
+        if self.target_branches.is_empty() {
+            label
+        } else {
+            let targets = self
+                .target_branches
+                .iter()
+                .map(|target| {
+                    if target.exact {
+                        target.text.clone()
+                    } else {
+                        format!("~{}", target.text)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{label}, target: {targets}")
         }
     }
 }
@@ -356,10 +397,12 @@ pub struct PrFilterModal {
     pub states: BTreeSet<PrState>,
     /// State セクションのカーソル（[`PrState::ALL`] のインデックス）。
     pub state_cursor: usize,
-    /// Author セクションのカーソル（表示行のインデックス。クエリ空なら 0 = All authors、
-    /// `1..` = `authors[author_matches[i-1]]`。クエリ非空なら `authors[author_matches[i]]`）。
-    /// Author セクションは単一選択のため、カーソル位置がそのまま選択を表す。
+    /// Author セクションのカーソル（表示行のインデックス。常に 0 = All authors）。
     pub author_cursor: usize,
+    /// author チェックボックスの作業コピー。
+    pub author_selected: Vec<PrAuthor>,
+    /// クエリ空時に All 直下へ固定する author（open/refilter 時だけ再計算）。
+    pub author_pins: Vec<PrAuthor>,
     /// author 候補（`None` は読み込み中）。
     pub authors: Option<Vec<PrAuthor>>,
     /// Author セクションの検索クエリ（印字文字で追記・`Backspace` で削除。`j`/`k` も文字と
@@ -369,15 +412,16 @@ pub struct PrFilterModal {
     /// 非空なら fuzzy スコア降順（[`fuzzy_match_indices`]）。表示・カーソル・適用はこの
     /// 並びを辿る。
     pub author_matches: Vec<usize>,
-    /// Target セクションのカーソル（表示行のインデックス。行 0 = All branches、クエリ非空
-    /// なら行 1 = 「『{query}』で部分一致」、以降 = `branches[target_matches[..]]`）。
-    /// 単一選択のため、カーソル位置がそのまま選択を表す。
+    /// Target セクションのカーソル（常に行 0 = All branches、クエリ非空なら行 1 = 部分一致）。
     pub target_cursor: usize,
+    /// target branch チェックボックスの作業コピー。
+    pub target_selected: Vec<TargetBranch>,
+    /// クエリ空時に All 直下へ固定する target（open/refilter 時だけ再計算）。
+    pub target_pins: Vec<TargetBranch>,
     /// target branch 候補（ブランチ名。`None` は読み込み中。取得失敗時は空の `Some` =
     /// 候補なし。自由入力の部分一致は候補が無くても使える）。
     pub branches: Option<Vec<String>>,
-    /// Target セクションの検索クエリ（操作系は `author_query` と同じ。部分一致フィルタ
-    /// 適用中にモーダルを開いたときは、その文字列で初期化する）。
+    /// Target セクションの検索クエリ（操作系は `author_query` と同じ）。
     pub target_query: String,
     /// `target_query` を通過した候補（`branches` へのインデックス）。クエリ空なら恒等写像、
     /// 非空なら fuzzy スコア降順（[`fuzzy_match_indices`]）。
@@ -398,127 +442,143 @@ pub enum PrFilterRow<T> {
     Missing,
 }
 
+pub enum TargetFilterRow<'a> {
+    Pinned(&'a TargetBranch),
+    Candidate(&'a str),
+}
+
 impl PrFilterModal {
-    /// Author セクションの表示行数。クエリ空 = 「All authors」+ 全候補（読み込み中は
-    /// All authors のみ）、クエリ非空 = マッチした候補のみ（0 件なら 0 行）。
+    fn toggle_current_author(&mut self) {
+        match self.author_row(self.author_cursor) {
+            PrFilterRow::All => self.author_selected.clear(),
+            PrFilterRow::Candidate(author) => {
+                let author = author.clone();
+                if let Some(index) = self
+                    .author_selected
+                    .iter()
+                    .position(|selected| selected.uuid == author.uuid)
+                {
+                    self.author_selected.remove(index);
+                } else {
+                    self.author_selected.push(author);
+                }
+            }
+            PrFilterRow::Partial | PrFilterRow::Missing => {}
+        }
+    }
+
+    fn toggle_current_target(&mut self) {
+        let target = match self.target_row(self.target_cursor) {
+            PrFilterRow::All => {
+                self.target_selected.clear();
+                return;
+            }
+            PrFilterRow::Partial => TargetBranch {
+                text: self.target_query.clone(),
+                exact: false,
+            },
+            PrFilterRow::Candidate(TargetFilterRow::Pinned(target)) => target.clone(),
+            PrFilterRow::Candidate(TargetFilterRow::Candidate(name)) => TargetBranch {
+                text: name.to_string(),
+                exact: true,
+            },
+            PrFilterRow::Missing => return,
+        };
+        if let Some(index) = self
+            .target_selected
+            .iter()
+            .position(|selected| selected == &target)
+        {
+            self.target_selected.remove(index);
+        } else {
+            self.target_selected.push(target);
+        }
+    }
+
+    /// Author セクションの表示行数。All は常時表示し、クエリ空なら pin と未選択候補、
+    /// クエリ非空なら fuzzy マッチ候補を続ける。
     /// カーソル移動の範囲と `ui` の候補窓計算の双方で使う。
     pub fn author_row_count(&self) -> usize {
-        self.author_matches.len() + usize::from(self.author_query.is_empty())
+        1 + self.author_matches.len()
+            + if self.author_query.is_empty() {
+                self.author_pins.len()
+            } else {
+                0
+            }
     }
 
-    /// Target セクションの表示行数。「All branches」1 行 + クエリ非空なら部分一致行 1 行 +
-    /// マッチしたブランチ候補（候補なしは 0 行）。読み込み中かつクエリ空は選択可能な行なし
-    /// （「読み込み中…」プレースホルダのみ。Enter は現用維持なので、選べる見た目を出さない）。
+    /// Target セクションの表示行数。All は常時表示し、クエリ空なら pin と未選択候補、
+    /// クエリ非空なら部分一致行と fuzzy マッチ候補を続ける。
     /// カーソル移動の範囲と `ui` の候補窓計算の双方で使う。
     pub fn target_row_count(&self) -> usize {
-        if self.branches.is_none() && self.target_query.is_empty() {
-            return 0;
-        }
-        1 + usize::from(!self.target_query.is_empty()) + self.target_matches.len()
+        1 + usize::from(!self.target_query.is_empty())
+            + self.target_matches.len()
+            + if self.target_query.is_empty() {
+                self.target_pins.len()
+            } else {
+                0
+            }
     }
 
-    /// Author セクションの表示行 `row` が指す選択内容（クエリ空なら行 0 = All authors、
-    /// 以降 = `authors[author_matches[row-1]]`。クエリ非空なら `authors[author_matches[row]]`。
-    /// 読み込み中は行を出さないため常に [`PrFilterRow::Missing`]）。
+    /// Author セクションの表示行 `row` が指す内容。行 0 は常に All、クエリ空なら pin、
+    /// その後に `author_matches` の候補が続く。
     pub fn author_row(&self, row: usize) -> PrFilterRow<&PrAuthor> {
-        let Some(authors) = self.authors.as_deref() else {
-            return PrFilterRow::Missing;
-        };
-        let query_empty = self.author_query.is_empty();
-        if query_empty && row == 0 {
+        if row == 0 {
             return PrFilterRow::All;
         }
+        let pin_count = if self.author_query.is_empty() {
+            self.author_pins.len()
+        } else {
+            0
+        };
+        if let Some(author) = row
+            .checked_sub(1)
+            .and_then(|index| self.author_pins.get(index))
+            && row <= pin_count
+        {
+            return PrFilterRow::Candidate(author);
+        }
         match row
-            .checked_sub(usize::from(query_empty))
+            .checked_sub(1 + pin_count)
             .and_then(|index| self.author_matches.get(index))
-            .and_then(|&index| authors.get(index))
+            .and_then(|&index| self.authors.as_deref()?.get(index))
         {
             Some(author) => PrFilterRow::Candidate(author),
             None => PrFilterRow::Missing,
         }
     }
 
-    /// Target セクションの表示行 `row` が指す選択内容（行 0 = All branches、クエリ非空なら
-    /// 行 1 = 部分一致、以降 = `branches[target_matches[..]]`。読み込み中かつクエリ空は行を
-    /// 出さないため常に [`PrFilterRow::Missing`]）。
-    pub fn target_row(&self, row: usize) -> PrFilterRow<&str> {
+    /// Target セクションの表示行 `row` が指す内容。行 0 は常に All、クエリ空なら pin、
+    /// クエリ非空なら行 1 に部分一致、その後に `target_matches` の候補が続く。
+    pub fn target_row(&self, row: usize) -> PrFilterRow<TargetFilterRow<'_>> {
         let query_empty = self.target_query.is_empty();
-        if self.branches.is_none() && query_empty {
-            return PrFilterRow::Missing;
-        }
         if row == 0 {
             return PrFilterRow::All;
         }
         if !query_empty && row == 1 {
             return PrFilterRow::Partial;
         }
+        let pin_count = if query_empty {
+            self.target_pins.len()
+        } else {
+            0
+        };
+        if let Some(target) = row
+            .checked_sub(1)
+            .and_then(|index| self.target_pins.get(index))
+            && row <= pin_count
+        {
+            return PrFilterRow::Candidate(TargetFilterRow::Pinned(target));
+        }
         match row
-            .checked_sub(1 + usize::from(!query_empty))
+            .checked_sub(1 + usize::from(!query_empty) + pin_count)
             .and_then(|index| self.target_matches.get(index))
             .and_then(|&index| self.branches.as_deref()?.get(index))
         {
-            Some(name) => PrFilterRow::Candidate(name.as_str()),
+            Some(name) => PrFilterRow::Candidate(TargetFilterRow::Candidate(name.as_str())),
             None => PrFilterRow::Missing,
         }
     }
-}
-
-/// 現在適用中の author が候補（uuid 照合）に無ければ挿入する（表示名の大文字小文字を
-/// 無視した昇順 = [`users_to_authors`] の並びを維持）。PR 集約の結果や
-/// フォールバック候補に現用 author が含まれない場合（直近 PR に登場しない著者等）でも、
-/// モーダル上で現在の選択が見え、そのまま維持・解除できるようにするため。
-fn insert_current_author(authors: &mut Vec<PrAuthor>, current: Option<&PrAuthor>) {
-    let Some(current) = current else {
-        return;
-    };
-    if authors.iter().any(|author| author.uuid == current.uuid) {
-        return;
-    }
-    let key = current.display_name.to_lowercase();
-    let index = authors.partition_point(|author| author.display_name.to_lowercase() <= key);
-    authors.insert(index, current.clone());
-}
-
-/// モーダルの author カーソル初期位置（現在のフィルタの author が候補にあればその行、
-/// 無ければ 0 = All authors）。
-fn author_cursor_for(authors: Option<&[PrAuthor]>, current: Option<&PrAuthor>) -> usize {
-    let (Some(authors), Some(current)) = (authors, current) else {
-        return 0;
-    };
-    authors
-        .iter()
-        .position(|author| author.uuid == current.uuid)
-        .map_or(0, |index| index + 1)
-}
-
-/// 現在適用中の完全一致 target branch が候補（ブランチ名照合）に無ければ先頭へ挿入する。
-/// 候補（最終コミット日時降順の 1 ページ目）から漏れたブランチでも、モーダル上で現在の
-/// 選択が見え、そのまま維持・解除できるようにするため（[`insert_current_author`] と同じ
-/// 狙い。候補の並びに整列キーが無いため位置は先頭とする）。部分一致（`exact=false`）は
-/// 検索クエリ側（[`App::open_pr_filter_modal`] の初期化）で表現するため対象外。
-fn insert_current_target(branches: &mut Vec<String>, current: Option<&TargetBranch>) {
-    let Some(current) = current else {
-        return;
-    };
-    if !current.exact || branches.iter().any(|name| name == &current.text) {
-        return;
-    }
-    branches.insert(0, current.text.clone());
-}
-
-/// モーダルの target カーソル初期位置（クエリ空の前提。現在のフィルタが完全一致でその
-/// ブランチが候補にあればその行、無ければ 0 = All branches）。
-fn target_cursor_for(branches: Option<&[String]>, current: Option<&TargetBranch>) -> usize {
-    let (Some(branches), Some(current)) = (branches, current) else {
-        return 0;
-    };
-    if !current.exact {
-        return 0;
-    }
-    branches
-        .iter()
-        .position(|name| name == &current.text)
-        .map_or(0, |index| index + 1)
 }
 
 /// ユーザー一覧を author 候補へ変換する（uuid 無しは除外、uuid で重複排除、表示名の
@@ -902,6 +962,8 @@ pub enum CommentRowKind {
         mine: bool,
         resolved: bool,
     },
+    /// 同一スレッド内のコメント間隔用の枠内空行（non-focusable。クリックは no-op）。
+    InnerSpacer,
     /// 枠下端。
     Bottom,
     /// コラプス（折りたたみ）中のスレッドの 1 行表示。Enter/クリックで展開。
@@ -1097,7 +1159,7 @@ fn push_thread_rows(rows: &mut Vec<DisplayRow>, thread: &CommentThreadView) {
         comment_id: None,
         kind: CommentRowKind::Top,
     }));
-    for comment in &thread.comments {
+    for (index, comment) in thread.comments.iter().enumerate() {
         rows.push(DisplayRow::Comment(CommentRow {
             thread_root: thread.root_id,
             comment_id: Some(comment.id),
@@ -1128,6 +1190,13 @@ fn push_thread_rows(rows: &mut Vec<DisplayRow>, thread: &CommentThreadView) {
                 resolved: thread.resolved,
             },
         }));
+        if index + 1 < thread.comments.len() {
+            rows.push(DisplayRow::Comment(CommentRow {
+                thread_root: thread.root_id,
+                comment_id: None,
+                kind: CommentRowKind::InnerSpacer,
+            }));
+        }
     }
     rows.push(DisplayRow::Comment(CommentRow {
         thread_root: thread.root_id,
@@ -1935,8 +2004,12 @@ impl DiffState {
                 self.ensure_cursor_visible();
             }
             Some(DisplayRow::Comment(row)) => {
-                if matches!(row.kind, CommentRowKind::Spacer) {
-                    // スレッド間の空行は無操作（枠上下端の「スレッド先頭選択」に落とさない）。
+                if matches!(
+                    row.kind,
+                    CommentRowKind::InnerSpacer | CommentRowKind::Spacer
+                ) {
+                    // コメント間・スレッド間の空行は無操作（枠上下端の「スレッド先頭選択」に
+                    // 落とさない）。
                 } else if matches!(row.kind, CommentRowKind::Collapsed { .. }) {
                     // コラプス行のクリックは展開。
                     self.toggle_thread_collapse(row.thread_root);
@@ -4631,8 +4704,8 @@ impl App {
     /// だけで別ワークスペースの同名 repo も区別できる。同一 repo の選び直しでは維持する）。
     fn select_repo(&mut self, repo: &Repository) {
         if self.selected_repo.as_deref() != Some(repo.full_name.as_str()) {
-            self.pr_state_filter.author = None;
-            self.pr_state_filter.target_branch = None;
+            self.pr_state_filter.authors.clear();
+            self.pr_state_filter.target_branches.clear();
         }
         self.selected_repo = Some(repo.full_name.clone());
         self.repo_main_branch = repo.main_branch_name().map(str::to_string);
@@ -4801,14 +4874,15 @@ impl App {
     fn set_pr_states(&mut self, states: BTreeSet<PrState>) -> Command {
         self.set_pr_filter(PrStateFilter {
             states,
-            author: self.pr_state_filter.author.clone(),
-            target_branch: self.pr_state_filter.target_branch.clone(),
+            authors: self.pr_state_filter.authors.clone(),
+            target_branches: self.pr_state_filter.target_branches.clone(),
         })
     }
 
     /// フィルタを切り替え、states を config.toml へ永続化し、1 ページ目から読み込み直す
     /// （新しいフィルタ文脈のため）。単発キーとフィルタモーダル適用の共通経路。
-    fn set_pr_filter(&mut self, filter: PrStateFilter) -> Command {
+    fn set_pr_filter(&mut self, mut filter: PrStateFilter) -> Command {
+        filter.normalize();
         self.pr_state_filter = filter;
         self.persist_pr_states();
         self.load_pull_requests_page(1)
@@ -4828,60 +4902,65 @@ impl App {
     /// 発行する（取得完了までは「読み込み中」表示）。
     fn open_pr_filter_modal(&mut self) -> Command {
         let repo_full_name = self.selected_repo.clone();
-        let current_author = self.pr_state_filter.author.clone();
-        let current_target = self.pr_state_filter.target_branch.clone();
-
-        let mut authors = repo_full_name
+        let authors = repo_full_name
             .as_ref()
             .and_then(|key| self.pr_authors_cache.get(key).cloned());
-        if let Some(authors) = authors.as_mut() {
-            insert_current_author(authors, current_author.as_ref());
-        }
-        let author_cursor = author_cursor_for(authors.as_deref(), current_author.as_ref());
         let need_author_fetch = authors.is_none();
-        // 検索クエリは空で開く → マッチは恒等写像（全候補）。
-        let author_matches = (0..authors.as_ref().map_or(0, Vec::len)).collect();
+        let author_selected = self.pr_state_filter.authors.clone();
+        let author_pins = author_selected.clone();
+        let author_matches = authors
+            .as_ref()
+            .map(|authors| {
+                authors
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, author)| {
+                        !author_selected
+                            .iter()
+                            .any(|selected| selected.uuid == author.uuid)
+                    })
+                    .map(|(index, _)| index)
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        let mut branches = repo_full_name
+        let branches = repo_full_name
             .as_ref()
             .and_then(|key| self.branch_candidates_cache.get(key).cloned());
-        if let Some(branches) = branches.as_mut() {
-            insert_current_target(branches, current_target.as_ref());
-        }
         let need_branch_fetch = branches.is_none();
-        // 部分一致（exact=false）適用中は検索クエリへ復元し、カーソルを部分一致行に置く
-        // （開いてそのまま Enter しても現在のフィルタを維持できるようにする。完全一致は
-        // 候補行のカーソル位置で表現する）。
-        let target_query = match &current_target {
-            Some(target) if !target.exact => target.text.clone(),
-            _ => String::new(),
-        };
-        let target_matches = match branches.as_deref() {
-            Some(branches) => fuzzy_match_indices(
-                &target_query,
-                branches,
-                |name| name.clone(),
-                &mut self.pr_filter_matcher,
-            ),
-            None => Vec::new(),
-        };
-        let target_cursor = if target_query.is_empty() {
-            target_cursor_for(branches.as_deref(), current_target.as_ref())
-        } else {
-            1
-        };
+        let target_selected = self.pr_state_filter.target_branches.clone();
+        let target_pins = target_selected.clone();
+        let target_matches = branches
+            .as_ref()
+            .map(|branches| {
+                branches
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, name)| {
+                        !target_selected
+                            .iter()
+                            .any(|selected| selected.exact && selected.text == **name)
+                    })
+                    .map(|(index, _)| index)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         self.pr_filter_modal = Some(PrFilterModal {
             section: PrFilterSection::States,
             states: self.pr_state_filter.states.clone(),
             state_cursor: 0,
-            author_cursor,
+            author_cursor: 0,
+            author_selected,
+            author_pins,
             authors,
             author_query: String::new(),
             author_matches,
-            target_cursor,
+            target_cursor: 0,
+            target_selected,
+            target_pins,
             branches,
-            target_query,
+            target_query: String::new(),
             target_matches,
         });
 
@@ -4988,11 +5067,17 @@ impl App {
                     }
                     Command::None
                 }
-                // Author / Target セクションでは印字文字がそのまま検索クエリ（`j`/`k`/空白も
-                // 文字。候補の移動は `↑↓`）。Ctrl/Alt 付きは入力として扱わない（Ctrl+K 等の
-                // 誤爆防止）。
+                // Author / Target セクションでは Space がカーソル行のチェックトグル、それ
+                // 以外の印字文字は検索クエリへの入力（`j`/`k` も文字。候補の移動は `↑↓`）。
+                // Ctrl/Alt 付きは入力として扱わない（Ctrl+K 等の誤爆防止）。
                 PrFilterSection::Author | PrFilterSection::Target => {
-                    if !key
+                    if c == ' ' {
+                        match modal.section {
+                            PrFilterSection::Author => modal.toggle_current_author(),
+                            PrFilterSection::Target => modal.toggle_current_target(),
+                            PrFilterSection::States => {}
+                        }
+                    } else if !key
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                     {
@@ -5031,57 +5116,85 @@ impl App {
         }
     }
 
-    /// Author 検索クエリで候補を再絞り込みする。カーソルは、クエリ非空なら先頭マッチ、空へ
-    /// 戻ったら現用フィルタの author の行（無ければ All authors。[`author_cursor_for`]）へ
-    /// 戻す（入力→全消去で選択が黙って All authors へ落ちないようにする）。fuzzy は
-    /// [`SelectList`] と同じ nucleo 経路（[`fuzzy_match_indices`]）を流用する。
+    /// Author 検索クエリで候補を再絞り込みする。空へ戻ったときは pending を pin として
+    /// 再計算し、未選択候補から除く。fuzzy は [`SelectList`] と同じ経路を流用する。
     fn refilter_pr_filter_authors(&mut self) {
-        let current = self.pr_state_filter.author.clone();
         let Some(modal) = self.pr_filter_modal.as_mut() else {
             return;
         };
         let authors: &[PrAuthor] = modal.authors.as_deref().unwrap_or(&[]);
-        modal.author_matches = fuzzy_match_indices(
+        let matches = fuzzy_match_indices(
             &modal.author_query,
             authors,
             |author| author.display_name.clone(),
             &mut self.pr_filter_matcher,
         );
-        modal.author_cursor = if modal.author_query.is_empty() {
-            author_cursor_for(modal.authors.as_deref(), current.as_ref())
+        if modal.author_query.is_empty() {
+            modal.author_pins = modal.author_selected.clone();
+            modal.author_pins.sort_by(|left, right| {
+                left.display_name
+                    .to_lowercase()
+                    .cmp(&right.display_name.to_lowercase())
+                    .then_with(|| left.uuid.cmp(&right.uuid))
+            });
+            modal.author_matches = matches
+                .into_iter()
+                .filter(|&index| {
+                    authors.get(index).is_some_and(|author| {
+                        !modal
+                            .author_selected
+                            .iter()
+                            .any(|selected| selected.uuid == author.uuid)
+                    })
+                })
+                .collect();
+            modal.author_cursor = 0;
         } else {
-            0
-        };
+            modal.author_matches = matches;
+            modal.author_cursor = usize::from(!modal.author_matches.is_empty());
+        }
     }
 
-    /// Target 検索クエリで候補を再絞り込みする。カーソルは、クエリ非空なら部分一致行
-    /// （テキスト入力の主目的）、空へ戻ったら現用フィルタの target の行（無ければ
-    /// All branches。[`target_cursor_for`]）へ戻す（入力→全消去で選択が黙って All branches
-    /// へ落ちないようにする）。fuzzy は Author と同じ nucleo 経路
-    /// （[`fuzzy_match_indices`]）を流用する。
+    /// Target 検索クエリで候補を再絞り込みする。空へ戻ったときは pending を pin として
+    /// 再計算し、完全一致の選択済み候補を未選択候補から除く。
     fn refilter_pr_filter_targets(&mut self) {
-        let current = self.pr_state_filter.target_branch.clone();
         let Some(modal) = self.pr_filter_modal.as_mut() else {
             return;
         };
         let branches: &[String] = modal.branches.as_deref().unwrap_or(&[]);
-        modal.target_matches = fuzzy_match_indices(
+        let matches = fuzzy_match_indices(
             &modal.target_query,
             branches,
             |name| name.clone(),
             &mut self.pr_filter_matcher,
         );
-        modal.target_cursor = if modal.target_query.is_empty() {
-            target_cursor_for(modal.branches.as_deref(), current.as_ref())
+        if modal.target_query.is_empty() {
+            modal.target_pins = modal.target_selected.clone();
+            modal.target_pins.sort_by(|left, right| {
+                left.text
+                    .cmp(&right.text)
+                    .then(left.exact.cmp(&right.exact))
+            });
+            modal.target_matches = matches
+                .into_iter()
+                .filter(|&index| {
+                    branches.get(index).is_some_and(|name| {
+                        !modal
+                            .target_selected
+                            .iter()
+                            .any(|selected| selected.exact && selected.text == *name)
+                    })
+                })
+                .collect();
+            modal.target_cursor = 0;
         } else {
-            1
-        };
+            modal.target_matches = matches;
+            modal.target_cursor = 1;
+        }
     }
 
     /// フィルタモーダルの内容を適用する（`Enter`）。states が空なら Status エラーを出して
-    /// 適用しない（モーダルは開いたまま）。カーソル行 → 選択の写像は描画と共有する
-    /// [`PrFilterModal::author_row`] / [`PrFilterModal::target_row`] に従う（選択を指さない行
-    /// （読み込み中・該当なし・範囲外）は現用フィルタを維持し、黙って解除しない）。
+    /// 適用しない（モーダルは開いたまま）。author / target は pending の全体を適用する。
     fn apply_pr_filter_modal(&mut self) -> Command {
         let Some(modal) = self.pr_filter_modal.as_ref() else {
             return Command::None;
@@ -5090,100 +5203,54 @@ impl App {
             self.status = Status::Error("state を 1 つ以上選択してください".to_string());
             return Command::None;
         }
-        let author = match modal.author_row(modal.author_cursor) {
-            PrFilterRow::All => None,
-            PrFilterRow::Candidate(author) => Some(author.clone()),
-            // Partial は Target 専用で Author 行には現れない（防御的に維持と同じ扱い）。
-            PrFilterRow::Partial | PrFilterRow::Missing => self.pr_state_filter.author.clone(),
-        };
-        let target_branch = match modal.target_row(modal.target_cursor) {
-            PrFilterRow::All => None,
-            PrFilterRow::Partial => Some(TargetBranch {
-                text: modal.target_query.clone(),
-                exact: false,
-            }),
-            PrFilterRow::Candidate(name) => Some(TargetBranch {
-                text: name.to_string(),
-                exact: true,
-            }),
-            PrFilterRow::Missing => self.pr_state_filter.target_branch.clone(),
-        };
         let filter = PrStateFilter {
             states: modal.states.clone(),
-            author,
-            target_branch,
+            authors: modal.author_selected.clone(),
+            target_branches: modal.target_selected.clone(),
         };
         self.pr_filter_modal = None;
         self.set_pr_filter(filter)
     }
 
-    /// author 候補の取得結果（またはフォールバック）をフィルタモーダルへ反映する。
-    /// 現在適用中の author が候補に無ければ挿入する（[`insert_current_author`]。モーダルの
-    /// 作業コピーのみで、[`App::pr_authors_cache`] には影響しない）。
+    /// author 候補の取得結果（またはフォールバック）をフィルタモーダルへ反映し、現在の
+    /// クエリと pending から表示行を再計算する。
     ///
     /// 取得中に別リポジトリへ移動していた場合と、既に候補が入っている場合（キャッシュ
     /// 命中で開き直した後に古い取得結果が届いた場合）は反映しない。
-    ///
-    /// 読み込み中の Author セクションは選択可能な行を出さない（カーソルは実質動かせない）
-    /// ため、ここでのカーソル設定がユーザーの選択を上書きすることはない（Target 側の
-    /// [`App::fill_pr_filter_modal_branches`] は部分一致行が選べるため選択の意味を保持する）。
-    fn fill_pr_filter_modal_authors(&mut self, repo_full_name: &str, mut authors: Vec<PrAuthor>) {
+    fn fill_pr_filter_modal_authors(&mut self, repo_full_name: &str, authors: Vec<PrAuthor>) {
         if self.selected_repo.as_deref() != Some(repo_full_name) {
             return;
         }
-        let current = self.pr_state_filter.author.clone();
         let mut refilter = false;
         if let Some(modal) = self.pr_filter_modal.as_mut()
             && modal.authors.is_none()
         {
-            insert_current_author(&mut authors, current.as_ref());
-            modal.author_cursor = author_cursor_for(Some(&authors), current.as_ref());
-            modal.author_matches = (0..authors.len()).collect();
             modal.authors = Some(authors);
-            // 読み込み中に検索クエリが入力済みなら、届いた候補で絞り込みを再計算する
-            // （クエリ空なら上の恒等写像 + 現用 author カーソルのまま）。
-            refilter = !modal.author_query.is_empty();
+            refilter = true;
         }
         if refilter {
             self.refilter_pr_filter_authors();
         }
     }
 
-    /// target branch 候補の取得結果（取得失敗時は空候補）をフィルタモーダルへ反映する。
-    /// 現在適用中の完全一致 target が候補に無ければ挿入する（[`insert_current_target`]。
-    /// モーダルの作業コピーのみで、[`App::branch_candidates_cache`] には影響しない）。
+    /// target branch 候補の取得結果（取得失敗時は空候補）を反映し、現在のクエリと pending
+    /// から表示行を再計算する。
     ///
     /// 取得中に別リポジトリへ移動していた場合と、既に候補が入っている場合は反映しない
     /// （[`App::fill_pr_filter_modal_authors`] と同じガード）。
-    fn fill_pr_filter_modal_branches(&mut self, repo_full_name: &str, mut branches: Vec<String>) {
+    fn fill_pr_filter_modal_branches(&mut self, repo_full_name: &str, branches: Vec<String>) {
         if self.selected_repo.as_deref() != Some(repo_full_name) {
             return;
         }
-        let current = self.pr_state_filter.target_branch.clone();
-        let mut preserved_cursor = None;
+        let mut refilter = false;
         if let Some(modal) = self.pr_filter_modal.as_mut()
             && modal.branches.is_none()
         {
-            insert_current_target(&mut branches, current.as_ref());
-            if modal.target_query.is_empty() {
-                // クエリ空の読み込み中は選択可能な行が無い（ユーザーは行を選べていない）ため、
-                // 現用フィルタの行へカーソルを置く。
-                modal.target_cursor = target_cursor_for(Some(&branches), current.as_ref());
-            } else {
-                // 読み込み中に検索クエリが入力済み（部分一致フィルタからの復元を含む）なら、
-                // 届いた候補で絞り込みを再計算する。行 0（All branches）/ 行 1（部分一致）は
-                // 到着後も同じ位置にあるため、ユーザーが選択中の行の意味を保って復元する
-                // （無条件に部分一致行へ戻さない）。
-                preserved_cursor = Some(modal.target_cursor);
-            }
-            modal.target_matches = (0..branches.len()).collect();
             modal.branches = Some(branches);
+            refilter = true;
         }
-        if let Some(cursor) = preserved_cursor {
+        if refilter {
             self.refilter_pr_filter_targets();
-            if let Some(modal) = self.pr_filter_modal.as_mut() {
-                modal.target_cursor = cursor.min(modal.target_row_count().saturating_sub(1));
-            }
         }
     }
 
@@ -5449,8 +5516,8 @@ impl App {
         if self.selected_workspace.as_deref() != Some(workspace.as_str())
             || self.selected_repo.as_deref() != Some(repo_full_name.as_str())
         {
-            self.pr_state_filter.author = None;
-            self.pr_state_filter.target_branch = None;
+            self.pr_state_filter.authors.clear();
+            self.pr_state_filter.target_branches.clear();
         }
         self.selected_workspace = Some(workspace);
         self.selected_repo = Some(repo_full_name);
@@ -8337,7 +8404,7 @@ mod tests {
     fn single_state_keys_map_to_state_sets_and_preserve_author() {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
-        app.pr_state_filter.author = Some(author("Alice", "{u-1}"));
+        app.pr_state_filter.authors = vec![author("Alice", "{u-1}")];
 
         app.update(Msg::Key(key(KeyCode::Char('o'))));
         assert_eq!(app.pr_state_filter.states, BTreeSet::from([PrState::Open]));
@@ -8354,7 +8421,7 @@ mod tests {
         let cmd = app.update(Msg::Key(key(KeyCode::Char('a'))));
         assert_eq!(app.pr_state_filter.states, BTreeSet::from(PrState::ALL));
         // author は state キーとは独立の軸なので維持される（解除はフィルタモーダルで行う）。
-        assert_eq!(app.pr_state_filter.author, Some(author("Alice", "{u-1}")));
+        assert_eq!(app.pr_state_filter.authors, vec![author("Alice", "{u-1}")]);
         // 既存の体感どおり 1 ページ目から再取得する。
         match cmd {
             Command::LoadPullRequests { page, filter, .. } => {
@@ -8369,7 +8436,7 @@ mod tests {
     fn state_filter_change_persists_states_to_config_but_not_author() {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
-        app.pr_state_filter.author = Some(author("Alice", "{u-1}"));
+        app.pr_state_filter.authors = vec![author("Alice", "{u-1}")];
         app.update(Msg::Key(key(KeyCode::Char('m'))));
         assert_eq!(app.config.pr_states, Some(vec!["MERGED".to_string()]));
     }
@@ -8388,7 +8455,7 @@ mod tests {
             filter.states,
             BTreeSet::from([PrState::Merged, PrState::Declined])
         );
-        assert!(filter.author.is_none());
+        assert!(filter.authors.is_empty());
 
         let invalid = vec!["bogus".to_string()];
         assert_eq!(
@@ -8408,7 +8475,7 @@ mod tests {
             app.pr_state_filter.states,
             BTreeSet::from([PrState::Merged])
         );
-        assert!(app.pr_state_filter.author.is_none());
+        assert!(app.pr_state_filter.authors.is_empty());
     }
 
     /// target branch フィルタのテストヘルパ。
@@ -8423,8 +8490,8 @@ mod tests {
     fn filter_with_author(states: BTreeSet<PrState>, author: PrAuthor) -> PrStateFilter {
         PrStateFilter {
             states,
-            author: Some(author),
-            target_branch: None,
+            authors: vec![author],
+            target_branches: Vec::new(),
         }
     }
 
@@ -8446,18 +8513,144 @@ mod tests {
             author("Alice", "{u-1}"),
         );
         assert_eq!(filter.label(), "OPEN+MERGED, author: Alice");
-        // 部分一致は `target~"..."`、完全一致は `target: ...`。
+        // 部分一致は `~`、完全一致はそのまま表示する。
         let partial = PrStateFilter {
-            target_branch: Some(target("release", false)),
+            target_branches: vec![target("release", false)],
             ..PrStateFilter::only(PrState::Open)
         };
-        assert_eq!(partial.label(), r#"OPEN, target~"release""#);
+        assert_eq!(partial.label(), "OPEN, target: ~release");
         let exact = PrStateFilter {
-            author: Some(author("Alice", "{u-1}")),
-            target_branch: Some(target("main", true)),
+            authors: vec![author("Alice", "{u-1}")],
+            target_branches: vec![target("main", true)],
             ..PrStateFilter::only(PrState::Open)
         };
         assert_eq!(exact.label(), "OPEN, author: Alice, target: main");
+    }
+
+    #[test]
+    fn pr_state_filter_normalizes_multiple_authors_and_targets_for_cache_keys() {
+        let mut left = PrStateFilter {
+            states: BTreeSet::from([PrState::Open]),
+            authors: vec![
+                author("bob", "{u-2}"),
+                author("Alice", "{u-1}"),
+                author("Duplicate", "{u-2}"),
+            ],
+            target_branches: vec![
+                target("release", false),
+                target("main", true),
+                target("main", true),
+            ],
+        };
+        left.normalize();
+        let mut right = PrStateFilter {
+            states: BTreeSet::from([PrState::Open]),
+            authors: vec![author("Alice", "{u-1}"), author("bob", "{u-2}")],
+            target_branches: vec![target("main", true), target("release", false)],
+        };
+        right.normalize();
+        assert_eq!(left, right);
+        assert_eq!(
+            left.label(),
+            "OPEN, author: Alice, bob, target: main, ~release"
+        );
+    }
+
+    #[test]
+    fn pr_filter_modal_author_space_toggles_pending_without_editing_query() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.pr_authors_cache
+            .insert("acme/widget".to_string(), vec![author("Alice", "{u-1}")]);
+        app.branch_candidates_cache
+            .insert("acme/widget".to_string(), Vec::new());
+        app.update(Msg::Key(key(KeyCode::Char('f'))));
+        app.update(Msg::Key(key(KeyCode::Tab)));
+        app.update(Msg::Key(key(KeyCode::Down)));
+        app.update(Msg::Key(key(KeyCode::Char(' '))));
+
+        let modal = app.pr_filter_modal.as_ref().expect("modal open");
+        assert_eq!(modal.author_selected, vec![author("Alice", "{u-1}")]);
+        assert!(modal.author_query.is_empty());
+        assert_eq!(modal.author_cursor, 1, "Space では行順を変えない");
+        assert!(app.pr_state_filter.authors.is_empty(), "Enter 前は未適用");
+    }
+
+    #[test]
+    fn pr_filter_modal_enter_applies_multiple_authors_and_targets() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.pr_authors_cache.insert(
+            "acme/widget".to_string(),
+            vec![author("Alice", "{u-1}"), author("Bob", "{u-2}")],
+        );
+        app.branch_candidates_cache.insert(
+            "acme/widget".to_string(),
+            vec!["main".to_string(), "develop".to_string()],
+        );
+        app.update(Msg::Key(key(KeyCode::Char('f'))));
+        app.update(Msg::Key(key(KeyCode::Tab)));
+        app.update(Msg::Key(key(KeyCode::Down)));
+        app.update(Msg::Key(key(KeyCode::Char(' '))));
+        app.update(Msg::Key(key(KeyCode::Down)));
+        app.update(Msg::Key(key(KeyCode::Char(' '))));
+        app.update(Msg::Key(key(KeyCode::Tab)));
+        app.update(Msg::Key(key(KeyCode::Down)));
+        app.update(Msg::Key(key(KeyCode::Char(' '))));
+        app.update(Msg::Key(key(KeyCode::Down)));
+        app.update(Msg::Key(key(KeyCode::Char(' '))));
+
+        let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
+        assert_eq!(
+            app.pr_state_filter.authors,
+            vec![author("Alice", "{u-1}"), author("Bob", "{u-2}")]
+        );
+        assert_eq!(
+            app.pr_state_filter.target_branches,
+            vec![target("develop", true), target("main", true)]
+        );
+        match cmd {
+            Command::LoadPullRequests { filter, .. } => {
+                assert_eq!(filter.author_uuids(), vec!["{u-1}", "{u-2}"]);
+                assert_eq!(
+                    filter.target_branches,
+                    vec![target("develop", true), target("main", true)]
+                );
+            }
+            other => panic!("expected LoadPullRequests, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_filter_modal_empty_query_rows_are_all_then_pins_then_candidates() {
+        let mut app = review_app();
+        app.screen = Screen::PullRequests;
+        app.pr_state_filter.authors = vec![author("Alice", "{u-1}")];
+        app.pr_state_filter.target_branches = vec![target("release", false)];
+        app.pr_authors_cache.insert(
+            "acme/widget".to_string(),
+            vec![author("Alice", "{u-1}"), author("Bob", "{u-2}")],
+        );
+        app.branch_candidates_cache
+            .insert("acme/widget".to_string(), vec!["main".to_string()]);
+        app.update(Msg::Key(key(KeyCode::Char('f'))));
+        let modal = app.pr_filter_modal.as_ref().expect("modal open");
+
+        assert!(matches!(modal.author_row(0), PrFilterRow::All));
+        assert!(
+            matches!(modal.author_row(1), PrFilterRow::Candidate(author) if author.uuid == "{u-1}")
+        );
+        assert!(
+            matches!(modal.author_row(2), PrFilterRow::Candidate(author) if author.uuid == "{u-2}")
+        );
+        assert!(matches!(modal.target_row(0), PrFilterRow::All));
+        assert!(
+            matches!(modal.target_row(1), PrFilterRow::Candidate(TargetFilterRow::Pinned(target)) if !target.exact && target.text == "release")
+        );
+        assert!(matches!(
+            modal.target_row(2),
+            PrFilterRow::Candidate(TargetFilterRow::Candidate("main"))
+        ));
     }
 
     #[test]
@@ -8606,13 +8799,14 @@ mod tests {
         );
         // Author セクションでは `j` は検索文字（8.4）なので、移動は ↓ で行う。
         app.update(Msg::Key(key(KeyCode::Down))); // All authors → Alice
+        app.update(Msg::Key(key(KeyCode::Char(' '))));
         let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
-        assert_eq!(app.pr_state_filter.author, Some(author("Alice", "{u-1}")));
+        assert_eq!(app.pr_state_filter.authors, vec![author("Alice", "{u-1}")]);
         assert_eq!(app.pr_state_filter.states, BTreeSet::from([PrState::Open]));
         match cmd {
             Command::LoadPullRequests { filter, page, .. } => {
                 assert_eq!(page, 1);
-                assert_eq!(filter.author_uuid(), Some("{u-1}"));
+                assert_eq!(filter.author_uuids(), vec!["{u-1}"]);
             }
             other => panic!("expected LoadPullRequests, got {other:?}"),
         }
@@ -8688,10 +8882,11 @@ mod tests {
         for c in "rel".chars() {
             app.update(Msg::Key(key(KeyCode::Char(c))));
         }
+        app.update(Msg::Key(key(KeyCode::Char(' '))));
         app.update(Msg::Key(key(KeyCode::Enter)));
         assert_eq!(
-            app.pr_state_filter.target_branch,
-            Some(target("rel", false))
+            app.pr_state_filter.target_branches,
+            vec![target("rel", false)]
         );
 
         // 失敗はキャッシュしない → 開き直すとブランチ候補の再取得を試みる。
@@ -8707,7 +8902,7 @@ mod tests {
     fn pr_filter_modal_enter_while_authors_loading_keeps_current_author() {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
-        app.pr_state_filter.author = Some(author("Alice", "{u-1}"));
+        app.pr_state_filter.authors = vec![author("Alice", "{u-1}")];
 
         let cmd = app.update(Msg::Key(key(KeyCode::Char('f'))));
         assert!(
@@ -8721,7 +8916,7 @@ mod tests {
         let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
         assert!(app.pr_filter_modal.is_none());
         // author は黙って All authors へ落とさず維持し、states だけを適用する。
-        assert_eq!(app.pr_state_filter.author, Some(author("Alice", "{u-1}")));
+        assert_eq!(app.pr_state_filter.authors, vec![author("Alice", "{u-1}")]);
         assert_eq!(
             app.pr_state_filter.states,
             BTreeSet::from([PrState::Open, PrState::Merged])
@@ -8729,7 +8924,7 @@ mod tests {
         match cmd {
             Command::LoadPullRequests { filter, page, .. } => {
                 assert_eq!(page, 1);
-                assert_eq!(filter.author_uuid(), Some("{u-1}"));
+                assert_eq!(filter.author_uuids(), vec!["{u-1}"]);
             }
             other => panic!("expected LoadPullRequests, got {other:?}"),
         }
@@ -8758,16 +8953,17 @@ mod tests {
             let modal = app.pr_filter_modal.as_ref().expect("modal open");
             assert_eq!(modal.author_query, "j");
             assert_eq!(modal.author_matches, vec![2], "Jane だけがマッチ");
-            assert_eq!(modal.author_cursor, 0, "カーソルは先頭マッチへ");
+            assert_eq!(modal.author_cursor, 1, "All 直下の先頭マッチへ");
         }
 
+        app.update(Msg::Key(key(KeyCode::Char(' '))));
         let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
         assert!(app.pr_filter_modal.is_none());
-        assert_eq!(app.pr_state_filter.author, Some(author("Jane", "{u-3}")));
+        assert_eq!(app.pr_state_filter.authors, vec![author("Jane", "{u-3}")]);
         match cmd {
             Command::LoadPullRequests { filter, page, .. } => {
                 assert_eq!(page, 1);
-                assert_eq!(filter.author_uuid(), Some("{u-3}"));
+                assert_eq!(filter.author_uuids(), vec!["{u-3}"]);
             }
             other => panic!("expected LoadPullRequests, got {other:?}"),
         }
@@ -8831,7 +9027,7 @@ mod tests {
     fn pr_filter_modal_author_query_no_match_enter_keeps_current_author() {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
-        app.pr_state_filter.author = Some(author("Alice", "{u-1}"));
+        app.pr_state_filter.authors = vec![author("Alice", "{u-1}")];
         app.pr_authors_cache.insert(
             "acme/widget".to_string(),
             vec![author("Alice", "{u-1}"), author("Bob", "{u-2}")],
@@ -8849,11 +9045,11 @@ mod tests {
 
         let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
         assert!(app.pr_filter_modal.is_none());
-        assert_eq!(app.pr_state_filter.author, Some(author("Alice", "{u-1}")));
+        assert_eq!(app.pr_state_filter.authors, vec![author("Alice", "{u-1}")]);
         match cmd {
             Command::LoadPullRequests { filter, page, .. } => {
                 assert_eq!(page, 1);
-                assert_eq!(filter.author_uuid(), Some("{u-1}"));
+                assert_eq!(filter.author_uuids(), vec!["{u-1}"]);
             }
             other => panic!("expected LoadPullRequests, got {other:?}"),
         }
@@ -8893,17 +9089,18 @@ mod tests {
             app.pr_filter_modal
                 .as_ref()
                 .map(|modal| modal.author_cursor),
-            Some(1)
+            Some(2)
         );
+        app.update(Msg::Key(key(KeyCode::Char(' '))));
         app.update(Msg::Key(key(KeyCode::Enter)));
-        assert_eq!(app.pr_state_filter.author, Some(expected));
+        assert_eq!(app.pr_state_filter.authors, vec![expected]);
     }
 
     #[test]
     fn current_author_missing_from_members_is_inserted_with_cursor_on_it() {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
-        app.pr_state_filter.author = Some(author("Alice", "{u-1}"));
+        app.pr_state_filter.authors = vec![author("Alice", "{u-1}")];
         app.update(Msg::Key(key(KeyCode::Char('f'))));
         app.update(Msg::PrAuthorsLoaded {
             repo_full_name: "acme/widget".to_string(),
@@ -8914,18 +9111,13 @@ mod tests {
         });
 
         let modal = app.pr_filter_modal.as_ref().expect("modal stays open");
-        // 直近 PR に登場しない等で候補に無い現用 author は表示名順（大文字小文字無視）の
-        // 位置へ挿入される。
+        // 候補に無い現用 author は候補配列を変えず pin として表示する。
         assert_eq!(
             modal.authors,
-            Some(vec![
-                author("Alice", "{u-1}"),
-                author("bob", "{u-2}"),
-                author("Zoe", "{u-3}"),
-            ])
+            Some(vec![author("bob", "{u-2}"), author("Zoe", "{u-3}")])
         );
-        // カーソルは現用 author を指す（0 = All authors、1 = Alice）。
-        assert_eq!(modal.author_cursor, 1);
+        assert_eq!(modal.author_pins, vec![author("Alice", "{u-1}")]);
+        assert_eq!(modal.author_cursor, 0);
         // 挿入はモーダルの作業コピーのみで、repo 単位キャッシュへは波及しない。
         assert_eq!(
             app.pr_authors_cache.get(&"acme/widget".to_string()),
@@ -8939,15 +9131,13 @@ mod tests {
         app.screen = Screen::PullRequests;
         app.pr_authors_cache
             .insert("acme/widget".to_string(), vec![author("Bob", "{u-2}")]);
-        app.pr_state_filter.author = Some(author("Alice", "{u-1}"));
+        app.pr_state_filter.authors = vec![author("Alice", "{u-1}")];
 
         app.update(Msg::Key(key(KeyCode::Char('f'))));
         let modal = app.pr_filter_modal.as_ref().expect("modal opens");
-        assert_eq!(
-            modal.authors,
-            Some(vec![author("Alice", "{u-1}"), author("Bob", "{u-2}")])
-        );
-        assert_eq!(modal.author_cursor, 1);
+        assert_eq!(modal.authors, Some(vec![author("Bob", "{u-2}")]));
+        assert_eq!(modal.author_pins, vec![author("Alice", "{u-1}")]);
+        assert_eq!(modal.author_cursor, 0);
     }
 
     #[test]
@@ -9060,7 +9250,7 @@ mod tests {
 
         // target 付きフィルタへ切替: target 無しのキャッシュに命中しないこと。
         let with_target = PrStateFilter {
-            target_branch: Some(target("release", false)),
+            target_branches: vec![target("release", false)],
             ..PrStateFilter::only(PrState::Open)
         };
         app.pr_state_filter = with_target.clone();
@@ -9080,7 +9270,7 @@ mod tests {
 
         // exact 違い（部分一致 ⇔ 完全一致）も別エントリ。
         app.pr_state_filter = PrStateFilter {
-            target_branch: Some(target("release", true)),
+            target_branches: vec![target("release", true)],
             ..PrStateFilter::only(PrState::Open)
         };
         let cmd = app.update(Msg::Key(key(KeyCode::Char('r'))));
@@ -9139,17 +9329,17 @@ mod tests {
             assert_eq!(modal.target_cursor, 1, "カーソルは部分一致行へ");
         }
 
-        // カーソル位置（部分一致行）のまま Enter → exact=false で適用。
+        app.update(Msg::Key(key(KeyCode::Char(' '))));
         let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
         assert!(app.pr_filter_modal.is_none());
         assert_eq!(
-            app.pr_state_filter.target_branch,
-            Some(target("rel", false))
+            app.pr_state_filter.target_branches,
+            vec![target("rel", false)]
         );
         match cmd {
             Command::LoadPullRequests { filter, page, .. } => {
                 assert_eq!(page, 1);
-                assert_eq!(filter.target_branch, Some(target("rel", false)));
+                assert_eq!(filter.target_branches, vec![target("rel", false)]);
             }
             other => panic!("expected LoadPullRequests, got {other:?}"),
         }
@@ -9172,16 +9362,17 @@ mod tests {
         // クエリ空: 行 0 = All branches、行 1 = main、行 2 = develop。
         app.update(Msg::Key(key(KeyCode::Down)));
         app.update(Msg::Key(key(KeyCode::Down)));
+        app.update(Msg::Key(key(KeyCode::Char(' '))));
         let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
         assert!(app.pr_filter_modal.is_none());
         assert_eq!(
-            app.pr_state_filter.target_branch,
-            Some(target("develop", true))
+            app.pr_state_filter.target_branches,
+            vec![target("develop", true)]
         );
         match cmd {
             Command::LoadPullRequests { filter, page, .. } => {
                 assert_eq!(page, 1);
-                assert_eq!(filter.target_branch, Some(target("develop", true)));
+                assert_eq!(filter.target_branches, vec![target("develop", true)]);
             }
             other => panic!("expected LoadPullRequests, got {other:?}"),
         }
@@ -9191,7 +9382,7 @@ mod tests {
     fn pr_filter_modal_target_all_branches_clears_filter() {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
-        app.pr_state_filter.target_branch = Some(target("main", true));
+        app.pr_state_filter.target_branches = vec![target("main", true)];
         app.pr_authors_cache
             .insert("acme/widget".to_string(), Vec::new());
         app.branch_candidates_cache.insert(
@@ -9200,45 +9391,44 @@ mod tests {
         );
         app.update(Msg::Key(key(KeyCode::Char('f'))));
         {
-            // 開いた時点でカーソルは現用の完全一致 target（行 1 = main）を指す。
             let modal = app.pr_filter_modal.as_ref().expect("modal open");
-            assert_eq!(modal.target_cursor, 1);
+            assert_eq!(modal.target_cursor, 0);
         }
         app.update(Msg::Key(key(KeyCode::Tab)));
         app.update(Msg::Key(key(KeyCode::Tab)));
-        app.update(Msg::Key(key(KeyCode::Up))); // main → All branches
+        app.update(Msg::Key(key(KeyCode::Char(' '))));
         app.update(Msg::Key(key(KeyCode::Enter)));
         assert!(app.pr_filter_modal.is_none());
-        assert!(app.pr_state_filter.target_branch.is_none());
+        assert!(app.pr_state_filter.target_branches.is_empty());
     }
 
     #[test]
     fn pr_filter_modal_enter_while_branches_loading_keeps_current_target() {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
-        app.pr_state_filter.target_branch = Some(target("main", true));
+        app.pr_state_filter.target_branches = vec![target("main", true)];
 
         // 候補未着（読み込み中）のまま Enter → target を黙って解除しない。
         app.update(Msg::Key(key(KeyCode::Char('f'))));
         let cmd = app.update(Msg::Key(key(KeyCode::Enter)));
         assert!(app.pr_filter_modal.is_none());
         assert_eq!(
-            app.pr_state_filter.target_branch,
-            Some(target("main", true))
+            app.pr_state_filter.target_branches,
+            vec![target("main", true)]
         );
         match cmd {
             Command::LoadPullRequests { filter, .. } => {
-                assert_eq!(filter.target_branch, Some(target("main", true)));
+                assert_eq!(filter.target_branches, vec![target("main", true)]);
             }
             other => panic!("expected LoadPullRequests, got {other:?}"),
         }
     }
 
     #[test]
-    fn pr_filter_modal_restores_partial_target_into_query_and_keeps_it_on_enter() {
+    fn pr_filter_modal_shows_applied_partial_target_as_pin_and_keeps_it_on_enter() {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
-        app.pr_state_filter.target_branch = Some(target("rel", false));
+        app.pr_state_filter.target_branches = vec![target("rel", false)];
         app.pr_authors_cache
             .insert("acme/widget".to_string(), Vec::new());
         app.branch_candidates_cache
@@ -9246,28 +9436,29 @@ mod tests {
 
         app.update(Msg::Key(key(KeyCode::Char('f'))));
         {
-            // 部分一致フィルタは検索クエリへ復元され、カーソルは部分一致行を指す。
             let modal = app.pr_filter_modal.as_ref().expect("modal open");
-            assert_eq!(modal.target_query, "rel");
-            assert_eq!(modal.target_cursor, 1);
+            assert_eq!(modal.target_query, "");
+            assert_eq!(modal.target_pins, vec![target("rel", false)]);
+            assert_eq!(modal.target_cursor, 0);
         }
         // 未操作のまま Enter → 同じ部分一致フィルタを維持する。
         app.update(Msg::Key(key(KeyCode::Enter)));
         assert_eq!(
-            app.pr_state_filter.target_branch,
-            Some(target("rel", false))
+            app.pr_state_filter.target_branches,
+            vec![target("rel", false)]
         );
     }
 
-    /// M8 レビュー修正 F2: 検索クエリを入力して全消去したとき、カーソルは All 行ではなく
-    /// 現用フィルタ値の行へ戻る（1 文字入力 → Backspace → Enter で適用中の author / target が
-    /// 黙って解除されない）。
+    /// M9: 検索クエリを入力して全消去したとき、カーソルは行 0（All）へ戻る。適用値は pin
+    /// として All 直下に見えており、Enter はカーソル行ではなく pending を適用するため、
+    /// 1 文字入力 → Backspace → Enter で適用中の author / target が黙って解除されることはない
+    /// （M8 レビュー修正 F2 の保護を新モデルで引き継ぐ）。
     #[test]
-    fn pr_filter_modal_clearing_query_returns_cursor_to_current_filter_row() {
+    fn pr_filter_modal_clearing_query_resets_cursor_and_enter_keeps_applied_filter() {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
-        app.pr_state_filter.author = Some(author("Alice", "{u-1}"));
-        app.pr_state_filter.target_branch = Some(target("main", true));
+        app.pr_state_filter.authors = vec![author("Alice", "{u-1}")];
+        app.pr_state_filter.target_branches = vec![target("main", true)];
         app.pr_authors_cache.insert(
             "acme/widget".to_string(),
             vec![author("Alice", "{u-1}"), author("Bob", "{u-2}")],
@@ -9286,7 +9477,7 @@ mod tests {
             app.pr_filter_modal
                 .as_ref()
                 .map(|modal| modal.author_cursor),
-            Some(1)
+            Some(0)
         );
 
         // Target: 同様に 1 文字入力 → 全消去で現用 target（行 1 = main）へ戻る。
@@ -9297,16 +9488,16 @@ mod tests {
             app.pr_filter_modal
                 .as_ref()
                 .map(|modal| modal.target_cursor),
-            Some(1)
+            Some(0)
         );
 
         // そのまま Enter しても現在のフィルタが維持される。
         app.update(Msg::Key(key(KeyCode::Enter)));
         assert!(app.pr_filter_modal.is_none());
-        assert_eq!(app.pr_state_filter.author, Some(author("Alice", "{u-1}")));
+        assert_eq!(app.pr_state_filter.authors, vec![author("Alice", "{u-1}")]);
         assert_eq!(
-            app.pr_state_filter.target_branch,
-            Some(target("main", true))
+            app.pr_state_filter.target_branches,
+            vec![target("main", true)]
         );
     }
 
@@ -9318,17 +9509,16 @@ mod tests {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
         // 部分一致フィルタ適用中に開く → クエリ復元・カーソルは部分一致行（1）。候補は未着。
-        app.pr_state_filter.target_branch = Some(target("rel", false));
+        app.pr_state_filter.target_branches = vec![target("rel", false)];
         app.update(Msg::Key(key(KeyCode::Char('f'))));
         app.update(Msg::Key(key(KeyCode::Tab)));
         app.update(Msg::Key(key(KeyCode::Tab)));
         {
             let modal = app.pr_filter_modal.as_ref().expect("modal open");
             assert!(modal.branches.is_none(), "候補は読み込み中");
-            assert_eq!(modal.target_cursor, 1);
+            assert_eq!(modal.target_cursor, 0);
         }
-        // 読み込み中に ↑ で All branches（行 0）を選ぶ。
-        app.update(Msg::Key(key(KeyCode::Up)));
+        app.update(Msg::Key(key(KeyCode::Char(' '))));
 
         // 応答到着 → 絞り込みは再計算されるが、カーソルは All のまま。
         app.update(Msg::FilterBranchesLoaded {
@@ -9345,14 +9535,14 @@ mod tests {
 
         // Enter → 見えている選択のとおり All branches（解除）が適用される。
         app.update(Msg::Key(key(KeyCode::Enter)));
-        assert!(app.pr_state_filter.target_branch.is_none());
+        assert!(app.pr_state_filter.target_branches.is_empty());
     }
 
     #[test]
     fn current_exact_target_missing_from_candidates_is_inserted_on_open() {
         let mut app = review_app();
         app.screen = Screen::PullRequests;
-        app.pr_state_filter.target_branch = Some(target("hotfix", true));
+        app.pr_state_filter.target_branches = vec![target("hotfix", true)];
         app.pr_authors_cache
             .insert("acme/widget".to_string(), Vec::new());
         app.branch_candidates_cache
@@ -9361,11 +9551,9 @@ mod tests {
         app.update(Msg::Key(key(KeyCode::Char('f'))));
         let modal = app.pr_filter_modal.as_ref().expect("modal open");
         // 候補（1 ページ目）から漏れた現用ブランチは先頭へ挿入され、カーソルが指す。
-        assert_eq!(
-            modal.branches,
-            Some(vec!["hotfix".to_string(), "main".to_string()])
-        );
-        assert_eq!(modal.target_cursor, 1);
+        assert_eq!(modal.branches, Some(vec!["main".to_string()]));
+        assert_eq!(modal.target_pins, vec![target("hotfix", true)]);
+        assert_eq!(modal.target_cursor, 0);
         // 挿入はモーダルの作業コピーのみで、repo 単位キャッシュへは波及しない。
         assert_eq!(
             app.branch_candidates_cache.get(&"acme/widget".to_string()),
@@ -9384,26 +9572,26 @@ mod tests {
             .set_items(vec![make_repo("acme/widget", None)]);
         app.pr_state_filter = PrStateFilter {
             states: BTreeSet::from([PrState::Merged]),
-            author: Some(author("Alice", "{u-1}")),
-            target_branch: Some(target("main", true)),
+            authors: vec![author("Alice", "{u-1}")],
+            target_branches: vec![target("main", true)],
         };
         app.update(Msg::Key(key(KeyCode::Enter)));
         assert_eq!(
             app.pr_state_filter.states,
             BTreeSet::from([PrState::Merged])
         );
-        assert!(app.pr_state_filter.author.is_none());
-        assert!(app.pr_state_filter.target_branch.is_none());
+        assert!(app.pr_state_filter.authors.is_empty());
+        assert!(app.pr_state_filter.target_branches.is_empty());
 
         // 同一 repo への再入場: repo コンテキストは変わらないので author / target を維持する。
-        app.pr_state_filter.author = Some(author("Alice", "{u-1}"));
-        app.pr_state_filter.target_branch = Some(target("main", true));
+        app.pr_state_filter.authors = vec![author("Alice", "{u-1}")];
+        app.pr_state_filter.target_branches = vec![target("main", true)];
         app.screen = Screen::Repositories;
         app.update(Msg::Key(key(KeyCode::Enter)));
-        assert_eq!(app.pr_state_filter.author, Some(author("Alice", "{u-1}")));
+        assert_eq!(app.pr_state_filter.authors, vec![author("Alice", "{u-1}")]);
         assert_eq!(
-            app.pr_state_filter.target_branch,
-            Some(target("main", true))
+            app.pr_state_filter.target_branches,
+            vec![target("main", true)]
         );
     }
 
@@ -10835,6 +11023,25 @@ diff --git a/two.txt b/two.txt\n\
         diff
     }
 
+    fn diff_with_three_comment_thread() -> DiffState {
+        let parsed = parse_diff("diff --git a/x.rs b/x.rs\n@@ -1,3 +1,3 @@\n a\n b\n c\n");
+        let comments = [
+            make_inline_comment(1, "root", "x.rs", 2, "2026-01-01T00:00:00Z", None),
+            make_inline_comment(2, "reply 1", "x.rs", 2, "2026-01-02T00:00:00Z", Some(1)),
+            make_inline_comment(3, "reply 2", "x.rs", 2, "2026-01-03T00:00:00Z", Some(1)),
+        ];
+        let comment_layout = build_comment_layout(&parsed, &comments, &Me::default());
+        let mut diff = DiffState {
+            parsed,
+            viewport: 30,
+            view_mode: DiffViewMode::Unified,
+            comment_layout,
+            ..Default::default()
+        };
+        diff.rebuild_display_rows();
+        diff
+    }
+
     /// スレッドのヘッダ行（カーソル停止対象）の表示行インデックス。
     fn thread_header_index(diff: &DiffState) -> usize {
         diff.display_rows
@@ -10947,6 +11154,90 @@ diff --git a/two.txt b/two.txt\n\
             .collect();
         // コメント 1 件（ルート）に 1 本のアクション行（root=true）。
         assert_eq!(actions, vec![true]);
+    }
+
+    #[test]
+    fn display_rows_insert_one_inner_spacer_between_comments_only() {
+        let diff = diff_with_three_comment_thread();
+        let kinds: Vec<&str> = diff
+            .display_rows
+            .iter()
+            .filter_map(|row| match row {
+                DisplayRow::Diff(_) => None,
+                DisplayRow::Comment(row) => Some(match row.kind {
+                    CommentRowKind::Top => "Top",
+                    CommentRowKind::Header { .. } => "Header",
+                    CommentRowKind::Body { .. } => "Body",
+                    CommentRowKind::Actions { .. } => "Actions",
+                    CommentRowKind::InnerSpacer => "InnerSpacer",
+                    CommentRowKind::Bottom => "Bottom",
+                    CommentRowKind::Spacer => "Spacer",
+                    CommentRowKind::Collapsed { .. } => "Collapsed",
+                }),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "Top",
+                "Header",
+                "Body",
+                "Actions",
+                "InnerSpacer",
+                "Header",
+                "Body",
+                "Actions",
+                "InnerSpacer",
+                "Header",
+                "Body",
+                "Actions",
+                "Bottom",
+                "Spacer",
+            ]
+        );
+
+        let spacer_indices: Vec<usize> = diff
+            .display_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                matches!(
+                    row,
+                    DisplayRow::Comment(CommentRow {
+                        kind: CommentRowKind::InnerSpacer,
+                        ..
+                    })
+                )
+                .then_some(index)
+            })
+            .collect();
+        assert_eq!(spacer_indices.len(), 2);
+        assert!(
+            spacer_indices
+                .iter()
+                .all(|index| !diff.is_focusable(*index))
+        );
+    }
+
+    #[test]
+    fn click_on_inner_spacer_row_is_noop() {
+        let mut diff = diff_with_three_comment_thread();
+        let spacer = diff
+            .display_rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row,
+                    DisplayRow::Comment(CommentRow {
+                        kind: CommentRowKind::InnerSpacer,
+                        ..
+                    })
+                )
+            })
+            .expect("inner spacer present");
+        assert_eq!(diff.cursor, 0);
+        diff.click_body_row(Rect::new(0, 0, 40, 30), (5, 1 + spacer as u16));
+        assert_eq!(diff.cursor, 0);
     }
 
     #[test]
@@ -14047,29 +14338,29 @@ diff --git a/two.txt b/two.txt\n\
         // 別リポジトリへのジャンプ: author / target はリポジトリ/ワークスペース依存なので
         // 両方リセット。
         let mut app = review_app();
-        app.pr_state_filter.author = Some(author("Alice", "{u-1}"));
-        app.pr_state_filter.target_branch = Some(target("release", false));
+        app.pr_state_filter.authors = vec![author("Alice", "{u-1}")];
+        app.pr_state_filter.target_branches = vec![target("release", false)];
         app.jump_to_pr(
             "acme".to_string(),
             "acme/other".to_string(),
             make_pr(5, "OPEN"),
         );
-        assert!(app.pr_state_filter.author.is_none());
-        assert!(app.pr_state_filter.target_branch.is_none());
+        assert!(app.pr_state_filter.authors.is_empty());
+        assert!(app.pr_state_filter.target_branches.is_empty());
 
         // 同一リポジトリへのジャンプ: 維持する。
         let mut app = review_app();
-        app.pr_state_filter.author = Some(author("Alice", "{u-1}"));
-        app.pr_state_filter.target_branch = Some(target("release", false));
+        app.pr_state_filter.authors = vec![author("Alice", "{u-1}")];
+        app.pr_state_filter.target_branches = vec![target("release", false)];
         app.jump_to_pr(
             "acme".to_string(),
             "acme/widget".to_string(),
             make_pr(5, "OPEN"),
         );
-        assert_eq!(app.pr_state_filter.author, Some(author("Alice", "{u-1}")));
+        assert_eq!(app.pr_state_filter.authors, vec![author("Alice", "{u-1}")]);
         assert_eq!(
-            app.pr_state_filter.target_branch,
-            Some(target("release", false))
+            app.pr_state_filter.target_branches,
+            vec![target("release", false)]
         );
     }
 

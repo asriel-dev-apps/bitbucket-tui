@@ -835,13 +835,16 @@ fn repositories_query(sort: ListSort) -> [(&'static str, &'static str); 2] {
 /// `sort` はどちらの経路でも併用する。ネットワークを介さずに検証できるよう純粋関数として
 /// 切り出している（[`repositories_query`] と同じ狙い）。
 fn pull_requests_query(filter: PrListFilter<'_>, sort: ListSort) -> Vec<(String, String)> {
-    let target = filter
-        .target_branch
-        .filter(|target| !target.text.is_empty());
-    let mut query: Vec<(String, String)> = if filter.author_uuid.is_some() || target.is_some() {
+    let targets: Vec<&TargetBranch> = filter
+        .target_branches
+        .iter()
+        .filter(|target| !target.text.is_empty())
+        .collect();
+    let mut query: Vec<(String, String)> = if !filter.author_uuids.is_empty() || !targets.is_empty()
+    {
         vec![(
             "q".to_string(),
-            bbql_filter(filter.states, filter.author_uuid, target),
+            bbql_filter(filter.states, filter.author_uuids, &targets),
         )]
     } else {
         filter
@@ -860,11 +863,7 @@ fn pull_requests_query(filter: PrListFilter<'_>, sort: ListSort) -> Vec<(String,
 /// target branch は `exact` に応じて `=`（完全一致）/`~`（部分一致。実測で大文字小文字を
 /// 区別しない）を使う。`states` が空なら state 条件を省く（UI 側は空 state の適用を拒否する
 /// ため防御的な分岐）。
-fn bbql_filter(
-    states: &[&str],
-    author_uuid: Option<&str>,
-    target: Option<&TargetBranch>,
-) -> String {
+fn bbql_filter(states: &[&str], author_uuids: &[&str], targets: &[&TargetBranch]) -> String {
     let mut conditions = Vec::new();
     if !states.is_empty() {
         let state_list = states
@@ -874,15 +873,33 @@ fn bbql_filter(
             .join(",");
         conditions.push(format!("state IN ({state_list})"));
     }
-    if let Some(uuid) = author_uuid {
-        conditions.push(format!("author.uuid={}", bbql_quote(uuid)));
+    if !author_uuids.is_empty() {
+        let authors = author_uuids
+            .iter()
+            .map(|uuid| format!("author.uuid={}", bbql_quote(uuid)))
+            .collect::<Vec<_>>();
+        conditions.push(if authors.len() == 1 {
+            authors[0].clone()
+        } else {
+            format!("({})", authors.join(" OR "))
+        });
     }
-    if let Some(target) = target {
-        let operator = if target.exact { "=" } else { "~" };
-        conditions.push(format!(
-            "destination.branch.name {operator} {}",
-            bbql_quote(&target.text)
-        ));
+    if !targets.is_empty() {
+        let targets = targets
+            .iter()
+            .map(|target| {
+                let operator = if target.exact { "=" } else { "~" };
+                format!(
+                    "destination.branch.name {operator} {}",
+                    bbql_quote(&target.text)
+                )
+            })
+            .collect::<Vec<_>>();
+        conditions.push(if targets.len() == 1 {
+            targets[0].clone()
+        } else {
+            format!("({})", targets.join(" OR "))
+        });
     }
     conditions.join(" AND ")
 }
@@ -1222,13 +1239,13 @@ mod tests {
     /// `pull_requests_query` へ渡すフィルタ指定を組み立てるテストヘルパ。
     fn pr_filter<'a>(
         states: &'a [&'a str],
-        author_uuid: Option<&'a str>,
-        target_branch: Option<&'a TargetBranch>,
+        author_uuids: &'a [&'a str],
+        target_branches: &'a [TargetBranch],
     ) -> PrListFilter<'a> {
         PrListFilter {
             states,
-            author_uuid,
-            target_branch,
+            author_uuids,
+            target_branches,
         }
     }
 
@@ -1243,7 +1260,7 @@ mod tests {
     #[test]
     fn pull_requests_query_without_author_repeats_state_and_appends_selected_sort() {
         assert_eq!(
-            pull_requests_query(pr_filter(&["OPEN", "MERGED"], None, None), ListSort::Newest),
+            pull_requests_query(pr_filter(&["OPEN", "MERGED"], &[], &[]), ListSort::Newest),
             owned_query(&[
                 ("state", "OPEN"),
                 ("state", "MERGED"),
@@ -1255,7 +1272,7 @@ mod tests {
     #[test]
     fn pull_requests_query_with_no_states_only_has_sort() {
         assert_eq!(
-            pull_requests_query(pr_filter(&[], None, None), ListSort::LeastRecentlyUpdated),
+            pull_requests_query(pr_filter(&[], &[], &[]), ListSort::LeastRecentlyUpdated),
             owned_query(&[("sort", "updated_on")])
         );
     }
@@ -1267,8 +1284,8 @@ mod tests {
         let query = pull_requests_query(
             pr_filter(
                 &["OPEN", "MERGED"],
-                Some("{d3f5e4b0-1234-5678-9abc-def012345678}"),
-                None,
+                &["{d3f5e4b0-1234-5678-9abc-def012345678}"],
+                &[],
             ),
             ListSort::Newest,
         );
@@ -1289,10 +1306,7 @@ mod tests {
     fn pull_requests_query_with_author_and_no_states_filters_by_author_only() {
         // UI は空 state の適用を拒否するが、防御的に `state IN ()`（不正な BBQL）を作らない。
         assert_eq!(
-            pull_requests_query(
-                pr_filter(&[], Some("{u-1}"), None),
-                ListSort::RecentlyUpdated
-            ),
+            pull_requests_query(pr_filter(&[], &["{u-1}"], &[]), ListSort::RecentlyUpdated),
             owned_query(&[("q", r#"author.uuid="{u-1}""#), ("sort", "-updated_on")])
         );
     }
@@ -1301,7 +1315,7 @@ mod tests {
     fn pull_requests_query_with_partial_target_uses_single_q_with_tilde() {
         let branch = target("release", false);
         let query = pull_requests_query(
-            pr_filter(&["OPEN"], None, Some(&branch)),
+            pr_filter(&["OPEN"], &[], &[branch]),
             ListSort::RecentlyUpdated,
         );
         assert_eq!(
@@ -1321,7 +1335,7 @@ mod tests {
     fn pull_requests_query_with_exact_target_uses_equals_operator() {
         let branch = target("main", true);
         let query = pull_requests_query(
-            pr_filter(&["OPEN", "MERGED"], None, Some(&branch)),
+            pr_filter(&["OPEN", "MERGED"], &[], &[branch]),
             ListSort::Newest,
         );
         assert_eq!(
@@ -1340,7 +1354,7 @@ mod tests {
     fn pull_requests_query_with_author_and_target_joins_conditions_with_and() {
         let branch = target("release", false);
         let query = pull_requests_query(
-            pr_filter(&["OPEN"], Some("{u-1}"), Some(&branch)),
+            pr_filter(&["OPEN"], &["{u-1}"], &[branch]),
             ListSort::RecentlyUpdated,
         );
         assert_eq!(
@@ -1356,12 +1370,32 @@ mod tests {
     }
 
     #[test]
+    fn pull_requests_query_with_multiple_authors_and_targets_uses_parenthesized_or_groups() {
+        let targets = [target(r#"ma"in"#, true), target("release", false)];
+        let query = pull_requests_query(
+            pr_filter(&["OPEN"], &[r#"{u"1}"#, "{u-2}"], &targets),
+            ListSort::RecentlyUpdated,
+        );
+        assert_eq!(
+            query,
+            owned_query(&[
+                (
+                    "q",
+                    r#"state IN ("OPEN") AND (author.uuid="{u\"1}" OR author.uuid="{u-2}") AND (destination.branch.name = "ma\"in" OR destination.branch.name ~ "release")"#,
+                ),
+                ("sort", "-updated_on"),
+            ])
+        );
+        assert!(query.iter().all(|(key, _)| key != "state"));
+    }
+
+    #[test]
     fn bbql_filter_escapes_backslashes_and_quotes_in_target_and_author() {
         // 自由入力の `"` はエスケープされ、BBQL の文字列リテラルが途中で閉じない。
         let branch = target(r#"re""#, false);
         assert_eq!(
             pull_requests_query(
-                pr_filter(&["OPEN"], None, Some(&branch)),
+                pr_filter(&["OPEN"], &[], &[branch]),
                 ListSort::RecentlyUpdated
             ),
             owned_query(&[
@@ -1377,7 +1411,7 @@ mod tests {
         let branch = target(r"a\b", true);
         assert_eq!(
             pull_requests_query(
-                pr_filter(&["OPEN"], None, Some(&branch)),
+                pr_filter(&["OPEN"], &[], &[branch]),
                 ListSort::RecentlyUpdated
             ),
             owned_query(&[
@@ -1393,7 +1427,7 @@ mod tests {
         let branch = target(r#"\""#, false);
         assert_eq!(
             pull_requests_query(
-                pr_filter(&["OPEN"], None, Some(&branch)),
+                pr_filter(&["OPEN"], &[], &[branch]),
                 ListSort::RecentlyUpdated
             ),
             owned_query(&[
@@ -1409,7 +1443,7 @@ mod tests {
         // 埋め込み経路を統一して防御する）。
         assert_eq!(
             pull_requests_query(
-                pr_filter(&[], Some(r#"{u"1}"#), None),
+                pr_filter(&[], &[r#"{u"1}"#], &[]),
                 ListSort::RecentlyUpdated
             ),
             owned_query(&[("q", r#"author.uuid="{u\"1}""#), ("sort", "-updated_on")])
@@ -1422,7 +1456,7 @@ mod tests {
         let branch = target("", false);
         assert_eq!(
             pull_requests_query(
-                pr_filter(&["OPEN"], None, Some(&branch)),
+                pr_filter(&["OPEN"], &[], &[branch]),
                 ListSort::RecentlyUpdated
             ),
             owned_query(&[("state", "OPEN"), ("sort", "-updated_on")])
@@ -1455,7 +1489,7 @@ mod tests {
         // `q` の値の URL エンコードは手組みせず reqwest の `.query()` に委ねる。
         // 空白・引用符・波括弧が生のまま URL に残らないことを確認する。
         let query = pull_requests_query(
-            pr_filter(&["OPEN", "MERGED"], Some("{u-1}"), None),
+            pr_filter(&["OPEN", "MERGED"], &["{u-1}"], &[]),
             ListSort::Newest,
         );
         let request = HttpClient::new()
