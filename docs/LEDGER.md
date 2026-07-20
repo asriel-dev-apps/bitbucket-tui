@@ -123,7 +123,7 @@
 
 ## M9 実装メモ (2026-07-19): キーヒント順序反転・フィルタ複数選択化・ソートラベル英語化・スレッド内コメント間隔
 
-仕様書 `docs/specs/M9.md`。2 フェーズに分けて委譲し、フェーズ毎にゲート（fmt/clippy -D warnings/test --offline）を再実行して検収した。
+仕様書 `docs/specs/M9.md`。2 フェーズに分けて実装・検証し、フェーズ毎にゲート（fmt/clippy -D warnings/test --offline）を再実行した。
 
 **Phase 1（小粒 3 件）**:
 - キーヒント: M8 の「`?` 先頭固定」方針を反転（ユーザー指示）。並びは「`Enter`（存在する画面のみ先頭）→ 画面固有（相対順維持）→ `Esc` → `Ctrl+K` → `q` → `?`（末尾）」。`render_hints` は末尾 `?` の幅を先に予約し、狭い幅でも `?` は必ず表示（極小幅は `?` のみ）。ヒットボックスは描画と一致。
@@ -139,11 +139,11 @@
 - 旧単一選択の行分岐（Enter がカーソル行を適用する `All/Candidate/Partial/Missing` 分岐）と `insert_current_author`/`author_cursor_for` 等は pending/pin 方式へ置換。行→意味の写像は `author_row`/`target_row` への一元化を維持。
 - **未検証の仮定（実 token 未検証）**: OR 連結の認証付きリポジトリでの実挙動（公開リポジトリでは実測済み。実利用確認はユーザーに委ねる）。
 - テスト 622→628。fmt/clippy(-D warnings)/test(--offline) green。
-- 検収時修正（親側）: 旧仕様のまま残っていたコメント 1 箇所（「空白も文字」→ Space はトグル）とテスト名 2 件（`restores_partial_target_into_query…`→`shows_applied_partial_target_as_pin…`、`clearing_query_returns_cursor_to_current_filter_row`→`clearing_query_resets_cursor_and_enter_keeps_applied_filter`）を実態に合わせて改名・修正。挙動変更なし、628 green 維持。
+- 検証時修正: 旧仕様のまま残っていたコメント 1 箇所（「空白も文字」→ Space はトグル）とテスト名 2 件（`restores_partial_target_into_query…`→`shows_applied_partial_target_as_pin…`、`clearing_query_returns_cursor_to_current_filter_row`→`clearing_query_resets_cursor_and_enter_keeps_applied_filter`）を実態に合わせて改名・修正。挙動変更なし、628 green 維持。
 
 ## M8 実装メモ (2026-07-18): ヒント刷新・行番号ガター・author検索/ソース切替・Target branch フィルタ
 
-仕様書 `docs/specs/M7.md` の M8 節。2 フェーズに分けて委譲し、フェーズ毎にゲートを再実行して検収した。
+仕様書 `docs/specs/M7.md` の M8 節。2 フェーズに分けて実装・検証し、フェーズ毎にゲートを再実行した。
 
 **Phase 1**:
 - キーヒント: `?` を全画面（Onboarding 除く）の先頭へ・幅切詰めで落ちない。PgUp/PgDn・Shift+J/K のエントリを全画面から削除（機能とヘルプ全文は残す）。PR 一覧は `o/m/d/a` を出さず `f` のみ。
@@ -164,7 +164,7 @@
 
 ## M7 実装メモ (2026-07-17): コメント UI 磨き込み + PR フィルタ
 
-仕様書 `docs/specs/M7.md`。実装は 2 フェーズに分けて委譲し、フェーズ毎にゲート（fmt/clippy -D warnings/test --offline）を再実行して検収した。
+仕様書 `docs/specs/M7.md`。実装は 2 フェーズに分け、フェーズ毎にゲート（fmt/clippy -D warnings/test --offline）を再実行して検証した。
 
 **Phase 1（コメント UI 磨き + キーヒント）**:
 - **スレッド間の空行**: `CommentRowKind::Spacer` を各スレッドブロック（Bottom / Collapsed）の直後に挿入。non-focusable（カーソルは素通り）・クリック no-op。Actions ヒットボックスの y は描画ループの viewport オフセット基準なので Spacer 挿入でもズレない。
@@ -225,8 +225,8 @@
 ## 未検証の仮定
 
 - ~~**(M10) macOS Keychain の特殊文字roundtrip**~~: 2026-07-19に実機で検証し、非ASCII passwordが`security -w`でhex表示されることが判明。常時hex保存・decode方式へ変更し、再検収対象とした。
-- **(M10) Linux 実機の Secret Service roundtrip**: macOS 上では libsecret モジュールの compile/lint と純粋部分のみ検証。libsecret + DBus のある Linux 実機で store→lookup→clear を検収時に確認する。
-- **(M10) 旧 keyring 項目からの移行**: 旧項目が残る macOS 実機で、save の delete→`security -i` add により ACL 所有者の異なる項目へ確実に置換できることを検収時に確認する。
+- **(M10) Linux 実機の Secret Service roundtrip**: macOS 上では libsecret モジュールの compile/lint と純粋部分のみ検証。libsecret + DBus のある Linux 実機で store→lookup→clear を確認する。
+- **(M10) 旧 keyring 項目からの移行**: 旧項目が残る macOS 実機で、save の delete→`security -i` add により ACL 所有者の異なる項目へ確実に置換できることを確認する。
 - 必要スコープの**粒度スコープ名**は確定済み（上の「検証済みの事実」参照）。残るは各エンドポイントでの 200/403 実挙動の確認のみ。
 - `GET /2.0/repositories/{workspace}?role=member` のパラメータ挙動 — 実データで確認。
 - **(M1) PR/Comment/DiffStat の serde フィールド**: 仕様書の推定名で実装(`PullRequest.participants[].{approved,state,role}`、`DiffStatEntry.{status,lines_added,lines_removed,old.path,new.path}`、`Comment.{content.raw,inline.{path,from,to},deleted}` 等)。実 API 初回応答で有無/名称/値(特に `participant.state` の `changes_requested` 表記、`status` の `modified/added/removed/renamed`、PR `state` の `OPEN/MERGED/DECLINED/SUPERSEDED`)を確定し、モデルとフィルタ判定を補正する。

@@ -2079,7 +2079,6 @@ pub enum Status {
 }
 
 /// イベントループから `update()` へ渡されるメッセージ。
-#[derive(Debug)]
 pub enum Msg {
     /// キー入力。
     Key(KeyEvent),
@@ -2213,6 +2212,192 @@ pub enum Msg {
         url: String,
         result: Result<Vec<u8>, String>,
     },
+}
+
+impl std::fmt::Debug for Msg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Key(value) => f.debug_tuple("Key").field(value).finish(),
+            Self::Mouse(value) => f.debug_tuple("Mouse").field(value).finish(),
+            Self::AuthValidated {
+                email,
+                token: _,
+                user,
+            } => f
+                .debug_struct("AuthValidated")
+                .field("email", email)
+                .field("token", &"<redacted>")
+                .field("user", user)
+                .finish(),
+            Self::AuthFailed(value) => f.debug_tuple("AuthFailed").field(value).finish(),
+            Self::WorkspacesLoaded {
+                workspaces,
+                page_info,
+            } => f
+                .debug_struct("WorkspacesLoaded")
+                .field("workspaces", workspaces)
+                .field("page_info", page_info)
+                .finish(),
+            Self::RepositoriesLoaded {
+                workspace,
+                sort,
+                repos,
+                page_info,
+            } => f
+                .debug_struct("RepositoriesLoaded")
+                .field("workspace", workspace)
+                .field("sort", sort)
+                .field("repos", repos)
+                .field("page_info", page_info)
+                .finish(),
+            Self::LoadFailed(value) => f.debug_tuple("LoadFailed").field(value).finish(),
+            Self::PullRequestsLoaded {
+                repo,
+                filter,
+                sort,
+                prs,
+                page_info,
+            } => f
+                .debug_struct("PullRequestsLoaded")
+                .field("repo", repo)
+                .field("filter", filter)
+                .field("sort", sort)
+                .field("prs", prs)
+                .field("page_info", page_info)
+                .finish(),
+            Self::PrAuthorsLoaded {
+                repo_full_name,
+                result,
+            } => f
+                .debug_struct("PrAuthorsLoaded")
+                .field("repo_full_name", repo_full_name)
+                .field("result", result)
+                .finish(),
+            Self::FilterBranchesLoaded {
+                repo_full_name,
+                result,
+            } => f
+                .debug_struct("FilterBranchesLoaded")
+                .field("repo_full_name", repo_full_name)
+                .field("result", result)
+                .finish(),
+            Self::PrDetailLoaded { id, pr } => f
+                .debug_struct("PrDetailLoaded")
+                .field("id", id)
+                .field("pr", pr)
+                .finish(),
+            Self::DiffStatLoaded { id, entries } => f
+                .debug_struct("DiffStatLoaded")
+                .field("id", id)
+                .field("entries", entries)
+                .finish(),
+            Self::CommentsLoaded { id, comments } => f
+                .debug_struct("CommentsLoaded")
+                .field("id", id)
+                .field("comments", comments)
+                .finish(),
+            Self::DiffLoaded { id, text } => f
+                .debug_struct("DiffLoaded")
+                .field("id", id)
+                .field("text", text)
+                .finish(),
+            Self::ReviewActionDone { id, message } => f
+                .debug_struct("ReviewActionDone")
+                .field("id", id)
+                .field("message", message)
+                .finish(),
+            Self::CommentPosted { id } => f.debug_struct("CommentPosted").field("id", id).finish(),
+            Self::CommentActionDone { id, message } => f
+                .debug_struct("CommentActionDone")
+                .field("id", id)
+                .field("message", message)
+                .finish(),
+            Self::MergeDone { id } => f.debug_struct("MergeDone").field("id", id).finish(),
+            Self::ActionFailed(value) => f.debug_tuple("ActionFailed").field(value).finish(),
+            Self::Tick => f.write_str("Tick"),
+            Self::PipelinesLoaded {
+                repo,
+                pipelines,
+                page_info,
+            } => f
+                .debug_struct("PipelinesLoaded")
+                .field("repo", repo)
+                .field("pipelines", pipelines)
+                .field("page_info", page_info)
+                .finish(),
+            Self::PipelineLoaded { uuid, pipeline } => f
+                .debug_struct("PipelineLoaded")
+                .field("uuid", uuid)
+                .field("pipeline", pipeline)
+                .finish(),
+            Self::PipelineStepsLoaded { uuid, steps } => f
+                .debug_struct("PipelineStepsLoaded")
+                .field("uuid", uuid)
+                .field("steps", steps)
+                .finish(),
+            Self::StepLogLoaded { step_uuid, text } => f
+                .debug_struct("StepLogLoaded")
+                .field("step_uuid", step_uuid)
+                .field("text", text)
+                .finish(),
+            Self::PipelineActionDone { action } => f
+                .debug_struct("PipelineActionDone")
+                .field("action", action)
+                .finish(),
+            Self::BranchesLoaded {
+                repo,
+                branches,
+                page_info,
+            } => f
+                .debug_struct("BranchesLoaded")
+                .field("repo", repo)
+                .field("branches", branches)
+                .field("page_info", page_info)
+                .finish(),
+            Self::CommitsLoaded {
+                revision,
+                commits,
+                next,
+                page,
+            } => f
+                .debug_struct("CommitsLoaded")
+                .field("revision", revision)
+                .field("commits", commits)
+                .field("next", next)
+                .field("page", page)
+                .finish(),
+            Self::CommitDetailLoaded { hash, commit } => f
+                .debug_struct("CommitDetailLoaded")
+                .field("hash", hash)
+                .field("commit", commit)
+                .finish(),
+            Self::CommitDiffLoaded { spec, text } => f
+                .debug_struct("CommitDiffLoaded")
+                .field("spec", spec)
+                .field("text", text)
+                .finish(),
+            Self::SourceLoaded {
+                reference,
+                path,
+                entries,
+            } => f
+                .debug_struct("SourceLoaded")
+                .field("reference", reference)
+                .field("path", path)
+                .field("entries", entries)
+                .finish(),
+            Self::FileLoaded { path, text } => f
+                .debug_struct("FileLoaded")
+                .field("path", path)
+                .field("text", text)
+                .finish(),
+            Self::ImageLoaded { url, result } => f
+                .debug_struct("ImageLoaded")
+                .field("url", url)
+                .field("result", result)
+                .finish(),
+        }
+    }
 }
 
 /// `update()` が返す副作用の指示。実行は `event` モジュールが担う。
@@ -5958,6 +6143,8 @@ impl App {
 
     fn open_url_in_browser(&mut self, url: &str) -> Command {
         let result = std::process::Command::new("open")
+            .env_remove("BBTUI_TOKEN")
+            .env_remove("BBTUI_EMAIL")
             .arg(url)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -8022,6 +8209,24 @@ mod tests {
     fn client() -> BitbucketClient {
         BitbucketClient::new("me@example.com".to_string(), "token".to_string())
             .expect("client builds")
+    }
+
+    #[test]
+    fn auth_validated_debug_redacts_token() {
+        let message = Msg::AuthValidated {
+            email: "me@example.com".to_string(),
+            token: "raw-secret-token".to_string(),
+            user: User {
+                uuid: None,
+                account_id: None,
+                display_name: Some("Reviewer".to_string()),
+                nickname: None,
+            },
+        };
+
+        let debug = format!("{message:?}");
+        assert!(debug.contains("token: \"<redacted>\""));
+        assert!(!debug.contains("raw-secret-token"));
     }
 
     /// テスト用の `PageInfo`（総ページ数・次ページ有無を明示指定）。

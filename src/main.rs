@@ -171,11 +171,25 @@ fn restore_persisted_client(config: &Config) -> Option<BitbucketClient> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 enum EnvCredentials {
     Complete { email: String, token: String },
     Incomplete,
     Absent,
+}
+
+impl std::fmt::Debug for EnvCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Complete { email, token: _ } => f
+                .debug_struct("Complete")
+                .field("email", email)
+                .field("token", &"<redacted>")
+                .finish(),
+            Self::Incomplete => f.write_str("Incomplete"),
+            Self::Absent => f.write_str("Absent"),
+        }
+    }
 }
 
 fn env_credentials() -> EnvCredentials {
@@ -218,6 +232,21 @@ mod tests {
             EnvCredentials::Incomplete
         );
         assert_eq!(classify_env_credentials(None, None), EnvCredentials::Absent);
+    }
+
+    #[test]
+    fn env_credentials_debug_redacts_token() {
+        let credentials = EnvCredentials::Complete {
+            email: "me@example.com".to_string(),
+            token: "raw-secret-token".to_string(),
+        };
+
+        let debug = format!("{credentials:?}");
+        assert_eq!(
+            debug,
+            "Complete { email: \"me@example.com\", token: \"<redacted>\" }"
+        );
+        assert!(!debug.contains("raw-secret-token"));
     }
 
     #[test]

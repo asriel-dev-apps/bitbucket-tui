@@ -794,9 +794,9 @@ fn with_bitbucket_auth(
     }
 }
 
-/// Authorization を送ってよい Bitbucket ホストか。
+/// Authorization を送ってよい HTTPS の Bitbucket ホストか。
 fn should_attach_auth(url: &Url) -> bool {
-    matches!(url.host_str(), Some("bitbucket.org" | "api.bitbucket.org"))
+    url.scheme() == "https" && matches!(url.host_str(), Some("bitbucket.org" | "api.bitbucket.org"))
 }
 
 /// Bitbucket の web ログイン URL か。クエリ文字列は判定に影響しない。
@@ -1125,6 +1125,16 @@ mod tests {
             "https://images.example.com/file.png",
             "https://bitbucket.org.evil.example/file.png",
             "https://subdomain.bitbucket.org/file.png",
+        ] {
+            assert!(!image_request(url).headers().contains_key(AUTHORIZATION));
+        }
+    }
+
+    #[test]
+    fn image_auth_is_not_attached_to_bitbucket_hosts_over_http() {
+        for url in [
+            "http://bitbucket.org/workspace/repo/images/file.png",
+            "http://api.bitbucket.org/2.0/repositories/workspace/repo",
         ] {
             assert!(!image_request(url).headers().contains_key(AUTHORIZATION));
         }

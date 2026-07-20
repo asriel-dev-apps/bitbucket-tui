@@ -101,10 +101,14 @@ mod security_cli {
         validate_security_interactive_args(service, email)?;
         let stored_token = hex_encode(token.as_bytes());
         let _ = Command::new(SECURITY)
+            .env_remove("BBTUI_TOKEN")
+            .env_remove("BBTUI_EMAIL")
             .args(["delete-generic-password", "-s", service, "-a", email])
             .output();
 
         let mut child = Command::new(SECURITY)
+            .env_remove("BBTUI_TOKEN")
+            .env_remove("BBTUI_EMAIL")
             .arg("-i")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -129,6 +133,8 @@ mod security_cli {
 
     pub(super) fn load(service: &str, email: &str) -> Result<Option<String>, AuthError> {
         let output = Command::new(SECURITY)
+            .env_remove("BBTUI_TOKEN")
+            .env_remove("BBTUI_EMAIL")
             .args(["find-generic-password", "-s", service, "-a", email, "-w"])
             .output()?;
         map_load_result(
@@ -141,6 +147,8 @@ mod security_cli {
 
     pub(super) fn delete(service: &str, email: &str) -> Result<(), AuthError> {
         let output = Command::new(SECURITY)
+            .env_remove("BBTUI_TOKEN")
+            .env_remove("BBTUI_EMAIL")
             .args(["delete-generic-password", "-s", service, "-a", email])
             .output()?;
         map_delete_result(
